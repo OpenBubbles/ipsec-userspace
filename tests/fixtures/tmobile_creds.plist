@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>imsIndividualCredentials</key>
+	<dict>
+		<key>password</key>
+		<string>i7kBuKxGLIQRcHV</string>
+		<key>imsi</key>
+		<string>999990302421609@prodepdg.t-mobile.com</string>
+		<key>sip-uri</key>
+		<string>prodepdg.t-mobile.com</string>
+		<key>username</key>
+		<string>999990302421609@prodepdg.t-mobile.com</string>
+		<key>pcscf-address</key>
+		<string>ueb2bprod.pc.t-mobile.com:35060</string>
+		<key>impu</key>
+		<string>12138461451@msg.pc.t-mobile.com</string>
+		<key>apn</key>
+		<string>ims.tmus</string>
+	</dict>
+	<key>subscriberId</key>
+	<string>999990302421609@prodepdg.t-mobile.com</string>
+	<key>slotId</key>
+	<string>0</string>
+	<key>token</key>
+	<string>QjVBQjI3RDZDQzkxRkZDNTNDNDIyQjhDMUJDQTUzRUMxNzEzQzQ3Mg==</string>
+</dict>
+</plist>

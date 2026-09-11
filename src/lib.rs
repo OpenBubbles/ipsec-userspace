@@ -1,0 +1,33 @@
+//! `epdg` — a userspace IKEv2 + EAP-TLS + ESP-in-UDP client for 3GPP ePDG (VoWiFi) gateways.
+//!
+//! Everything runs over plain UDP sockets: IKEv2 (RFC 7296) with EAP-only
+//! authentication (RFC 5998) carrying EAP-TLS (RFC 5216 / RFC 9190), tunnel-mode
+//! ESP (RFC 4303) encapsulated in UDP (RFC 3948), and a minimal inner IPv4/IPv6+UDP
+//! stack so callers can talk to hosts inside the tunnel (DNS, SIP). No raw sockets,
+//! no kernel IPsec, no privileges.
+//!
+//! Driven entirely by a carrier-bundle style [`Config`] (see `docs/DESIGN.md`); the
+//! algorithm set is a registry (`crypto::registry`) so new transforms can be added
+//! without touching the protocol code.
+//!
+//! Layout:
+//! - [`config`]  — configuration model + plist bundle parsing
+//! - [`crypto`]  — cipher / integrity / PRF / DH traits, implementations, registry
+//! - [`ike`]     — IKEv2 wire codec, key derivation, initiator state machine, transport
+//! - [`eap`]     — EAP framing and the EAP-TLS method (rustls-backed)
+//! - [`esp`]     — ESP codec, anti-replay, UDP encapsulation
+//! - [`ipstack`] — inner IPv4/IPv6 + UDP packet build/parse
+//! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`
+
+pub mod config;
+pub mod crypto;
+pub mod eap;
+pub mod error;
+pub mod esp;
+pub mod ike;
+pub mod ipstack;
+pub mod tunnel;
+
+pub use config::Config;
+pub use error::{Error, Result};
+pub use tunnel::{EpdgTunnel, InnerUdpSocket, TunnelInfo};
