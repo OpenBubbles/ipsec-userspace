@@ -126,7 +126,7 @@ pub struct NattConfig {
                                            // responder always detects a NAT and uses UDP-encapsulated ESP (AOSP needEnableForceUdpEncap for IPv4 peers)
     pub keepalive_offload: bool,           // carried
 }
-pub struct RetransmitConfig { pub initial_timeout_ms: u64 /* 500 */, pub backoff_multiplier: f64 /* 2.0 */, pub max_attempts: u32 /* 6 transmissions: t=0,+0.5,+1,+2,+4,+8 s; fail 8 s after the last (AOSP {500,1000,2000,4000,8000}) */ }
+pub struct RetransmitConfig { pub initial_timeout_ms: u64 /* 500 */, pub backoff_multiplier: f64 /* 2.0 */, pub max_attempts: u32 /* 5 transmissions total (AOSP {500,1000,2000,4000,8000}): send at t=0, +0.5, +1.5, +3.5, +7.5 s cumulative; after the 5th send wait 8 s then Error::Timeout (15.5 s) */ }
 pub struct ImsConfig { pub pcscf_address: String, pub apn: String, pub impu: String, pub sip_realm: String, pub username: String, pub password: String, pub imsi: String, pub token: Option<String> }
 
 impl Config {
@@ -151,7 +151,7 @@ Mapping rules:
 - `eap_only = (AuthenticationMethod == "None")`; error if `EAPMethod != "EAP-TLS"` (only method implemented).
 - DPD from `DeadPeerDetection{Enabled,Interval,RetryInterval,MaxRetries}`; NAT-T from
   `NATTKeepAliveOffload` (carried; we always run a software keepalive), `DisableSwitchToNATTPort`.
-- Defaults not in the bundle come from §14 (AOSP `IkeSessionParams` defaults): nonce 32 B, retransmit {500 ms ×2, 6 sends},
+- Defaults not in the bundle come from §14 (AOSP `IkeSessionParams` defaults): nonce 32 B, retransmit {500 ms ×2, 5 sends, fail at 15.5 s},
   NAT-T keepalive 10 s, fragment threshold 1280, EAP-TLS fragment 1024, TLS 1.2 only, MOBIKE on, SIGNATURE_HASH_ALGORITHMS on,
   rekey at soft lifetime = `lifetime_secs * (1 - rekey_margin_fraction)` with NO jitter (AOSP has none).
 - `ims.*` from `imsIndividualCredentials` + top-level `token`; carried for the SIP layer, unused here.
@@ -642,7 +642,7 @@ The exhaustive, file:line-cited dump is in **`docs/AOSP_FACTS.md`** (read the se
 Transform order **ENCR, INTEG, DH, PRF**. KeyLength attr TV `0x800E 0x0100`. Proposal hdr: last=0/more=2; transform hdr: last=0/more=3.
 SPIi = random nonzero u64; SPIr = 0; nonce 32 B; KE = group(2) | 0000 | 256-byte left-zero-padded public value; critical bit never set.
 NAT_D_SRC hashed over **192.0.2.0 + real local port**; NAT_D_DST over the real gateway addr + 500. NAT is treated as detected whenever
-the responder returns NAT-D notifies (local check forced true for IPv4). Retransmit 0.5/1/2/4/8 s (6 sends), identical bytes.
+the responder returns NAT-D notifies (local check forced true for IPv4). Retransmit waits 0.5/1/2/4/8 s after each of 5 sends (fail at 15.5 s), identical bytes each time.
 Response: I flag clear, msgid 0, exchange 34, exactly one proposal ⊆ ours (ENCR compared incl. key length), KE group == ours, SA/KE/Ni required.
 COOKIE: retry with N(COOKIE) first, everything else identical. INVALID_KE_PAYLOAD: full restart with the requested group.
 After success switch to **4500 + 4-byte zero non-ESP marker** for all further IKE; start 0xFF keepalive every 10 s on the same socket.
@@ -676,5 +676,35 @@ Peer CREATE_CHILD_SA we don't support → N(NO_ADDITIONAL_SAS) / TEMPORARY_FAILU
 response for a retransmitted peer request. AOSP rekeys at the soft lifetime with no jitter (its own defaults: IKE 7200 s, child 3600 s — the
 bundle's 80000 s was never wired in; we use the bundle value with `rekey_margin_fraction`).
 
+### 14.1 Reference byte layouts (known-answer vectors, from AOSP_FACTS_CRITIC.md #9-#11)
+**IKE_SA_INIT request, IPv4 ePDG, glue suite — 456 bytes:**
+```
+hdr(28): iSPI(8) | 00*8 | 21 | 20 | 22 | 08 | 00000000 | len(=0x000001C8)
+SA(48):  22 00 00 30 | 00 00 00 2C 01 01 00 04 | 03 00 00 0C 01 00 00 0C 80 0E 01 00 | 03 00 00 08 03 00 00 0C | 03 00 00 08 04 00 00 0E | 00 00 00 08 02 00 00 05
+KE(264): 28 00 01 08 | 00 0E 00 00 | g^x (256 B, left-zero-padded)
+Ni(36):  29 00 00 24 | 32 random bytes
+N NAT_D_SRC(28): 29 00 00 1C | 00 00 40 04 | SHA1(iSPI || 00*8 || C0 00 02 00 || localPort(2))
+N NAT_D_DST(28): 29 00 00 1C | 00 00 40 05 | SHA1(iSPI || 00*8 || remoteIPv4 || 01 F4)
+N FRAG(8):       29 00 00 08 | 00 00 40 2E
+N SIG_HASH(16):  00 00 00 10 | 00 00 40 2F | 00 01 00 02 00 03 00 04
+```
+(transform "more" byte = 3, last = 0; proposal last = 0, number 1, protocol 1, spi size 0, 4 transforms.)
+
+**First IKE_AUTH inner plaintext (before SK), IDi 40 bytes, IDr "ims.tmus" — 292 bytes:**
+```
+IDi(48):  24 00 00 30 | 03 00 00 00 | "900999990302421609@prodepdg.t-mobile.com"
+IDr(16):  29 00 00 10 | 02 00 00 00 | "ims.tmus"
+N EAP_ONLY(8): 29 00 00 08 | 00 00 40 21
+N MOBIKE(8):   21 00 00 08 | 00 00 40 0C
+SA(44):   2C 00 00 2C | 00 00 00 28 01 03 04 03 | SPI(4) | 03 00 00 0C 01 00 00 0C 80 0E 01 00 | 03 00 00 08 03 00 00 0C | 00 00 00 08 05 00 00 00
+TSi(64):  2D 00 00 40 | 02 00 00 00 | 07 00 00 10 00 00 FF FF 00 00 00 00 FF FF FF FF | 08 00 00 28 00 00 FF FF 00*16 FF*16
+TSr(64):  2F 00 00 40 | (same body)
+CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 00 0A 00 00 | 00 02 00 00 | 00 14 00 00 | 00 15 00 00 | 00 07 00 00
+```
+→ pad 11 + padlen byte → 304 B ciphertext; SK = 4+16+304+16 = 340; IKE message = 368 B (never fragmented). SK next-payload = 0x23, header next = 0x2E, exchange 0x23, flags 0x08, msgid 1.
+
+**Post-EAP IKE_AUTH request:** inner = one AUTH payload `00 00 00 28 | 02 00 00 00 | 32-byte HMAC` (40 B) → 7 pad + padlen → 48 B ciphertext; SK = 84; message = 112 B; SK next-payload 0x27.
+
 ## 15. Amendment log
+- 2026-09-11: retransmit corrected to 5 sends; §14.1 KAT layouts added from the critic pass (docs/AOSP_FACTS_CRITIC.md).
 - 2026-09-11: §2/§6/§8/§9/§12 patched from the AOSP extraction (fake NAT source, transform/payload/CP order, TLS 1.2-only, IDr-from-first-response).
