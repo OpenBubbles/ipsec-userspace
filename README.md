@@ -67,7 +67,7 @@ off-prefix routing, 3000-byte IPv4 and IPv6 datagrams fragmented at the wire MTU
 bursts and fire-and-forget sends, `resolve()` against a tiny in-process DNS server on the far stack's port 53, timeouts,
 port allocation, queue bounds, shutdown semantics.
 
-`tests/live_tmobile.rs` connects to the T-Mobile PROD ePDG with the fixture credentials, asserts an inner address,
+`tests/live_tmobile.rs` drives `target/debug/epdg-connect` (stable path, so one firewall rule keeps working across rebuilds; set `EPDG_LIVE_INPROCESS=1` to run the tunnel inside the test process instead). It connects to the T-Mobile PROD ePDG with the fixture credentials, asserts an inner address,
 resolves `ueb2bprod.pc.t-mobile.com` with `tunnel.resolve` (smoltcp DNS over ESP — proves ESP in both directions),
 runs a DPD, observes NAT-T keepalives, and tears down cleanly. It needs UDP egress on 500/4500; a per-application
 firewall (e.g. Little Snitch) must allow the test binary or `target/debug/epdg-connect`.

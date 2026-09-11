@@ -18,8 +18,8 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)
 }
 
-#[test]
-fn live_tmobile_tunnel() {
+/// The tunnel brought up inside this test process (needs the firewall to allow THIS binary).
+fn live_in_process() {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).is_test(false).try_init();
 
     if std::env::var_os("EPDG_SKIP_LIVE").is_some() {
@@ -136,5 +136,39 @@ fn live_tmobile_tunnel() {
         stats.stack.tx_packets,
         stats.stack.rx_packets,
         stats.stack.rx_queue_drops + stats.stack.udp_queue_drops
+    );
+}
+
+/// Default live test: drive the crate's stable-path CLI as a subprocess.
+///
+/// Per-application firewalls (Little Snitch etc.) key their rules on the executable path, and cargo's
+/// hash-suffixed integration-test binaries change on every rebuild — `target/debug/epdg-connect` does not.
+/// Cargo builds the bin for integration tests and exposes its path as `CARGO_BIN_EXE_epdg-connect`.
+/// Set `EPDG_LIVE_INPROCESS=1` to run the tunnel inside the test process instead.
+#[test]
+fn live_tmobile_tunnel() {
+    if std::env::var_os("EPDG_SKIP_LIVE").is_some() {
+        println!("SKIPPED: EPDG_SKIP_LIVE is set (live T-Mobile ePDG test not run)");
+        return;
+    }
+    if std::env::var_os("EPDG_LIVE_INPROCESS").is_some() {
+        return live_in_process();
+    }
+    let exe = env!("CARGO_BIN_EXE_epdg-connect");
+    println!("driving {exe} --hold 25 (set EPDG_LIVE_INPROCESS=1 to run in-process)");
+    let out = std::process::Command::new(exe)
+        .args(["--hold", "25"])
+        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .output()
+        .expect("spawn epdg-connect");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    assert!(out.status.success(), "epdg-connect exited with {:?}", out.status);
+    assert!(stdout.contains("PASS: T-Mobile ePDG tunnel"), "no PASS summary from epdg-connect");
+    assert!(
+        stdout.contains("ueb2bprod.pc.t-mobile.com -> [") && !stdout.contains("ueb2bprod.pc.t-mobile.com -> []"),
+        "P-CSCF did not resolve over the tunnel"
     );
 }
