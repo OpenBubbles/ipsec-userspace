@@ -596,20 +596,45 @@ pub fn classify(datagram: &[u8]) -> DatagramKind;
 `replay.rs`: RFC 4303 §3.4.3 sliding window; `ReplayWindow::new(size)` rounds size up to ≥ 32; `check(seq) -> bool` and
 `update(seq)`, or `check_and_update` used AFTER ICV verification. Seq 0 is invalid.
 
-## 11. Inner IP stack (`ipstack/*`)
+## 11. Inner IP stack = smoltcp (`ipstack/*`) — decision 2026-09-11, replaces the hand-rolled stack
+
+The tunnel-mode ESP payload IS a raw IP packet, so the inner network is a **smoltcp `Interface` over a `phy::Device` with
+`Medium::Ip`**. The previous hand-rolled `ipstack/{ipv4,ipv6,udp,dns}.rs` is deleted; smoltcp provides IPv4/IPv6 (+ fragmentation
+and reassembly), UDP, DNS, ICMP and TCP sockets. Dependency: `smoltcp = { version = "0.14", default-features = false,
+features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation",
+"socket-udp", "socket-tcp", "socket-dns", "socket-icmp"] }` (drop any feature name that 0.14 lacks; verify on docs.rs).
+
 ```rust
-pub struct UdpDatagram { pub src: SocketAddr, pub dst: SocketAddr, pub payload: Vec<u8> }
-pub enum ParsedIp { Udp(UdpDatagram), Other { version: u8, protocol: u8, src: IpAddr, dst: IpAddr } }
-pub fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Result<Vec<u8>>;   // family dispatch (v4/v6 must match)
-pub fn parse_ip_packet(pkt: &[u8]) -> Result<ParsedIp>;
-// ipv4.rs: build (IHL 5, DSCP 0, id random, DF=0, TTL 64, proto 17, header checksum) / parse (honor IHL; ignore options; fragments -> Error::Unsupported)
-//          UDP checksum over IPv4 pseudo-header (compute on build; on parse verify if nonzero).
-// ipv6.rs: build (hop limit 64, next header 17, MANDATORY UDP checksum over the v6 pseudo-header, 0 -> 0xffff) / parse.
-//          `Ipv6FragmentReassembler` (RFC 8200 §4.5, next-header 44): keyed (src,dst,id), TreeMap offset->chunk,
-//          complete when contiguous and last seen; rebuilds an unfragmented packet with next-header rewritten. Evict partials > 30s.
-//          parse_ip_packet must route next-header 44 through a caller-supplied reassembler (expose `parse_ipv6_or_fragment(pkt, &mut Reassembler) -> Result<Option<ParsedIp>>`).
-// dns.rs: `build_query(id, name, qtype: A|AAAA) -> Vec<u8>` and `parse_response(buf) -> Result<Vec<IpAddr>>` (answers of type A/AAAA; follow CNAMEs within the answer section; ignore the rest). Enough for the live test.
+// ipstack/device.rs
+/// smoltcp Device backed by the ESP data plane. TX: smoltcp writes an IP packet into a scratch buffer, the token's
+/// consume() encapsulates it (EspOutbound) and sends it on the IkeTransport (send_esp). RX: the tunnel rx thread
+/// pushes decapsulated inner IP packets into `rx: VecDeque<Vec<u8>>` (bounded, drop-oldest + counter) and wakes the stack.
+pub struct EspDevice { /* Arc<transport>, Arc<Mutex<EspOutbound>>, rx queue, mtu, stats */ }
+impl smoltcp::phy::Device for EspDevice { type RxToken<'a> = ...; type TxToken<'a> = ...; fn receive(..) fn transmit(..) fn capabilities(..) }
+// capabilities: medium = Medium::Ip, max_transmission_unit = cfg.child.inner_mtu (default 1280), checksum = default (smoltcp computes all).
+
+// ipstack/stack.rs — ONE owner thread ("epdg-stack") for Interface + SocketSet + device (smoltcp is !Sync):
+pub struct InnerStack { iface: Interface, sockets: SocketSet<'static>, device: EspDevice, dns: SocketHandle, udp: HashMap<u16, UdpBinding>, .. }
+// Interface::new(Config::new(HardwareAddress::Ip), &mut device, now); update_ip_addrs with every assigned inner address (v6 /prefix, v4 /32);
+// routes: add_default_ipv6_route(<first assigned v6 DNS server or the inner address>) and add_default_ipv4_route(..) when v4 is assigned —
+// with Medium::Ip the next hop is nominal (no ND/ARP) but off-prefix destinations still need a route; verify with a unit test.
+// Loop: { lock; iface.poll(now, &mut device, &mut sockets); drain UDP sockets -> per-binding sync_channel; complete DNS queries -> waiters;
+//         delay = iface.poll_delay(now, &sockets) } then condvar.wait_timeout(delay). Any external event (rx packet, send, bind, query) notifies.
+// Public (via tunnel.rs):
+pub struct InnerUdpSocket { .. }  // bind_udp(port): udp::Socket with rx/tx buffers (e.g. 16 x 2048 B metadata/payload), bound to (any addr, port)
+impl InnerUdpSocket { pub fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> Result<()>;   // socket.send_slice(payload, (dst).into()) + notify
+                      pub fn recv_timeout(&self, t: Duration) -> Result<Option<UdpDatagram>>; pub fn local_port(&self) -> u16; }
+pub struct UdpDatagram { pub src: SocketAddr, pub dst: SocketAddr, pub payload: Vec<u8> }   // dst = our inner address:port
+// DNS: EpdgTunnel::resolve(&self, name: &str, timeout: Duration) -> Result<Vec<IpAddr>> — dns::Socket configured with the assigned DNS
+// servers (update_servers after IKE_AUTH; smoltcp caps the server count — keep the first DNS_MAX_SERVER_COUNT), start_query for Aaaa then A
+// (skip a family we have no inner address for), poll until get_query_result is Ok/Err; Error::Timeout after `timeout`.
+// TCP: not exposed yet — the seam is `socket::tcp::Socket` in the same SocketSet (one method away; do NOT implement now).
 ```
+MTU: inner MTU defaults to 1280 (config `child.inner_mtu`); outbound IPv6 larger than that is fragmented by smoltcp (feature on).
+Inbound IPv6/IPv4 fragments (large SIP responses) are reassembled by smoltcp — do not reimplement. Unknown/ICMP traffic is handled or
+dropped by smoltcp (ND/ICMPv6 echo replies are harmless and useful).
+Threading rule: only the stack thread touches `Interface`/`SocketSet`/`EspDevice` (behind one Mutex + Condvar); callers hold the lock only
+to enqueue/dequeue. The ESP rx thread never blocks on the stack lock for long (push + notify). All queues bounded; drops counted in stats.
 
 ## 12. Tunnel facade (`tunnel.rs`)
 ```rust
@@ -620,7 +645,8 @@ pub struct EpdgTunnel { /* Arc<Shared>, rx thread, timer thread */ }
 impl EpdgTunnel {
     pub fn connect(cfg: &Config) -> Result<EpdgTunnel>;
     pub fn info(&self) -> &TunnelInfo;
-    pub fn bind_udp(&self, local_port: u16) -> Result<InnerUdpSocket>;   // 0 = pick free (49152..65535); source IP = assigned inner addr of dst's family
+    pub fn bind_udp(&self, local_port: u16) -> Result<InnerUdpSocket>;   // 0 = pick free (49152..65535); smoltcp picks the source address by route
+    pub fn resolve(&self, name: &str, timeout: Duration) -> Result<Vec<IpAddr>>; // smoltcp DNS socket over the assigned servers
     pub fn is_alive(&self) -> bool;
     pub fn dpd(&self) -> Result<Duration>;                              // on-demand liveness check (empty INFORMATIONAL), returns RTT
     pub fn stats(&self) -> TunnelStats;                                 // esp tx/rx packets+bytes, replay drops, icv fails, keepalives sent, last rx Instant
@@ -636,8 +662,8 @@ impl Drop for EpdgTunnel /* best-effort close */
 → `switch_to_natt` (we MUST end up on 4500 because raw ESP is impossible in userspace; if the responder detected no NAT
 it may reject UDP-encap — log a warning) → IKE_AUTH initial → EAP loop (`EapTlsClient`) → set_msk → AUTH final →
 `Established` → build `EspOutbound`/`EspInbound` → spawn threads.
-Rx thread: `recv` loop; `Esp` → `EspInbound::decapsulate` → `parse_ipv6_or_fragment`/v4 → UDP → deliver to the
-registered port's channel (else `debug!`); `Ike` → header: RESPONSE → hand to the pending-request slot (msgid) else
+Rx thread: `recv` loop; `Esp` → `EspInbound::decapsulate` → push the inner IP packet into `EspDevice.rx` and notify the stack thread
+(smoltcp then delivers UDP to the bound socket's channel); `Ike` → header: RESPONSE → hand to the pending-request slot (msgid) else
 peer request → `handle_peer_request` → send response; `DeleteIke` → mark dead. `Keepalive` → ignore.
 Timer thread (1 s tick): NAT-T keepalive `0xFF` every `keepalive_interval_secs` (10 s) on the SAME socket as IKE, starting right after
 the switch to 4500, regardless of traffic (AOSP behaviour; RFC 3948 §4);
@@ -733,6 +759,7 @@ CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 
 **Post-EAP IKE_AUTH request:** inner = one AUTH payload `00 00 00 28 | 02 00 00 00 | 32-byte HMAC` (40 B) → 7 pad + padlen → 48 B ciphertext; SK = 84; message = 112 B; SK next-payload 0x27.
 
 ## 15. Amendment log
+- 2026-09-11: §11 rewritten — inner IP stack is smoltcp (Medium::Ip Device over ESP); hand-rolled ipstack + DNS codec removed; `EpdgTunnel::resolve` added.
 - 2026-09-11: §9.3 — ePDG EAP-TLS server requires TLS_RSA_WITH_AES_128_CBC_SHA; EAP-TLS moved from rustls to OpenSSL (no pluggable backend).
 - 2026-09-11: retransmit corrected to 5 sends; §14.1 KAT layouts added from the critic pass (docs/AOSP_FACTS_CRITIC.md).
 - 2026-09-11: §2/§6/§8/§9/§12 patched from the AOSP extraction (fake NAT source, transform/payload/CP order, TLS 1.2-only, IDr-from-first-response).
