@@ -44,7 +44,7 @@ announce `MOBIKE_SUPPORTED` if configured), IPComp, transport mode, ESN, 3GPP no
 | `src/ike/session.rs` | agent:session | §8 |
 | `src/eap/{packet,tls}.rs` | agent:eap | §9 |
 | `src/esp/{codec,replay}.rs` | agent:esp | §10 |
-| `src/ipstack/{ipv4,ipv6,udp,dns}.rs` | agent:ipstack | §11 |
+| `src/ipstack/{device,frag,stack}.rs` | agent:ipstack | §11, §11.1 |
 | `src/tunnel.rs` + `tests/live_tmobile.rs` | agent:tunnel | §12, §13 |
 
 Fixed already (do not change signatures): `src/lib.rs`, `src/error.rs`, `src/crypto/mod.rs`
@@ -603,7 +603,10 @@ The tunnel-mode ESP payload IS a raw IP packet, so the inner network is a **smol
 `Medium::Ip`**. The previous hand-rolled `ipstack/{ipv4,ipv6,udp,dns}.rs` is deleted; smoltcp provides IPv4/IPv6 (+ fragmentation
 and reassembly), UDP, DNS, ICMP and TCP sockets. Dependency: `smoltcp = { version = "0.14", default-features = false,
 features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation",
-"socket-udp", "socket-tcp", "socket-dns", "socket-icmp"] }` (drop any feature name that 0.14 lacks; verify on docs.rs).
+"socket-udp", "socket-tcp", "socket-dns", "socket-icmp", "auto-icmp-echo-reply"] }` (drop any feature name that 0.14 lacks;
+verify on docs.rs). `auto-icmp-echo-reply` is in smoltcp's default set but NOT implied by `socket-icmp`: without it every ICMP
+echo request to the inner address is silently ignored (a P-CSCF/ePDG liveness ping got no reply until 2026-09-11). `socket-tcp`
+and `socket-icmp` are pre-enabled for the TCP seam below; `proto-ipv6-fragmentation` is inert on `Medium::Ip` (6LoWPAN only).
 
 ```rust
 // ipstack/device.rs
@@ -619,31 +622,43 @@ pub struct InnerStack { iface: Interface, sockets: SocketSet<'static>, device: E
 // Interface::new(Config::new(HardwareAddress::Ip), &mut device, now); update_ip_addrs with every assigned inner address (v6 /prefix, v4 /32);
 // routes: add_default_ipv6_route(<first assigned v6 DNS server or the inner address>) and add_default_ipv4_route(..) when v4 is assigned —
 // with Medium::Ip the next hop is nominal (no ND/ARP) but off-prefix destinations still need a route; verify with a unit test.
-// Loop: { lock; iface.poll(now, &mut device, &mut sockets); drain UDP sockets -> per-binding sync_channel; complete DNS queries -> waiters;
+// Loop: { lock; loop { iface.poll_ingress_single(now, &mut device, &mut sockets) — after EVERY ingested packet drain UDP sockets ->
+//         per-binding sync_channel and complete DNS queries -> waiters (a smoltcp udp::Socket buffers only 32 datagrams, the device
+//         queue 256: draining once per poll loses the rest of a burst inside smoltcp, uncounted) }; iface.poll_egress;
 //         delay = iface.poll_delay(now, &sockets) } then condvar.wait_timeout(delay). Any external event (rx packet, send, bind, query) notifies.
 // Public (via tunnel.rs):
 pub struct InnerUdpSocket { .. }  // bind_udp(port): udp::Socket with rx/tx buffers (e.g. 16 x 2048 B metadata/payload), bound to (any addr, port)
-impl InnerUdpSocket { pub fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> Result<()>;   // socket.send_slice(payload, (dst).into()) + notify
+// Send + Sync (the mpsc receiver sits behind a Mutex taken only in recv_timeout): one thread may block in recv_timeout while others send_to.
+// Drop: flush the socket's untransmitted tx buffer first (poll_egress on the caller's thread; the sink is synchronous), count what still
+// could not leave in `udp_tx_drops`, then remove the socket — an Ok from send_to means the datagram WILL be transmitted.
+impl InnerUdpSocket { pub fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> Result<()>;   // socket.send_slice(payload, (dst).into()) + notify;
+                      // BufferFull -> Error::Protocol and `udp_send_full` += 1
                       pub fn recv_timeout(&self, t: Duration) -> Result<Option<UdpDatagram>>; pub fn local_port(&self) -> u16; }
 pub struct UdpDatagram { pub src: SocketAddr, pub dst: SocketAddr, pub payload: Vec<u8> }   // dst = our inner address:port
 // DNS: EpdgTunnel::resolve(&self, name: &str, timeout: Duration) -> Result<Vec<IpAddr>> — dns::Socket configured with the assigned DNS
 // servers (update_servers after IKE_AUTH; smoltcp caps the server count — keep the first DNS_MAX_SERVER_COUNT), start_query for Aaaa then A
 // (skip a family we have no inner address for), poll until get_query_result is Ok/Err; Error::Timeout after `timeout`.
+// smoltcp reports a SILENT server as `Failed` too, but only after its private RETRANSMIT_TIMEOUT (10 s) x server count (mirrored as
+// `SMOLTCP_DNS_RETRANSMIT_TIMEOUT`): a `Failed` at least that long after the query started is completed as Error::Timeout, an earlier
+// one (NXDOMAIN / SERVFAIL / empty answer) as Error::Protocol. Non-unicast assigned DNS servers (0.0.0.0, ::, multicast) are skipped
+// with a warning — smoltcp fails every query sent to one.
+// Stack thread: InnerStack::spawn wraps run() in catch_unwind and close()s the stack on a panic (waiters get Error::Closed, not silence).
 // TCP: not exposed yet — the seam is `socket::tcp::Socket` in the same SocketSet (one method away; do NOT implement now).
 ```
-MTU: inner MTU defaults to 1280 (config `child.inner_mtu`, clamped to `[1280, 65535]`). **Verified smoltcp 0.14 behaviour
-(amendment 2026-09-11, see §15):** outbound IPv4 larger than the MTU is fragmented by smoltcp (up to `FRAGMENTATION_BUFFER_SIZE`)
-and inbound IPv4 fragments are reassembled (up to `REASSEMBLY_BUFFER_SIZE`); **IPv6 is neither fragmented nor reassembled on
-`Medium::Ip`** — the `proto-ipv6-fragmentation` feature only covers 6LoWPAN, an oversize IPv6 packet is dropped at dispatch and an
-inbound IPv6 Fragment header gets an ICMPv6 Parameter Problem. `InnerUdpSocket::send_to` therefore refuses an IPv6 payload that
-does not fit one MTU-sized packet (`Error::Protocol`) instead of losing it silently, and refuses IPv4 payloads beyond the
-fragmentation buffer. Do not reimplement reassembly in this crate; if large inner IPv6 UDP is needed, raise `inner_mtu`, use TCP,
-or upgrade smoltcp. smoltcp's compile-time limits are set by Cargo features (`iface-max-addr-count-8`, `iface-max-route-count-4`,
-`dns-max-server-count-4`, `dns-max-result-count-8`, `fragmentation-buffer-size-8192`, `reassembly-buffer-size-8192`,
-`reassembly-buffer-count-4`); `smoltcp::config::*` exposes the effective values. Unknown/ICMP traffic is handled or dropped by
-smoltcp (ICMP port-unreachable replies are harmless). Routes: with `Medium::Ip` smoltcp never resolves a next hop and never
-blocks egress on a missing route (`has_neighbor` is unconditionally true), so the default routes are nominal — the loopback test
-still proves off-prefix delivery end to end.
+MTU: the wire MTU defaults to 1280 (config `child.inner_mtu`, clamped to `[1280, 65535]`); the MTU smoltcp sees is
+`child.inner_mtu_stack` (§11.1). **Verified smoltcp 0.14 behaviour (amendment 2026-09-11, see §15):** outbound IPv4 larger than the
+(stack) MTU is fragmented by smoltcp (up to `FRAGMENTATION_BUFFER_SIZE`) and inbound IPv4 fragments are reassembled (up to
+`REASSEMBLY_BUFFER_SIZE`); **IPv6 is neither fragmented nor reassembled on `Medium::Ip`** — the `proto-ipv6-fragmentation` feature
+only covers 6LoWPAN, an oversize IPv6 packet is dropped at dispatch and an inbound IPv6 Fragment header gets an ICMPv6 Parameter
+Problem. Hence the §11.1 shim around the device; `InnerUdpSocket::send_to` refuses payloads above `inner_mtu_stack − 48/−28`
+(`Error::Protocol`) instead of losing them silently. smoltcp's compile-time limits are set by Cargo features
+(`iface-max-addr-count-8`, `iface-max-route-count-4`, `dns-max-server-count-4`, `dns-max-result-count-8`,
+`fragmentation-buffer-size-8192`, `reassembly-buffer-size-8192`, `reassembly-buffer-count-4`); `smoltcp::config::*` exposes the
+effective values. Unknown/ICMP traffic is handled or dropped by smoltcp (ICMP port-unreachable replies are harmless; echo requests
+are answered thanks to `auto-icmp-echo-reply`). Routes: with `Medium::Ip` smoltcp never resolves a next hop, but a matching route
+is still REQUIRED — `has_neighbor` is `route(addr).is_some()` (then unconditionally true for `Medium::Ip`), so without a default
+route an off-prefix datagram would never leave its socket. Only the next-hop VALUE is nominal; the default routes are load-bearing
+and the loopback test proves off-prefix delivery end to end.
 Threading rule: only the stack thread touches `Interface`/`SocketSet`/`EspDevice` (behind one Mutex + Condvar); callers hold the lock only
 to enqueue/dequeue. The ESP rx thread never blocks on the stack lock for long (push + notify). All queues bounded; drops counted in stats.
 
@@ -654,21 +669,27 @@ directions (1.5–3.7 KB 200 OK / NOTIFY arrive IPv6-fragmented from the P-CSCF;
 wraps the device:
 - **Device MTU seen by smoltcp** = `cfg.child.inner_mtu_stack` (new, default 16384; ≥ `inner_mtu`) so smoltcp never refuses a large
   UDP datagram. **Wire MTU** = `cfg.child.inner_mtu` (1280) is what fragments must fit.
-- **TX (`ipstack/frag.rs::fragment_for_wire(pkt, wire_mtu) -> Vec<Vec<u8>>`)**, applied in the TX sink before ESP: an IP packet
+- **TX (`ipstack/frag.rs::fragment_for_wire(pkt, wire_mtu, ident) -> Result<Option<Vec<Vec<u8>>>>`)**, applied inside
+  `EspDevice`'s TX token before the sink (so every sink — ESP or the test wires — only ever sees wire-sized packets): an IP packet
   longer than `wire_mtu` is split — IPv6 per RFC 8200 §4.5 (insert a Fragment extension header after the base header; only the
-  base header is unfragmentable when no extension headers are present — reject/pass-through packets with other extension headers;
-  fragment payloads are multiples of 8 except the last; random 32-bit Identification; M flag on all but the last; Payload Length
-  recomputed per fragment); IPv4 per RFC 791 (honour DF: drop + count; else split with MF/offset, recompute header checksum and
-  Total Length). Packets ≤ `wire_mtu` pass through untouched. Each fragment is one ESP packet.
+  base header is unfragmentable when no extension headers are present — packets with other extension headers are dropped and
+  counted (`tx_frag_drops`); fragment payloads are multiples of 8 except the last; 32-bit Identification from a randomly seeded
+  per-device counter; M flag on all but the last; Payload Length recomputed per fragment); IPv4 per RFC 791 (split with MF/offset,
+  recompute header checksum and Total Length; an already-fragmented packet keeps its Identification and its offsets are extended).
+  **DF is NOT honoured (deviation, 2026-09-11):** smoltcp 0.14 sets DF on every IPv4 packet it emits and has no API to clear it, so
+  honouring DF would drop every locally generated IPv4 datagram above 1252 bytes; the shim clears DF and assigns a fresh 16-bit
+  Identification instead. Packets ≤ `wire_mtu` pass through untouched. Each fragment is one ESP packet.
 - **RX (`ipstack/frag.rs::Ipv6Reassembler`)**, applied in `push_rx` before the device: reassemble IPv6 fragment sets keyed by
   (src, dst, Identification): TreeMap offset→chunk, complete when contiguous from 0 and the M=0 tail seen; rebuild the packet
   with the Fragment header removed, Next Header rewritten, Payload Length fixed; bounded (≤ 32 pending sets, ≤ 64 KiB each,
-  30 s eviction, counters in `StackStats`). IPv4 fragments pass straight through — smoltcp reassembles those itself
-  (`proto-ipv4-fragmentation`, `reassembly_timeout`).
+  30 s eviction, counters in `StackStats`: `rx_fragments`, `rx_reassembled`, `rx_reassembly_drops`; TX side `tx_fragmented`,
+  `tx_frag_drops`). Exact duplicates are ignored; overlapping or malformed fragments discard the whole set. IPv4 fragments pass
+  straight through — smoltcp reassembles those itself (`proto-ipv4-fragmentation`, `reassembly_timeout`).
 - `InnerUdpSocket::send_to` payload cap becomes `inner_mtu_stack − 48` (v6) / `− 28` (v4); oversize → `Error::Protocol`.
-- Tests: fragment→reassemble round trips (v6 sizes 1281, 1500, 3000, 8000; v4 3000 incl. DF drop), out-of-order/duplicate/missing
-  fragments, eviction; and the two-stack loopback harness must pass a 3000-byte **IPv6** UDP datagram both ways with the wire
-  MTU 1280 (each device sink asserts every packet it emits is ≤ 1280).
+- Tests: fragment→reassemble round trips (v6 sizes 1281, 1500, 3000, 8000, 16344, 65535; v4 3000 with DF set → fragmented with
+  DF cleared), out-of-order/duplicate/missing fragments, eviction, set limit, overlap; and the two-stack loopback harness passes a
+  3000-byte (and 8000-byte) **IPv6** UDP datagram both ways with the wire MTU 1280 (each device sink asserts every packet it emits
+  is ≤ 1280).
 
 ## 12. Tunnel facade (`tunnel.rs`)
 ```rust
@@ -713,10 +734,18 @@ encrypt→decrypt round-trip and ICV tamper → `Error::Integrity`; SKF fragment
 hand-computed vector (HMAC-SHA256 KAT from RFC 4231 for the HMAC itself); AES-CBC KAT (NIST SP800-38A F.2.5);
 DH group 14 checks (§3); IKE key derivation lengths/order; AUTH signed-octets construction; NAT hash KAT; EAP packet
 round-trips; EAP-TLS fragmentation/reassembly with a fake peer; ESP round-trip + replay window semantics + pad/ICV
-checks; IPv4/IPv6/UDP build→parse with checksum verification; IPv6 fragment reassembly; DNS query/response codec;
+checks; inner stack (§11/§11.1): `EspDevice` capabilities / rx queue bound / tx token (exact length, fragmentation for the wire);
+`frag.rs` fragment→reassemble round trips, malformed/overlap/eviction; two-stack loopback (`ipstack::stack::tests`): UDP both ways
+v4+v6 with exact endpoints, off-prefix routing, IPv4 and IPv6 3000-byte datagrams fragmented at the wire MTU 1280 and reassembled
+(every sink asserts ≤ 1280), payload caps, ICMPv4/v6 echo answered, a 256-datagram burst queued before the stack thread runs
+delivered in full, send_to-then-drop still transmitted, send-buffer-full counted, `InnerUdpSocket` shared between a receiver
+thread and senders (Send + Sync), bind_udp(0) allocation/duplicates/unbind-on-drop, queue bounds, resolve AAAA+A / family skip /
+NXDOMAIN / caller timeout / silent server beyond smoltcp's 10 s give-up (Timeout, not Protocol) / non-unicast servers skipped /
+input errors, stop semantics, stack-thread panic closes the stack;
 config parsing of `tests/fixtures/tmobile_prod_bundle.plist` + `tmobile_creds.plist` (assert every mapped field).
-Live (`tests/live_tmobile.rs`): loads the fixtures, `EpdgTunnel::connect`, asserts an inner IPv6 (or v4) address and
-≥1 P-CSCF address were assigned, prints `TunnelInfo`; then resolves `ueb2bprod.pc.t-mobile.com` over the tunnel via the
+Live (`tests/live_tmobile.rs`): loads the fixtures, `EpdgTunnel::connect`, asserts an inner IPv6 (or v4) address and ≥1 DNS
+server were assigned (P-CSCF attributes are optional — the PROD ePDG sends none; the P-CSCF is found via `resolve()`), prints
+`TunnelInfo`; then resolves `ueb2bprod.pc.t-mobile.com` over the tunnel via the
 assigned DNS (AAAA then A) and asserts ≥1 answer (proves ESP both ways); runs `dpd()` and asserts an RTT; sleeps 25 s
 and asserts `is_alive()` (keepalive exercised); `close()`. Skipped (with a printed reason) when `EPDG_SKIP_LIVE=1`.
 Log at `RUST_LOG=debug` includes hex dumps of every IKE datagram sent/received (redact keys).
@@ -793,6 +822,16 @@ CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 
 **Post-EAP IKE_AUTH request:** inner = one AUTH payload `00 00 00 28 | 02 00 00 00 | 32-byte HMAC` (40 B) → 7 pad + padlen → 48 B ciphertext; SK = 84; message = 112 B; SK next-payload 0x27.
 
 ## 15. Amendment log
+- 2026-09-11 (§11.1 implemented + §11 verifier fixes): (a) §11.1 lives in `ipstack/frag.rs`, applied inside `EspDevice` (TX) and
+  `InnerStack::push_rx` (RX); `child.inner_mtu_stack` (default 16384) added to `ChildConfig`; DF is not honoured on TX (smoltcp
+  sets it unconditionally) — see §11.1. (b) `auto-icmp-echo-reply` added to the smoltcp features (echo requests were ignored).
+  (c) The stack loop ingests packet by packet (`poll_ingress_single` + drain) so a burst larger than smoltcp's 32-slot UDP socket
+  buffer is no longer lost uncounted. (d) `InnerUdpSocket::drop` flushes queued datagrams before removing the socket
+  (`udp_tx_drops` counts leftovers); `udp_send_full` counts refused sends. (e) A DNS `Failed` after smoltcp's 10 s x servers
+  give-up is `Error::Timeout`. (f) `InnerUdpSocket` is `Send + Sync`. (g) `InnerStack::spawn` guards against panics.
+  (h) Non-unicast assigned DNS servers are skipped. (i) §11 route note corrected: default routes are required, only the next hop
+  is nominal. (j) §13 unit-test list and the §1 module table now describe the smoltcp stack; the live test does not assert a
+  P-CSCF attribute.
 - 2026-09-11: §11.1 — IP fragmentation shim around the smoltcp device (smoltcp 0.14 lacks IPv6 frag/reassembly on Medium::Ip).
 - 2026-09-11 (§11 implemented, deviations): (a) smoltcp 0.14 has no IPv6 fragmentation/reassembly on `Medium::Ip` — §11's
   "IPv6 larger than the MTU is fragmented / inbound IPv6 fragments are reassembled" is false for 0.14; `send_to` refuses oversize

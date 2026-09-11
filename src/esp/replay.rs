@@ -182,7 +182,7 @@ mod tests {
         // slide by one: 69 falls out
         assert!(w.check_and_update(101));
         assert!(!w.check(69));
-        assert!(w.check(70) == false, "70 already received");
+        assert!(!w.check(70), "70 already received");
         assert!(w.check(71));
     }
 

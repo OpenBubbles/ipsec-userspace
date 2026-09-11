@@ -79,11 +79,11 @@ impl EapPacket {
         out.push(self.code);
         out.push(self.identifier);
         out.extend_from_slice(&[0, 0]); // length placeholder
-        if !matches!(self.code, EAP_CODE_SUCCESS | EAP_CODE_FAILURE) {
-            if let Some(t) = self.eap_type {
-                out.push(t);
-                out.extend_from_slice(&self.type_data);
-            }
+        if !matches!(self.code, EAP_CODE_SUCCESS | EAP_CODE_FAILURE)
+            && let Some(t) = self.eap_type
+        {
+            out.push(t);
+            out.extend_from_slice(&self.type_data);
         }
         let len = out.len().min(u16::MAX as usize) as u16;
         out[2..4].copy_from_slice(&len.to_be_bytes());

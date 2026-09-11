@@ -176,15 +176,23 @@ pub struct ChildConfig {
     pub cfg_requests: Vec<u16>,
     /// Carried, unused.
     pub install_policies: bool,
-    /// MTU of the inner (tunnelled) IP interface in bytes of IP packet; not in the
-    /// bundle, defaults to [`DEFAULT_INNER_MTU`]. The stack clamps it to
-    /// `[1280, 65535]`. IPv4 above it is fragmented by smoltcp; IPv6 must fit.
+    /// Wire MTU of the inner (tunnelled) IP interface in bytes of IP packet: no ESP
+    /// payload is larger. Not in the bundle, defaults to [`DEFAULT_INNER_MTU`]; the
+    /// stack clamps it to `[1280, 65535]`. Larger packets are fragmented for the wire
+    /// (IPv4 and IPv6) by the §11.1 shim.
     pub inner_mtu: usize,
+    /// MTU the smoltcp stack sees (DESIGN.md §11.1), i.e. the largest inner IP packet
+    /// one UDP datagram may occupy before fragmentation: `send_to` accepts payloads up
+    /// to `inner_mtu_stack - 48` (IPv6) / `- 28` (IPv4). Not in the bundle, defaults
+    /// to [`DEFAULT_INNER_MTU_STACK`]; raised to at least `inner_mtu`.
+    pub inner_mtu_stack: usize,
 }
 
 /// Default inner MTU: the IPv6 minimum link MTU (RFC 8200 §5), which is also what
 /// AOSP's IKE client and the ePDG assume for the tunnelled link. Bundle-independent.
 pub const DEFAULT_INNER_MTU: usize = 1280;
+/// Default stack MTU (§11.1): large enough for any SIP message over UDP.
+pub const DEFAULT_INNER_MTU_STACK: usize = 16384;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildProposal {
@@ -587,6 +595,7 @@ impl Config {
             cfg_requests: build_cfg_requests(tech)?,
             install_policies: dict_bool(first_child, "InstallPolicies", false)?,
             inner_mtu: DEFAULT_INNER_MTU,
+            inner_mtu_stack: DEFAULT_INNER_MTU_STACK,
         };
 
         // --- IMS ---
@@ -832,6 +841,9 @@ mod tests {
         assert!(c.child.install_policies);
         assert_eq!(c.child.inner_mtu, DEFAULT_INNER_MTU);
         assert_eq!(c.child.inner_mtu, 1280);
+        assert_eq!(c.child.inner_mtu_stack, DEFAULT_INNER_MTU_STACK);
+        assert_eq!(c.child.inner_mtu_stack, 16384);
+        assert!(c.child.inner_mtu_stack >= c.child.inner_mtu);
     }
 
     #[test]

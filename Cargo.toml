@@ -26,7 +26,7 @@ sha2 = "0.10"
 smoltcp = { version = "0.14", default-features = false, features = [
     "std", "log", "medium-ip", "proto-ipv4", "proto-ipv6",
     "proto-ipv4-fragmentation", "proto-ipv6-fragmentation",
-    "socket-udp", "socket-tcp", "socket-dns", "socket-icmp",
+    "socket-udp", "socket-tcp", "socket-dns", "socket-icmp", "auto-icmp-echo-reply",
     "iface-max-addr-count-8", "iface-max-route-count-4",
     "dns-max-server-count-4", "dns-max-result-count-8",
     "fragmentation-buffer-size-8192", "reassembly-buffer-size-8192", "reassembly-buffer-count-4",

@@ -643,7 +643,12 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
     let outbound = Arc::new(RwLock::new(Arc::new(outbound)));
     let counters = Arc::new(Counters::default());
     counters.keepalives_sent.store(handshake_keepalives.load(Ordering::Relaxed), Ordering::Relaxed);
-    let stack = InnerStack::new(&assigned, esp_sink(&transport, &outbound, &counters), cfg.child.inner_mtu)?;
+    let stack = InnerStack::new(
+        &assigned,
+        esp_sink(&transport, &outbound, &counters),
+        cfg.child.inner_mtu,
+        cfg.child.inner_mtu_stack,
+    )?;
     let shared = Arc::new(Shared {
         cfg: cfg.clone(),
         transport,
@@ -682,7 +687,9 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
 
 /// The inner stack's TX sink: `EspOutbound::encapsulate` (current outbound SA, so a
 /// child rekey is picked up transparently) + `IkeTransport::send_esp`, counting ESP tx.
-/// Runs on the stack thread inside `Interface::poll`.
+/// Runs on the stack thread inside `Interface::poll` (and on a caller's thread when an
+/// `InnerUdpSocket` is dropped with datagrams still queued). Every packet it is handed
+/// already fits `child.inner_mtu` (the device fragments, §11.1).
 fn esp_sink(transport: &Arc<IkeTransport>, outbound: &Arc<RwLock<Arc<EspOutbound>>>, counters: &Arc<Counters>) -> TxSink {
     let transport = Arc::clone(transport);
     let outbound = Arc::clone(outbound);
@@ -1326,10 +1333,10 @@ impl EpdgTunnel {
 
 impl Drop for EpdgTunnel {
     fn drop(&mut self) {
-        if !self.closed {
-            if let Err(e) = self.shutdown() {
-                debug!("drop: close failed: {e}");
-            }
+        if !self.closed
+            && let Err(e) = self.shutdown()
+        {
+            debug!("drop: close failed: {e}");
         }
     }
 }
@@ -1531,7 +1538,8 @@ mod tests {
         let transport = Arc::new(transport);
         let outbound = Arc::new(RwLock::new(Arc::new(EspOutbound::new(sa()))));
         let counters = Arc::new(Counters::default());
-        let stack = InnerStack::new(&AssignedConfig::default(), esp_sink(&transport, &outbound, &counters), 1280).unwrap();
+        let stack =
+            InnerStack::new(&AssignedConfig::default(), esp_sink(&transport, &outbound, &counters), 1280, 16384).unwrap();
         Arc::new(Shared {
             cfg,
             transport,

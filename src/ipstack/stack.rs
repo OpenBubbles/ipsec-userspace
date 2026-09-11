@@ -6,10 +6,14 @@
 //! (`epdg-stack`, [`InnerStack::run`]):
 //!
 //! ```text
-//! loop { lock; iface.poll(); drain UDP sockets -> per-binding channels;
-//!        complete DNS queries -> waiters; delay = iface.poll_delay();
-//!        condvar.wait_timeout(delay) }
+//! loop { lock; for each queued packet { iface.poll_ingress_single(); drain UDP sockets ->
+//!        per-binding channels; complete DNS queries -> waiters }; iface.poll_egress();
+//!        delay = iface.poll_delay(); condvar.wait_timeout(delay) }
 //! ```
+//!
+//! Ingress is drained packet by packet: a smoltcp UDP socket holds only
+//! `UDP_SOCKET_PACKETS` datagrams, far fewer than the device queue, so draining once per
+//! poll would lose the rest of a burst inside smoltcp (uncounted).
 //!
 //! Everyone else holds the lock only to enqueue or dequeue, then notifies the condvar:
 //! the ESP rx thread pushes decapsulated packets ([`InnerStack::push_rx`]),
@@ -25,17 +29,24 @@
 //! test harness, which forwards through a channel for exactly that reason).
 //!
 //! smoltcp 0.14 facts this module relies on (verified in the crate source):
-//! - `Medium::Ip` needs no neighbour discovery: the default routes are nominal, but an
-//!   off-prefix destination is still delivered (tested below).
+//! - `Medium::Ip` needs no neighbour discovery, but a matching route is still
+//!   REQUIRED: `has_neighbor` is true only when `route()` finds one, so without the
+//!   default routes an off-prefix datagram would sit in its socket forever. Only the
+//!   next-hop value is nominal (tested below).
 //! - IPv4 packets larger than the MTU are fragmented (`proto-ipv4-fragmentation`) up to
 //!   `FRAGMENTATION_BUFFER_SIZE`, and inbound IPv4 fragments are reassembled up to
 //!   `REASSEMBLY_BUFFER_SIZE`. **IPv6 fragmentation is not implemented for `Medium::Ip`**
 //!   (the `proto-ipv6-fragmentation` feature only covers 6LoWPAN): an oversize IPv6
 //!   packet is dropped by smoltcp and an inbound IPv6 Fragment header is answered with
-//!   an ICMPv6 Parameter Problem. `send_to` therefore refuses IPv6 payloads that would
-//!   not fit in one MTU-sized packet.
+//!   an ICMPv6 Parameter Problem. Hence the shim of DESIGN.md §11.1: smoltcp sees the
+//!   *stack* MTU (`child.inner_mtu_stack`, 16384 by default) so it never refuses a large
+//!   datagram, the device splits what it emits to the *wire* MTU (`child.inner_mtu`,
+//!   1280) and [`InnerStack::push_rx`] reassembles inbound IPv6 fragment sets
+//!   ([`super::frag`]). `send_to` caps payloads at `inner_mtu_stack - 48/-28`.
 //! - The DNS socket keeps at most `DNS_MAX_SERVER_COUNT` servers and returns at most
-//!   `DNS_MAX_RESULT_COUNT` addresses per query (both raised via Cargo features).
+//!   `DNS_MAX_RESULT_COUNT` addresses per query (both raised via Cargo features), and
+//!   gives up on a silent server after its private 10 s retransmit timeout (see
+//!   [`SMOLTCP_DNS_RETRANSMIT_TIMEOUT`]).
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -46,11 +57,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use log::{debug, info, trace, warn};
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
+use smoltcp::iface::{Config as IfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet};
 use smoltcp::socket::{dns, udp};
 use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
 use super::device::{DEFAULT_RX_QUEUE_DEPTH, DeviceStats, EspDevice, TxSink};
+use super::frag::{Ipv6Reassembler, ReassemblyStats};
 use crate::ike::session::AssignedConfig;
 use crate::{Error, Result};
 
@@ -62,6 +74,10 @@ pub const EPHEMERAL_PORT_HI: u16 = 65535;
 pub const MIN_INNER_MTU: usize = 1280;
 /// Largest accepted inner MTU (maximum IP packet).
 pub const MAX_INNER_MTU: usize = 65_535;
+/// smoltcp 0.14's private `dns::RETRANSMIT_TIMEOUT`: after this long without an answer
+/// it moves to the next server, and reports `Failed` once every server timed out — so a
+/// `Failed` that arrives `servers x` this late means silence, not a negative answer.
+pub const SMOLTCP_DNS_RETRANSMIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per-binding receive queue depth (datagrams); beyond it the newest datagram is dropped.
 pub const UDP_QUEUE_DEPTH: usize = 256;
 /// smoltcp-side packet slots per UDP socket direction (drained on every poll).
@@ -108,10 +124,25 @@ pub struct StackStats {
     pub tx_bytes: u64,
     /// TX sink failures (packet dropped).
     pub tx_errors: u64,
+    /// IP packets split into wire-sized fragments on the way out (§11.1).
+    pub tx_fragmented: u64,
+    /// IP packets above the wire MTU that could not be fragmented (dropped).
+    pub tx_frag_drops: u64,
+    /// Inbound IPv6 fragments seen by the reassembler.
+    pub rx_fragments: u64,
+    /// Inbound IPv6 packets rebuilt from fragments.
+    pub rx_reassembled: u64,
+    /// Inbound IPv6 fragment sets discarded (malformed, overlapping, timed out, evicted).
+    pub rx_reassembly_drops: u64,
     /// UDP datagrams delivered to a binding's channel.
     pub udp_delivered: u64,
     /// UDP datagrams dropped because the binding's channel was full.
     pub udp_queue_drops: u64,
+    /// `send_to` calls refused because the socket's send buffer was full.
+    pub udp_send_full: u64,
+    /// Datagrams accepted by `send_to` but discarded because the socket was closed
+    /// before they could be transmitted (should stay 0: `Drop` flushes first).
+    pub udp_tx_drops: u64,
     /// DNS queries started (`resolve` issues one per address family).
     pub dns_queries: u64,
     /// Currently bound inner UDP ports.
@@ -120,10 +151,13 @@ pub struct StackStats {
 
 /// A UDP "socket" inside the tunnel, bound to one inner port on every inner address.
 /// Sends go through the smoltcp stack (source address chosen by smoltcp), receives
-/// come from the stack thread through a bounded channel. Dropping it unbinds the port.
+/// come from the stack thread through a bounded channel. `Send + Sync`: one thread can
+/// block in `recv_timeout` while others `send_to` on the same handle. Dropping it
+/// flushes what `send_to` accepted, then unbinds the port.
 pub struct InnerUdpSocket {
     port: u16,
-    rx: Receiver<UdpDatagram>,
+    /// Locked only inside `recv_timeout` (the receiver itself is `!Sync`).
+    rx: Mutex<Receiver<UdpDatagram>>,
     stack: InnerStack,
 }
 
@@ -196,12 +230,16 @@ impl DnsSlot {
 struct DnsWaiter {
     handle: dns::QueryHandle,
     slot: Arc<DnsSlot>,
+    /// smoltcp time at which the query was started.
+    started: smoltcp::time::Instant,
 }
 
 struct State {
     iface: Interface,
     sockets: SocketSet<'static>,
     device: EspDevice,
+    /// IPv6 fragment reassembly in front of the device (§11.1).
+    reassembler: Ipv6Reassembler,
     dns: SocketHandle,
     udp: HashMap<u16, UdpBinding>,
     dns_waiters: Vec<DnsWaiter>,
@@ -212,6 +250,8 @@ struct State {
     closed: Option<String>,
     udp_delivered: u64,
     udp_queue_drops: u64,
+    udp_send_full: u64,
+    udp_tx_drops: u64,
     dns_queries: u64,
 }
 
@@ -220,11 +260,25 @@ impl State {
         self.closed.as_ref().map(|r| Error::Closed(r.clone()))
     }
 
-    /// One stack-thread iteration: poll smoltcp, then move everything it produced out to
-    /// the waiting callers.
+    /// One stack-thread iteration: ingest the queued packets one at a time, moving what
+    /// each one produced out to the waiting callers before the next (a smoltcp UDP
+    /// socket only buffers `UDP_SOCKET_PACKETS` datagrams), then transmit.
     fn poll(&mut self, now: smoltcp::time::Instant) {
-        let State { iface, sockets, device, dns, udp, dns_waiters, udp_delivered, udp_queue_drops, .. } = self;
-        let _ = iface.poll(now, device, sockets);
+        self.iface.poll_maintenance(now);
+        loop {
+            match self.iface.poll_ingress_single(now, &mut self.device, &mut self.sockets) {
+                PollIngressSingleResult::None => break,
+                PollIngressSingleResult::PacketProcessed => {}
+                PollIngressSingleResult::SocketStateChanged => self.drain(now),
+            }
+        }
+        while self.iface.poll_egress(now, &mut self.device, &mut self.sockets) == PollResult::SocketStateChanged {}
+        self.drain(now);
+    }
+
+    /// Move everything smoltcp's sockets hold out to the callers.
+    fn drain(&mut self, now: smoltcp::time::Instant) {
+        let State { sockets, dns, udp, dns_waiters, dns_servers, udp_delivered, udp_queue_drops, .. } = self;
 
         // UDP: smoltcp socket rx buffers -> per-binding channels.
         let mut disconnected = Vec::new();
@@ -267,7 +321,14 @@ impl State {
                 false
             }
             Err(dns::GetQueryResultError::Failed) => {
-                w.slot.complete(Err(Error::Protocol("DNS query failed (no answer of that type, NXDOMAIN or server failure)".into())));
+                // smoltcp reports silence the same way as a negative answer, but only
+                // after every server's retransmit timeout has elapsed.
+                let give_up = smoltcp::time::Duration::from(SMOLTCP_DNS_RETRANSMIT_TIMEOUT) * (*dns_servers as u32).max(1);
+                w.slot.complete(Err(if now - w.started >= give_up {
+                    Error::Timeout("DNS response")
+                } else {
+                    Error::Protocol("DNS query failed (no answer of that type, NXDOMAIN or server failure)".into())
+                }));
                 false
             }
         });
@@ -305,8 +366,10 @@ fn pick_free_port(used: &HashMap<u16, UdpBinding>, start: u16) -> Option<u16> {
         .find(|p| !used.contains_key(p))
 }
 
-/// Largest UDP payload the stack can carry to a destination of the given family:
-/// IPv4 is fragmented by smoltcp up to its fragmentation buffer, IPv6 must fit the MTU.
+/// Largest UDP payload the stack can carry to a destination of the given family, given
+/// the MTU smoltcp sees (`child.inner_mtu_stack`): IPv4 is additionally fragmented by
+/// smoltcp up to its fragmentation buffer, IPv6 must fit one stack-MTU packet (the
+/// device then splits it to the wire MTU, §11.1).
 pub fn max_udp_payload(mtu: usize, ipv4: bool) -> usize {
     if ipv4 {
         smoltcp::config::FRAGMENTATION_BUFFER_SIZE.max(mtu).saturating_sub(IPV4_UDP_OVERHEAD)
@@ -330,17 +393,23 @@ fn udp_buffer() -> udp::PacketBuffer<'static> {
 
 impl InnerStack {
     /// Build the interface from the gateway-assigned configuration: every inner IPv6
-    /// address with its prefix and every inner IPv4 address as /32, nominal default
-    /// routes (first DNS server of the family, else the inner address itself), DNS
-    /// servers of the families we have an address for. Nothing runs until
-    /// [`InnerStack::run`] / [`InnerStack::spawn`].
-    pub fn new(assigned: &AssignedConfig, sink: TxSink, inner_mtu: usize) -> Result<InnerStack> {
+    /// address with its prefix and every inner IPv4 address as /32, default routes
+    /// (next hop = first DNS server of the family, else the inner address itself), DNS
+    /// servers of the families we have an address for. `inner_mtu` is the wire MTU
+    /// (clamped to `[1280, 65535]`), `inner_mtu_stack` the MTU smoltcp sees (raised to
+    /// at least the wire MTU, §11.1). Nothing runs until [`InnerStack::run`] /
+    /// [`InnerStack::spawn`].
+    pub fn new(assigned: &AssignedConfig, sink: TxSink, inner_mtu: usize, inner_mtu_stack: usize) -> Result<InnerStack> {
         let mtu = effective_mtu(inner_mtu);
         if mtu != inner_mtu {
             warn!("inner MTU {inner_mtu} clamped to {mtu}");
         }
+        let stack_mtu = inner_mtu_stack.clamp(mtu, MAX_INNER_MTU);
+        if stack_mtu != inner_mtu_stack {
+            warn!("inner stack MTU {inner_mtu_stack} clamped to {stack_mtu}");
+        }
         let epoch = Instant::now();
-        let mut device = EspDevice::new(sink, mtu, DEFAULT_RX_QUEUE_DEPTH);
+        let mut device = EspDevice::new(sink, mtu, stack_mtu, DEFAULT_RX_QUEUE_DEPTH);
         let mut config = IfaceConfig::new(HardwareAddress::Ip);
         config.random_seed = rand::random();
         let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::from_micros(0i64));
@@ -384,7 +453,8 @@ impl InnerStack {
         let has_v6 = iface.ip_addrs().iter().any(|c| matches!(c, IpCidr::Ipv6(_)));
         let has_v4 = iface.ip_addrs().iter().any(|c| matches!(c, IpCidr::Ipv4(_)));
 
-        // Nominal default routes (Medium::Ip has no next-hop resolution).
+        // Default routes: required for off-prefix delivery (smoltcp's `has_neighbor`
+        // needs a route); only the next hop is nominal (no ND/ARP on Medium::Ip).
         if has_v6 {
             let gw = assigned.dns_ipv6.first().copied().or(v6.first().copied()).unwrap_or(Ipv6Addr::UNSPECIFIED);
             iface.routes_mut().add_default_ipv6_route(gw).map_err(|e| Error::Config(format!("inner IPv6 route: {e:?}")))?;
@@ -394,7 +464,8 @@ impl InnerStack {
             iface.routes_mut().add_default_ipv4_route(gw).map_err(|e| Error::Config(format!("inner IPv4 route: {e:?}")))?;
         }
 
-        // DNS servers of the families we can reach; smoltcp keeps the first DNS_MAX_SERVER_COUNT.
+        // DNS servers of the families we can reach (smoltcp fails every query sent to a
+        // non-unicast server, so those are skipped); smoltcp keeps the first DNS_MAX_SERVER_COUNT.
         let mut servers: Vec<IpAddress> = Vec::new();
         if has_v6 {
             servers.extend(assigned.dns_ipv6.iter().map(|a| IpAddress::Ipv6(*a)));
@@ -402,6 +473,14 @@ impl InnerStack {
         if has_v4 {
             servers.extend(assigned.dns_ipv4.iter().map(|a| IpAddress::Ipv4(*a)));
         }
+        servers.retain(|s| {
+            if s.is_unicast() {
+                true
+            } else {
+                warn!("ignoring non-unicast inner DNS server {s}");
+                false
+            }
+        });
         if servers.len() > smoltcp::config::DNS_MAX_SERVER_COUNT {
             warn!(
                 "{} inner DNS servers assigned; keeping the first {}",
@@ -414,7 +493,7 @@ impl InnerStack {
         let dns = sockets.add(dns::Socket::new(&servers, vec![]));
 
         info!(
-            "inner stack: mtu {mtu}, addresses {:?}, dns {:?}, ipv4 fragmentation up to {} bytes",
+            "inner stack: wire mtu {mtu}, stack mtu {stack_mtu}, addresses {:?}, dns {:?}, smoltcp ipv4 fragmentation up to {} bytes",
             iface.ip_addrs(),
             servers,
             smoltcp::config::FRAGMENTATION_BUFFER_SIZE
@@ -429,6 +508,7 @@ impl InnerStack {
                     iface,
                     sockets,
                     device,
+                    reassembler: Ipv6Reassembler::default(),
                     dns,
                     udp: HashMap::new(),
                     dns_waiters: Vec::new(),
@@ -438,6 +518,8 @@ impl InnerStack {
                     closed: None,
                     udp_delivered: 0,
                     udp_queue_drops: 0,
+                    udp_send_full: 0,
+                    udp_tx_drops: 0,
                     dns_queries: 0,
                 }),
                 cv: Condvar::new(),
@@ -447,10 +529,25 @@ impl InnerStack {
         })
     }
 
-    /// Spawn the stack thread (`epdg-stack`) running [`InnerStack::run`].
+    /// Spawn the stack thread (`epdg-stack`) running [`InnerStack::run`]. Should the
+    /// thread panic, the stack is closed (every pending and later operation fails with
+    /// `Error::Closed`) instead of stranding its waiters.
     pub fn spawn(&self) -> Result<JoinHandle<()>> {
         let stack = self.clone();
-        thread::Builder::new().name("epdg-stack".into()).spawn(move || stack.run()).map_err(Error::Io)
+        thread::Builder::new()
+            .name("epdg-stack".into())
+            .spawn(move || {
+                if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stack.run())) {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic".into());
+                    warn!("stack thread panicked: {msg}");
+                    stack.close(format!("stack thread panicked: {msg}"));
+                }
+            })
+            .map_err(Error::Io)
     }
 
     /// The stack thread body: poll, hand results out, sleep until the next smoltcp
@@ -500,13 +597,17 @@ impl InnerStack {
     }
 
     /// Queue one decapsulated inner IP packet (from the ESP rx thread) and wake the
-    /// stack thread. Never blocks for long: the device queue is bounded (drop-oldest).
+    /// stack thread. IPv6 fragments are held by the reassembler until their set is
+    /// complete (§11.1). Never blocks for long: the device queue is bounded (drop-oldest).
     pub fn push_rx(&self, packet: Vec<u8>) {
         {
             let mut st = lock(&self.shared.state);
             if st.closed.is_some() {
                 return;
             }
+            let Some(packet) = st.reassembler.push(packet, Instant::now()) else {
+                return;
+            };
             st.device.push_rx(packet);
         }
         self.shared.notify();
@@ -537,7 +638,7 @@ impl InnerStack {
         drop(st);
         self.shared.notify();
         debug!("inner UDP port {port} bound");
-        Ok(InnerUdpSocket { port, rx, stack: self.clone() })
+        Ok(InnerUdpSocket { port, rx: Mutex::new(rx), stack: self.clone() })
     }
 
     /// Resolve `name` over the assigned DNS servers: AAAA and A queries (a family we
@@ -589,6 +690,7 @@ impl InnerStack {
         if types.is_empty() {
             return Err(Error::Config("no inner address assigned; cannot resolve".into()));
         }
+        let started = self.shared.now();
         let State { iface, sockets, dns, dns_waiters, dns_queries, .. } = &mut *st;
         let sock = sockets.get_mut::<dns::Socket>(*dns);
         let mut slots = Vec::with_capacity(types.len());
@@ -596,7 +698,7 @@ impl InnerStack {
             match sock.start_query(iface.context(), name, t) {
                 Ok(handle) => {
                     let slot = Arc::new(DnsSlot::default());
-                    dns_waiters.push(DnsWaiter { handle, slot: Arc::clone(&slot) });
+                    dns_waiters.push(DnsWaiter { handle, slot: Arc::clone(&slot), started });
                     slots.push(slot);
                     *dns_queries += 1;
                     trace!("dns query {t:?} {name} started");
@@ -638,6 +740,7 @@ impl InnerStack {
     pub fn stats(&self) -> StackStats {
         let st = lock(&self.shared.state);
         let d: DeviceStats = st.device.stats();
+        let r: ReassemblyStats = st.reassembler.stats();
         StackStats {
             rx_packets: d.rx_packets,
             rx_bytes: d.rx_bytes,
@@ -645,8 +748,15 @@ impl InnerStack {
             tx_packets: d.tx_packets,
             tx_bytes: d.tx_bytes,
             tx_errors: d.tx_errors,
+            tx_fragmented: d.tx_fragmented,
+            tx_frag_drops: d.tx_frag_drops,
+            rx_fragments: r.fragments,
+            rx_reassembled: r.reassembled,
+            rx_reassembly_drops: r.drops,
             udp_delivered: st.udp_delivered,
             udp_queue_drops: st.udp_queue_drops,
+            udp_send_full: st.udp_send_full,
+            udp_tx_drops: st.udp_tx_drops,
             dns_queries: st.dns_queries,
             udp_bindings: st.udp.len() as u64,
         }
@@ -662,8 +772,14 @@ impl InnerStack {
             .collect()
     }
 
-    /// Link MTU of the inner interface.
+    /// Wire MTU of the inner interface (`child.inner_mtu`): the largest packet handed
+    /// to the TX sink.
     pub fn mtu(&self) -> usize {
+        lock(&self.shared.state).device.wire_mtu()
+    }
+
+    /// MTU smoltcp sees (`child.inner_mtu_stack`, §11.1): bounds one UDP datagram.
+    pub fn stack_mtu(&self) -> usize {
         lock(&self.shared.state).device.mtu()
     }
 
@@ -701,9 +817,9 @@ impl InnerUdpSocket {
         let max = max_udp_payload(st.device.mtu(), dst.is_ipv4());
         if payload.len() > max {
             return Err(Error::Protocol(format!(
-                "{} byte payload exceeds the {max} byte limit for inner {family} datagrams{}",
+                "{} byte payload exceeds the {max} byte limit for inner {family} datagrams (inner_mtu_stack {})",
                 payload.len(),
-                if dst.is_ipv6() { " (smoltcp has no IPv6 fragmentation)" } else { "" }
+                st.device.mtu()
             )));
         }
         let handle = st
@@ -711,13 +827,15 @@ impl InnerUdpSocket {
             .get(&self.port)
             .map(|b| b.handle)
             .ok_or_else(|| Error::Closed(format!("inner UDP port {} is no longer bound", self.port)))?;
-        st.sockets
-            .get_mut::<udp::Socket>(handle)
-            .send_slice(payload, IpEndpoint::from(dst))
-            .map_err(|e| match e {
-                udp::SendError::BufferFull => Error::Protocol(format!("inner UDP port {}: send buffer full", self.port)),
+        if let Err(e) = st.sockets.get_mut::<udp::Socket>(handle).send_slice(payload, IpEndpoint::from(dst)) {
+            return Err(match e {
+                udp::SendError::BufferFull => {
+                    st.udp_send_full += 1;
+                    Error::Protocol(format!("inner UDP port {}: send buffer full", self.port))
+                }
                 udp::SendError::Unaddressable => Error::Config(format!("inner UDP: {dst} is not addressable")),
-            })?;
+            });
+        }
         drop(st);
         self.stack.shared.notify();
         trace!("inner UDP tx port {} -> {} ({} bytes)", self.port, dst, payload.len());
@@ -727,7 +845,8 @@ impl InnerUdpSocket {
     /// Wait up to `timeout` for a datagram addressed to this port. `Ok(None)` on
     /// timeout, `Error::Closed` once the stack is stopped.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<UdpDatagram>> {
-        match self.rx.recv_timeout(timeout) {
+        let r = lock(&self.rx).recv_timeout(timeout);
+        match r {
             Ok(dg) => Ok(Some(dg)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
@@ -743,10 +862,24 @@ impl InnerUdpSocket {
 }
 
 impl Drop for InnerUdpSocket {
+    /// Unbind the port. Datagrams `send_to` accepted but the stack thread has not
+    /// transmitted yet are flushed first (the sink is synchronous, so this thread can
+    /// drive egress itself); whatever still cannot leave is counted in `udp_tx_drops`.
     fn drop(&mut self) {
         {
             let mut st = lock(&self.stack.shared.state);
             if let Some(b) = st.udp.remove(&self.port) {
+                let queued = st.sockets.get::<udp::Socket>(b.handle).send_queue();
+                if queued > 0 {
+                    let now = self.stack.shared.now();
+                    let State { iface, device, sockets, .. } = &mut *st;
+                    while iface.poll_egress(now, device, sockets) == PollResult::SocketStateChanged {}
+                    let left = st.sockets.get::<udp::Socket>(b.handle).send_queue();
+                    if left > 0 {
+                        st.udp_tx_drops += left as u64;
+                        debug!("inner UDP port {}: {left} queued datagram(s) dropped on close", self.port);
+                    }
+                }
                 st.sockets.remove(b.handle);
                 debug!("inner UDP port {} unbound", self.port);
             }
@@ -775,7 +908,10 @@ mod tests {
     const B_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0xb, 0, 0, 0, 0, 1);
     const A_V4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
     const B_V4: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);
+    /// Wire MTU: every packet a sink sees must fit it.
     const MTU: usize = 1280;
+    /// MTU smoltcp sees (§11.1).
+    const STACK_MTU: usize = 16384;
     const WAIT: Duration = Duration::from_secs(5);
 
     fn assigned(v6: Option<Ipv6Addr>, v4: Option<Ipv4Addr>, dns6: Option<Ipv6Addr>, dns4: Option<Ipv4Addr>) -> AssignedConfig {
@@ -789,20 +925,22 @@ mod tests {
     }
 
     /// One direction of the loopback "wire": the sink (which runs on the sending
-    /// stack's thread, with that stack's lock held) only records the packet size and
-    /// queues the packet; a forwarder thread pushes it into the far stack. The sink
-    /// must never lock the far stack itself: the two stack threads would deadlock
-    /// (A holds A, pushes into B; B holds B, replies into A). The real tunnel has the
-    /// same shape — the sink does a UDP send, the far side's rx thread does `push_rx`.
+    /// stack's thread, with that stack's lock held) asserts the packet fits the wire
+    /// MTU (§11.1), records it and queues it; a forwarder thread pushes it into the far
+    /// stack. The sink must never lock the far stack itself: the two stack threads
+    /// would deadlock (A holds A, pushes into B; B holds B, replies into A). The real
+    /// tunnel has the same shape — the sink does a UDP send, the far side's rx thread
+    /// does `push_rx`.
     fn wire(
         name: &str,
         target: Arc<OnceLock<InnerStack>>,
-        tap: Arc<Mutex<Vec<usize>>>,
+        tap: Arc<Mutex<Vec<Vec<u8>>>>,
         stop: Arc<AtomicBool>,
     ) -> (TxSink, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let sink: TxSink = Arc::new(move |pkt: &[u8]| {
-            tap.lock().unwrap().push(pkt.len());
+            assert!(pkt.len() <= MTU, "sink handed a {} byte packet, wire MTU is {MTU}", pkt.len());
+            tap.lock().unwrap().push(pkt.to_vec());
             tx.send(pkt.to_vec()).map_err(|_| Error::Protocol("wire down".into()))
         });
         let forwarder = thread::Builder::new()
@@ -828,13 +966,14 @@ mod tests {
         (sink, forwarder)
     }
 
-    /// Two stacks whose devices feed each other over asynchronous wires; `a_wire`
-    /// records the size of every IP packet A transmitted. Stops and joins every
-    /// thread on drop.
+    /// Two stacks whose devices feed each other over asynchronous wires; `a_wire` /
+    /// `b_wire` record every IP packet A / B transmitted. Stops and joins every thread
+    /// on drop.
     struct Pair {
         a: InnerStack,
         b: InnerStack,
-        a_wire: Arc<Mutex<Vec<usize>>>,
+        a_wire: Arc<Mutex<Vec<Vec<u8>>>>,
+        b_wire: Arc<Mutex<Vec<Vec<u8>>>>,
         stop_wires: Arc<AtomicBool>,
         threads: Vec<JoinHandle<()>>,
     }
@@ -847,13 +986,27 @@ mod tests {
             let b_slot: Arc<OnceLock<InnerStack>> = Arc::new(OnceLock::new());
             let a_slot: Arc<OnceLock<InnerStack>> = Arc::new(OnceLock::new());
             let (sink_a, wire_ab) = wire("wire-a-to-b", Arc::clone(&b_slot), Arc::clone(&a_wire), Arc::clone(&stop_wires));
-            let (sink_b, wire_ba) = wire("wire-b-to-a", Arc::clone(&a_slot), b_wire, Arc::clone(&stop_wires));
-            let a = InnerStack::new(&a_cfg, sink_a, MTU).unwrap();
-            let b = InnerStack::new(&b_cfg, sink_b, MTU).unwrap();
+            let (sink_b, wire_ba) = wire("wire-b-to-a", Arc::clone(&a_slot), Arc::clone(&b_wire), Arc::clone(&stop_wires));
+            let a = InnerStack::new(&a_cfg, sink_a, MTU, STACK_MTU).unwrap();
+            let b = InnerStack::new(&b_cfg, sink_b, MTU, STACK_MTU).unwrap();
             let _ = b_slot.set(b.clone());
             let _ = a_slot.set(a.clone());
             let threads = vec![a.spawn().unwrap(), b.spawn().unwrap(), wire_ab, wire_ba];
-            Pair { a, b, a_wire, stop_wires, threads }
+            Pair { a, b, a_wire, b_wire, stop_wires, threads }
+        }
+
+        /// Sizes of the packets A transmitted so far.
+        fn a_wire_lens(&self) -> Vec<usize> {
+            self.a_wire.lock().unwrap().iter().map(Vec::len).collect()
+        }
+
+        /// Wait until B has transmitted at least `n` packets; returns them.
+        fn b_wire_after(&self, n: usize) -> Vec<Vec<u8>> {
+            let deadline = Instant::now() + WAIT;
+            while self.b_wire.lock().unwrap().len() < n && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            self.b_wire.lock().unwrap().clone()
         }
 
         /// A(v6 + v4, DNS = B) <-> B(v6 on another /64 + v4, DNS = A).
@@ -922,22 +1075,59 @@ mod tests {
         assert_eq!(effective_mtu(100), MIN_INNER_MTU);
         assert_eq!(effective_mtu(1400), 1400);
         assert_eq!(effective_mtu(1 << 20), MAX_INNER_MTU);
+        // The payload cap follows the stack MTU (§11.1): inner_mtu_stack - 48 / - 28.
         assert_eq!(max_udp_payload(1280, false), 1280 - 48);
+        assert_eq!(max_udp_payload(STACK_MTU, false), STACK_MTU - 48);
         assert_eq!(max_udp_payload(1280, true), smoltcp::config::FRAGMENTATION_BUFFER_SIZE - 28);
-        assert!(max_udp_payload(1280, true) >= 3000, "the fragmentation buffer must hold the test payload");
+        assert_eq!(max_udp_payload(STACK_MTU, true), STACK_MTU - 28);
+        assert!(max_udp_payload(STACK_MTU, false) >= 3000, "the stack MTU must hold the test payload");
         assert_eq!(max_udp_payload(65535, true), 65535 - 28);
     }
 
     #[test]
     fn stack_installs_addresses_and_stats_start_at_zero() {
         let sink: TxSink = Arc::new(|_: &[u8]| Ok(()));
-        let s = InnerStack::new(&assigned(Some(A_V6), Some(A_V4), Some(B_V6), None), sink, 1400).unwrap();
+        let s = InnerStack::new(&assigned(Some(A_V6), Some(A_V4), Some(B_V6), None), sink.clone(), 1400, 9000).unwrap();
         let mut addrs = s.addresses();
         addrs.sort();
         assert_eq!(addrs, vec![(IpAddr::V4(A_V4), 32), (IpAddr::V6(A_V6), 64)]);
         assert_eq!(s.mtu(), 1400);
+        assert_eq!(s.stack_mtu(), 9000);
         assert_eq!(s.stats(), StackStats::default());
         assert!(!s.is_closed());
+        // The stack MTU is clamped to [wire MTU, 65535].
+        let s = InnerStack::new(&assigned(Some(A_V6), None, None, None), sink.clone(), 1400, 100).unwrap();
+        assert_eq!((s.mtu(), s.stack_mtu()), (1400, 1400));
+        let s = InnerStack::new(&assigned(Some(A_V6), None, None, None), sink, 1400, 1 << 20).unwrap();
+        assert_eq!((s.mtu(), s.stack_mtu()), (1400, MAX_INNER_MTU));
+    }
+
+    #[test]
+    fn non_unicast_dns_servers_are_skipped() {
+        let sink: TxSink = Arc::new(|_: &[u8]| Ok(()));
+        let cfg = AssignedConfig {
+            internal_ipv6: vec![(A_V6, 64)],
+            internal_ipv4: vec![A_V4],
+            dns_ipv6: vec![Ipv6Addr::UNSPECIFIED, Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1)],
+            dns_ipv4: vec![Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST],
+            ..Default::default()
+        };
+        let s = InnerStack::new(&cfg, sink.clone(), MTU, STACK_MTU).unwrap();
+        let e = s.resolve(HOST, WAIT).unwrap_err();
+        assert!(matches!(e, Error::Config(ref m) if m.contains("no inner DNS server")), "{e}");
+        assert_eq!(s.stats().dns_queries, 0);
+        // A usable server after a garbage one is kept and used.
+        let p = Pair::new(
+            AssignedConfig {
+                internal_ipv6: vec![(A_V6, 64)],
+                internal_ipv4: vec![A_V4],
+                dns_ipv4: vec![Ipv4Addr::UNSPECIFIED, B_V4],
+                ..Default::default()
+            },
+            assigned(Some(B_V6), Some(B_V4), None, None),
+        );
+        let _server = DnsServer::start(&p.b, vec![IpAddr::V4(ANS_V4)], 0);
+        assert_eq!(p.a.resolve(HOST, WAIT).unwrap(), vec![IpAddr::V4(ANS_V4)]);
     }
 
     #[test]
@@ -948,7 +1138,7 @@ mod tests {
             internal_ipv4: vec![Ipv4Addr::BROADCAST, Ipv4Addr::UNSPECIFIED, A_V4],
             ..Default::default()
         };
-        let s = InnerStack::new(&cfg, sink, 1280).unwrap();
+        let s = InnerStack::new(&cfg, sink, 1280, STACK_MTU).unwrap();
         let mut addrs = s.addresses();
         addrs.sort();
         assert_eq!(addrs, vec![(IpAddr::V4(A_V4), 32), (IpAddr::V6(A_V6), 128)], "prefix clamped to 128");
@@ -1025,25 +1215,238 @@ mod tests {
         assert_eq!(dg.payload.len(), 3000);
         assert_eq!(dg.payload, payload, "reassembled payload intact");
         assert_eq!(dg.src, SocketAddr::new(A_V4.into(), sa.local_port()));
-        let wire = p.a_wire.lock().unwrap().clone();
+        let wire = p.a_wire_lens();
         assert!(wire.len() >= 3, "3028 bytes need >= 3 fragments at MTU 1280, saw {wire:?}");
         assert!(wire.iter().all(|&len| len <= MTU), "every fragment fits the MTU: {wire:?}");
         assert_eq!(wire.iter().sum::<usize>(), 3000 + 8 + 20 * wire.len(), "fragments carry the whole datagram once");
-        assert_eq!(p.a.stats().tx_packets as usize, wire.len());
+        let st = p.a.stats();
+        assert_eq!(st.tx_packets as usize, wire.len());
+        assert_eq!((st.tx_fragmented, st.tx_frag_drops), (1, 0), "split by the §11.1 shim, not smoltcp: {st:?}");
         // And back, so B's fragmenter is exercised too.
         sb.send_to(dg.src, &payload).unwrap();
         assert_eq!(recv(&sa).payload, payload);
     }
 
     #[test]
-    fn ipv6_payload_that_does_not_fit_the_mtu_is_refused() {
-        // smoltcp 0.14 has no IPv6 fragmentation on Medium::Ip: refuse instead of losing it.
+    fn ipv6_3000_byte_payload_is_fragmented_at_the_wire_mtu_and_reassembled() {
+        // §11.1: the wire MTU is 1280 (every sink asserts it), smoltcp sees STACK_MTU.
         let p = Pair::dual();
         let sa = p.a.bind_udp(0).unwrap();
-        let limit = MTU - 48;
-        sa.send_to(SocketAddr::new(B_V6.into(), 7000), &vec![0u8; limit]).unwrap();
+        let sb = p.b.bind_udp(5060).unwrap();
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 249) as u8).collect();
+        sa.send_to(SocketAddr::new(B_V6.into(), 5060), &payload).unwrap();
+        let dg = recv(&sb);
+        assert_eq!(dg.payload, payload, "reassembled payload intact");
+        assert_eq!(dg.src, SocketAddr::new(A_V6.into(), sa.local_port()));
+        assert_eq!(dg.dst, SocketAddr::new(B_V6.into(), 5060));
+        let wire = p.a_wire.lock().unwrap().clone();
+        assert_eq!(wire.len(), 3, "3008 bytes = 1232 + 1232 + 544 at MTU 1280");
+        assert!(wire.iter().all(|pkt| pkt.len() <= MTU && pkt[6] == 44), "IPv6 fragments within the wire MTU");
+        let a = p.a.stats();
+        assert_eq!((a.tx_packets, a.tx_fragmented, a.tx_frag_drops, a.tx_errors), (3, 1, 0, 0), "{a:?}");
+        let b = p.b.stats();
+        assert_eq!((b.rx_packets, b.rx_fragments, b.rx_reassembled, b.rx_reassembly_drops), (1, 3, 1, 0), "{b:?}");
+        // And back, so B's fragmenter and A's reassembler are exercised too.
+        sb.send_to(dg.src, &payload).unwrap();
+        assert_eq!(recv(&sa).payload, payload);
+        assert_eq!(p.a.stats().rx_reassembled, 1);
+        // Both families at once, larger still.
+        let big: Vec<u8> = (0..8000u32).map(|i| (i % 7) as u8).collect();
+        sa.send_to(SocketAddr::new(B_V6.into(), 5060), &big).unwrap();
+        assert_eq!(recv(&sb).payload, big);
+    }
+
+    #[test]
+    fn ipv6_payload_beyond_the_stack_mtu_is_refused_up_front() {
+        let p = Pair::dual();
+        let sa = p.a.bind_udp(0).unwrap();
+        let sb = p.b.bind_udp(7000).unwrap();
+        // Above the wire MTU but within the stack MTU: accepted and delivered (§11.1).
+        sa.send_to(SocketAddr::new(B_V6.into(), 7000), &vec![7u8; MTU - 48 + 1]).unwrap();
+        assert_eq!(recv(&sb).payload.len(), MTU - 48 + 1);
+        let limit = STACK_MTU - 48;
+        sa.send_to(SocketAddr::new(B_V6.into(), 7000), &vec![1u8; limit]).unwrap();
+        assert_eq!(recv(&sb).payload.len(), limit);
         let e = sa.send_to(SocketAddr::new(B_V6.into(), 7000), &vec![0u8; limit + 1]).unwrap_err();
-        assert!(matches!(e, Error::Protocol(ref m) if m.contains("IPv6 fragmentation")), "{e}");
+        assert!(matches!(e, Error::Protocol(ref m) if m.contains("inner_mtu_stack")), "{e}");
+        let e = sa.send_to(SocketAddr::new(B_V4.into(), 7000), &vec![0u8; STACK_MTU - 28 + 1]).unwrap_err();
+        assert!(matches!(e, Error::Protocol(_)), "{e}");
+    }
+
+    /// Hand-built IPv6/UDP datagram `src:sport -> dst:dport` with valid checksums.
+    fn ipv6_udp_packet(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+        use smoltcp::wire::{Ipv6Packet, Ipv6Repr, UdpPacket, UdpRepr};
+        let caps = smoltcp::phy::ChecksumCapabilities::default();
+        let udp = UdpRepr { src_port: sport, dst_port: dport };
+        let ip = Ipv6Repr {
+            src_addr: src,
+            dst_addr: dst,
+            next_header: smoltcp::wire::IpProtocol::Udp,
+            payload_len: udp.header_len() + payload.len(),
+            hop_limit: 64,
+        };
+        let mut buf = vec![0u8; ip.buffer_len() + ip.payload_len];
+        let mut ipp = Ipv6Packet::new_unchecked(&mut buf);
+        ip.emit(&mut ipp);
+        let mut udpp = UdpPacket::new_unchecked(ipp.payload_mut());
+        udp.emit(&mut udpp, &IpAddress::Ipv6(src), &IpAddress::Ipv6(dst), payload.len(), |b| b.copy_from_slice(payload), &caps);
+        buf
+    }
+
+    #[test]
+    fn burst_larger_than_the_smoltcp_socket_buffer_is_delivered_in_full() {
+        // Everything queued in the device before the stack thread runs (a whole device
+        // queue, 256 packets, far more than the 32 slots of a smoltcp UDP socket) must
+        // reach the binding's channel: ingress is drained packet by packet.
+        let (sink, _tap) = {
+            let tap = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+            let t = Arc::clone(&tap);
+            let sink: TxSink = Arc::new(move |pkt: &[u8]| {
+                t.lock().unwrap().push(pkt.to_vec());
+                Ok(())
+            });
+            (sink, tap)
+        };
+        let b = InnerStack::new(&assigned(Some(B_V6), None, None, None), sink, MTU, STACK_MTU).unwrap();
+        let sb = b.bind_udp(6000).unwrap();
+        let n = DEFAULT_RX_QUEUE_DEPTH;
+        assert!(n > UDP_SOCKET_PACKETS);
+        for i in 0..n {
+            b.push_rx(ipv6_udp_packet(A_V6, B_V6, 40000, 6000, &(i as u32).to_be_bytes()));
+        }
+        assert_eq!(b.stats().rx_packets as usize, n);
+        assert_eq!(b.stats().rx_queue_drops, 0);
+        let t = b.spawn().unwrap();
+        for i in 0..n {
+            let dg = sb.recv_timeout(WAIT).unwrap().unwrap_or_else(|| panic!("datagram {i} of {n} missing"));
+            assert_eq!(dg.payload, (i as u32).to_be_bytes(), "in order");
+            assert_eq!(dg.src, SocketAddr::new(A_V6.into(), 40000));
+        }
+        let st = b.stats();
+        assert_eq!((st.udp_delivered as usize, st.udp_queue_drops), (n, 0), "{st:?}");
+        b.stop();
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn send_to_then_drop_still_transmits_the_datagram() {
+        // Fire-and-forget (bind, send, drop): Drop flushes the socket before removing it.
+        let p = Pair::dual();
+        let sb = p.b.bind_udp(5062).unwrap();
+        let n = 40u32;
+        for i in 0..n {
+            let s = p.a.bind_udp(0).unwrap();
+            s.send_to(SocketAddr::new(B_V6.into(), 5062), &i.to_be_bytes()).unwrap();
+            drop(s);
+        }
+        let mut got: Vec<u32> = (0..n).map(|_| u32::from_be_bytes(recv(&sb).payload.try_into().unwrap())).collect();
+        got.sort_unstable();
+        assert_eq!(got, (0..n).collect::<Vec<_>>());
+        let st = p.a.stats();
+        assert_eq!((st.tx_packets, st.udp_tx_drops, st.udp_bindings), (n as u64, 0, 0), "{st:?}");
+    }
+
+    #[test]
+    fn send_buffer_full_is_an_error_and_counted() {
+        let sink: TxSink = Arc::new(|_: &[u8]| Ok(()));
+        // No stack thread: nothing drains the smoltcp tx buffer.
+        let s = InnerStack::new(&assigned(Some(A_V6), None, None, None), sink, MTU, STACK_MTU).unwrap();
+        let sock = s.bind_udp(0).unwrap();
+        for _ in 0..UDP_SOCKET_PACKETS {
+            sock.send_to(SocketAddr::new(B_V6.into(), 9), b"x").unwrap();
+        }
+        let e = sock.send_to(SocketAddr::new(B_V6.into(), 9), b"x").unwrap_err();
+        assert!(matches!(e, Error::Protocol(ref m) if m.contains("send buffer full")), "{e}");
+        assert_eq!(s.stats().udp_send_full, 1);
+        // Drop flushes the 32 queued datagrams through the sink on this thread.
+        drop(sock);
+        let st = s.stats();
+        assert_eq!((st.tx_packets, st.udp_tx_drops), (UDP_SOCKET_PACKETS as u64, 0), "{st:?}");
+    }
+
+    #[test]
+    fn inner_udp_socket_is_shared_between_a_receiver_and_senders() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<InnerUdpSocket>();
+        assert_send_sync::<InnerStack>();
+        assert_send_sync::<UdpDatagram>();
+
+        let p = Pair::dual();
+        let sa = p.a.bind_udp(0).unwrap();
+        let sb = p.b.bind_udp(5060).unwrap();
+        let n = 20u32;
+        thread::scope(|sc| {
+            // One thread blocks receiving on `sb` while two others send on the same handle.
+            let echo = sc.spawn(|| {
+                for _ in 0..n {
+                    let dg = recv(&sb);
+                    sb.send_to(dg.src, &dg.payload).unwrap();
+                }
+            });
+            let senders: Vec<_> = (0..2)
+                .map(|t| {
+                    let sa = &sa;
+                    sc.spawn(move || {
+                        for i in 0..n / 2 {
+                            sa.send_to(SocketAddr::new(B_V6.into(), 5060), &(t * 100 + i).to_be_bytes()).unwrap();
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    })
+                })
+                .collect();
+            for s in senders {
+                s.join().unwrap();
+            }
+            echo.join().unwrap();
+        });
+        let mut got: Vec<u32> = (0..n).map(|_| u32::from_be_bytes(recv(&sa).payload.try_into().unwrap())).collect();
+        got.sort_unstable();
+        let mut want: Vec<u32> = (0..2).flat_map(|t| (0..n / 2).map(move |i| t * 100 + i)).collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn icmp_echo_requests_are_answered() {
+        use smoltcp::wire::{
+            Icmpv4Packet, Icmpv4Repr, Icmpv6Packet, Icmpv6Repr, IpProtocol, Ipv4Packet, Ipv4Repr, Ipv6Packet, Ipv6Repr,
+        };
+        let caps = smoltcp::phy::ChecksumCapabilities::default();
+        let p = Pair::dual();
+        // ICMPv6 echo request A -> B (as a P-CSCF liveness ping would arrive).
+        let data = b"ping-v6";
+        let req = Icmpv6Repr::EchoRequest { ident: 0x1234, seq_no: 7, data };
+        let ip = Ipv6Repr { src_addr: A_V6, dst_addr: B_V6, next_header: IpProtocol::Icmpv6, payload_len: req.buffer_len(), hop_limit: 64 };
+        let mut buf = vec![0u8; ip.buffer_len() + ip.payload_len];
+        let mut ipp = Ipv6Packet::new_unchecked(&mut buf);
+        ip.emit(&mut ipp);
+        req.emit(&A_V6, &B_V6, &mut Icmpv6Packet::new_unchecked(ipp.payload_mut()), &caps);
+        p.b.push_rx(buf);
+        let wire = p.b_wire_after(1);
+        assert_eq!(wire.len(), 1, "B answered with exactly one packet");
+        let ipp = Ipv6Packet::new_checked(wire[0].as_slice()).unwrap();
+        let ipr = Ipv6Repr::parse(&ipp).unwrap();
+        assert_eq!((ipr.src_addr, ipr.dst_addr, ipr.next_header), (B_V6, A_V6, IpProtocol::Icmpv6));
+        let reply = Icmpv6Repr::parse(&B_V6, &A_V6, &Icmpv6Packet::new_checked(ipp.payload()).unwrap(), &caps).unwrap();
+        assert_eq!(reply, Icmpv6Repr::EchoReply { ident: 0x1234, seq_no: 7, data });
+
+        // ICMPv4 echo request A -> B.
+        let data4 = b"ping-v4";
+        let req4 = Icmpv4Repr::EchoRequest { ident: 0x4321, seq_no: 9, data: data4 };
+        let ip4 = Ipv4Repr { src_addr: A_V4, dst_addr: B_V4, next_header: IpProtocol::Icmp, payload_len: req4.buffer_len(), hop_limit: 64 };
+        let mut buf4 = vec![0u8; ip4.buffer_len() + ip4.payload_len];
+        let mut ipp4 = Ipv4Packet::new_unchecked(&mut buf4);
+        ip4.emit(&mut ipp4, &caps);
+        req4.emit(&mut Icmpv4Packet::new_unchecked(ipp4.payload_mut()), &caps);
+        p.b.push_rx(buf4);
+        let wire = p.b_wire_after(2);
+        assert_eq!(wire.len(), 2);
+        let ipp4 = Ipv4Packet::new_checked(wire[1].as_slice()).unwrap();
+        let ipr4 = Ipv4Repr::parse(&ipp4, &caps).unwrap();
+        assert_eq!((ipr4.src_addr, ipr4.dst_addr, ipr4.next_header), (B_V4, A_V4, IpProtocol::Icmp));
+        let reply4 = Icmpv4Repr::parse(&Icmpv4Packet::new_checked(ipp4.payload()).unwrap(), &caps).unwrap();
+        assert_eq!(reply4, Icmpv4Repr::EchoReply { ident: 0x4321, seq_no: 9, data: data4 });
+        assert_eq!(p.b.stats().rx_packets, 2);
     }
 
     #[test]
@@ -1274,6 +1677,23 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reports_a_silent_server_as_timeout_after_smoltcp_gives_up() {
+        // With a caller timeout beyond smoltcp's 10 s per-server retransmit timeout,
+        // smoltcp itself reports the query as Failed; that is still a Timeout to us.
+        let p = Pair::new(assigned(Some(A_V6), None, Some(B_V6), None), assigned(Some(B_V6), None, None, None));
+        let started = Instant::now();
+        let e = p.a.resolve(HOST, SMOLTCP_DNS_RETRANSMIT_TIMEOUT + Duration::from_secs(4)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(matches!(e, Error::Timeout(_)), "{e} after {elapsed:?}");
+        assert!(elapsed >= SMOLTCP_DNS_RETRANSMIT_TIMEOUT && elapsed < SMOLTCP_DNS_RETRANSMIT_TIMEOUT + Duration::from_secs(3), "{elapsed:?}");
+        assert_eq!(p.a.pending_dns_queries(), 0);
+        assert!(p.a.stats().tx_packets >= 2, "the query was retransmitted");
+        // A negative answer within that window is still a Protocol error.
+        let _server = DnsServer::start(&p.b, vec![], 3);
+        assert!(matches!(p.a.resolve(HOST, WAIT).unwrap_err(), Error::Protocol(_)));
+    }
+
+    #[test]
     fn resolve_times_out_cleanly_when_nothing_answers() {
         let p = Pair::dual();
         let started = Instant::now();
@@ -1290,11 +1710,11 @@ mod tests {
     #[test]
     fn resolve_input_errors() {
         let sink: TxSink = Arc::new(|_: &[u8]| Ok(()));
-        let no_dns = InnerStack::new(&assigned(Some(A_V6), None, None, None), sink.clone(), MTU).unwrap();
+        let no_dns = InnerStack::new(&assigned(Some(A_V6), None, None, None), sink.clone(), MTU, STACK_MTU).unwrap();
         assert!(matches!(no_dns.resolve(HOST, WAIT).unwrap_err(), Error::Config(_)));
-        let no_addr = InnerStack::new(&assigned(None, None, Some(B_V6), None), sink.clone(), MTU).unwrap();
+        let no_addr = InnerStack::new(&assigned(None, None, Some(B_V6), None), sink.clone(), MTU, STACK_MTU).unwrap();
         assert!(matches!(no_addr.resolve(HOST, WAIT).unwrap_err(), Error::Config(_)));
-        let ok = InnerStack::new(&assigned(Some(A_V6), None, Some(B_V6), None), sink, MTU).unwrap();
+        let ok = InnerStack::new(&assigned(Some(A_V6), None, Some(B_V6), None), sink, MTU, STACK_MTU).unwrap();
         assert!(matches!(ok.resolve("", WAIT).unwrap_err(), Error::Config(_)));
         assert!(matches!(ok.resolve("a..b", WAIT).unwrap_err(), Error::Config(_)));
         let long = format!("{}.example", "x".repeat(64));
@@ -1339,7 +1759,7 @@ mod tests {
                 Err(Error::Protocol("ESP not ready".into()))
             })
         };
-        let s = InnerStack::new(&assigned(Some(A_V6), None, Some(B_V6), None), sink, MTU).unwrap();
+        let s = InnerStack::new(&assigned(Some(A_V6), None, Some(B_V6), None), sink, MTU, STACK_MTU).unwrap();
         let t = s.spawn().unwrap();
         let sock = s.bind_udp(0).unwrap();
         sock.send_to(SocketAddr::new(B_V6.into(), 5060), b"hello").unwrap();
@@ -1351,6 +1771,26 @@ mod tests {
         assert_eq!(errors.load(Ordering::SeqCst), 1);
         s.stop();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn stack_thread_panic_closes_the_stack_instead_of_stranding_waiters() {
+        let sink: TxSink = Arc::new(|_: &[u8]| -> Result<()> { panic!("sink exploded") });
+        let s = InnerStack::new(&assigned(Some(A_V6), None, Some(B_V6), None), sink, MTU, STACK_MTU).unwrap();
+        let t = s.spawn().unwrap();
+        let sock = s.bind_udp(0).unwrap();
+        let resolver = {
+            let s = s.clone();
+            thread::spawn(move || s.resolve(HOST, Duration::from_secs(10)))
+        };
+        // The resolver's query drives the panicking sink on the stack thread.
+        t.join().expect("the guard catches the panic");
+        assert!(s.is_closed());
+        let e = resolver.join().unwrap().unwrap_err();
+        assert!(matches!(e, Error::Closed(ref r) if r.contains("panicked")), "{e}");
+        let e = sock.recv_timeout(Duration::from_millis(10)).unwrap_err();
+        assert!(matches!(e, Error::Closed(ref r) if r.contains("sink exploded")), "{e}");
+        assert!(matches!(s.bind_udp(0).unwrap_err(), Error::Closed(_)));
     }
 
     #[test]

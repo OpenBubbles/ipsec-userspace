@@ -757,7 +757,7 @@ mod tests {
             let m = msg(EXCH_INFORMATIONAL, payloads.clone());
             let raw = m.encode_encrypted(&suite, &sk_e(), &sk_a()).unwrap();
             let expected_ct = padded_len(inner_len, 16);
-            assert_eq!(expected_ct, ((inner_len + 1) + 15) / 16 * 16);
+            assert_eq!(expected_ct, (inner_len + 1).div_ceil(16) * 16);
             assert_eq!(raw.len(), 28 + 4 + 16 + expected_ct + 16, "inner_len {}", inner_len);
             let d = IkeMessage::decode_encrypted(&raw, &suite, &sk_e(), &sk_a()).unwrap();
             assert_eq!(d.payloads, payloads);

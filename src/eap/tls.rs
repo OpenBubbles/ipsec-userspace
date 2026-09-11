@@ -138,15 +138,14 @@ impl EapTlsData {
         } else {
             (None, &type_data[1..])
         };
-        if flags & EAP_TLS_FLAG_M == 0 {
-            if let Some(l) = length {
-                if data.len() > l as usize {
-                    return Err(Error::decode(format!(
-                        "EAP-TLS payload ({} bytes) larger than declared length {l}",
-                        data.len()
-                    )));
-                }
-            }
+        if flags & EAP_TLS_FLAG_M == 0
+            && let Some(l) = length
+            && data.len() > l as usize
+        {
+            return Err(Error::decode(format!(
+                "EAP-TLS payload ({} bytes) larger than declared length {l}",
+                data.len()
+            )));
         }
         Ok(EapTlsData { flags, length, data: data.to_vec() })
     }
@@ -515,13 +514,13 @@ impl EapTlsClient {
                 }
             }
             Some(mut rx) => {
-                if let Some(l) = td.length {
-                    if l as usize != rx.capacity {
-                        return Err(Error::Eap(format!(
-                            "EAP-TLS fragment declares total length {l} but reassembly expects {}",
-                            rx.capacity
-                        )));
-                    }
+                if let Some(l) = td.length
+                    && l as usize != rx.capacity
+                {
+                    return Err(Error::Eap(format!(
+                        "EAP-TLS fragment declares total length {l} but reassembly expects {}",
+                        rx.capacity
+                    )));
                 }
                 let remaining = rx.capacity - rx.buf.len();
                 if td.data.len() > remaining {

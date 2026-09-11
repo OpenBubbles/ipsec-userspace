@@ -579,15 +579,15 @@ fn encode_ts(ts: &TsPayload, out: &mut Vec<u8>) -> Result<()> {
         if s.start_addr.len() != s.end_addr.len() {
             return Err(Error::Encode("TS: start/end address lengths differ".into()));
         }
-        if let Some(want) = ts_addr_len(s.ts_type) {
-            if s.start_addr.len() != want {
-                return Err(Error::Encode(format!(
-                    "TS: type {} needs {}-byte addresses, got {}",
-                    s.ts_type,
-                    want,
-                    s.start_addr.len()
-                )));
-            }
+        if let Some(want) = ts_addr_len(s.ts_type)
+            && s.start_addr.len() != want
+        {
+            return Err(Error::Encode(format!(
+                "TS: type {} needs {}-byte addresses, got {}",
+                s.ts_type,
+                want,
+                s.start_addr.len()
+            )));
         }
         let len = len_u16("TS selector", TS_SELECTOR_HEADER_LEN + s.start_addr.len() + s.end_addr.len())?;
         out.push(s.ts_type);

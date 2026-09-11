@@ -11,7 +11,8 @@ carrier-bundle style configuration. Verified live against T-Mobile's production 
 - Tunnel-mode **ESP** (RFC 4303) encapsulated in UDP/4500, anti-replay window, AES-256-CBC + HMAC-SHA2-256-128.
 - Inner IP stack = **smoltcp 0.14** over the ESP data plane (a `Medium::Ip` device: the tunnel-mode ESP payload *is* the IP
   packet): IPv4/IPv6, inner UDP sockets (`EpdgTunnel::bind_udp`), a DNS resolver over the assigned servers
-  (`EpdgTunnel::resolve`), IPv4 fragmentation/reassembly; ICMP and TCP sockets are one method away in the same `SocketSet`.
+  (`EpdgTunnel::resolve`), IPv4 fragmentation/reassembly, ICMP echo replies; a small shim (`ipstack::frag`) fragments and
+  reassembles IPv6 for the wire MTU, which smoltcp 0.14 cannot do on `Medium::Ip`; TCP sockets are one method away in the same `SocketSet`.
 - Crypto for IKE/ESP via RustCrypto (`aes`/`cbc`/`hmac`/`sha2`) and `num-bigint` MODP DH, behind a transform registry
   (`crypto::registry`) so more algorithms can be added without touching protocol code.
 
@@ -62,8 +63,9 @@ RUST_LOG=debug cargo test --test live_tmobile -- --nocapture   # live: hex dumps
 
 The inner stack is tested offline with an in-process **two-stack loopback** (`ipstack::stack::tests`): two `InnerStack`s
 on different IPv6 /64s (+ a v4 /32 each) whose device sinks feed each other — UDP both ways with exact endpoints,
-off-prefix routing, a 3000-byte IPv4 datagram fragmented at MTU 1280 and reassembled, `resolve()` against a tiny
-in-process DNS server on the far stack's port 53, timeouts, port allocation, queue bounds, shutdown semantics.
+off-prefix routing, 3000-byte IPv4 and IPv6 datagrams fragmented at the wire MTU 1280 and reassembled, ICMP echo,
+bursts and fire-and-forget sends, `resolve()` against a tiny in-process DNS server on the far stack's port 53, timeouts,
+port allocation, queue bounds, shutdown semantics.
 
 `tests/live_tmobile.rs` connects to the T-Mobile PROD ePDG with the fixture credentials, asserts an inner address,
 resolves `ueb2bprod.pc.t-mobile.com` with `tunnel.resolve` (smoltcp DNS over ESP — proves ESP in both directions),
@@ -84,7 +86,9 @@ one mutex + condvar. The ESP rx thread decapsulates and pushes the inner IP pack
 drop-oldest); `send_to` / `bind_udp` / `resolve` hold the lock only to enqueue and then notify; received datagrams
 reach `InnerUdpSocket::recv_timeout` through a bounded channel without touching the lock. smoltcp's compile-time
 limits are raised through Cargo features (8 addresses, 4 routes, 4 DNS servers, 8 DNS results, 8 KiB
-fragmentation/reassembly buffers); `child.inner_mtu` (default 1280) sets the inner MTU.
+fragmentation/reassembly buffers); `child.inner_mtu` (default 1280) is the wire MTU, `child.inner_mtu_stack` (default
+16384) the MTU smoltcp sees — the device fragments outbound packets to the wire MTU and `push_rx` reassembles inbound
+IPv6 fragment sets (DESIGN.md §11.1).
 
 ## Notes from the live bring-up
 
@@ -95,6 +99,7 @@ fragmentation/reassembly buffers); `child.inner_mtu` (default 1280) sets the inn
 - NAT_DETECTION_SOURCE_IP is deliberately hashed over `192.0.2.0` (as the AOSP client does) so the gateway always
   selects UDP-encapsulated ESP — the only kind a userspace client can carry.
 - smoltcp 0.14 has **no IPv6 fragmentation or reassembly on `Medium::Ip`** (its `proto-ipv6-fragmentation` feature
-  only covers 6LoWPAN): an IPv6 datagram larger than the inner MTU is refused by `send_to` up front, and an inbound
-  IPv6 Fragment header is dropped by smoltcp (ICMPv6 Parameter Problem). IPv4 fragments both ways. Large inner IPv6
-  traffic (e.g. SIP responses over UDP) therefore needs either a bigger `inner_mtu`, TCP, or a future smoltcp release.
+  only covers 6LoWPAN) and would answer an inbound IPv6 Fragment header with an ICMPv6 Parameter Problem — fatal for
+  SIP, whose 200 OK / NOTIFY arrive IPv6-fragmented from the P-CSCF. `ipstack::frag` therefore fragments on the way
+  out and reassembles on the way in around the device (DESIGN.md §11.1); `send_to` accepts payloads up to
+  `inner_mtu_stack - 48` (v6) / `- 28` (v4). smoltcp also sets DF on every IPv4 packet it emits, so the shim ignores DF.
