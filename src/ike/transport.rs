@@ -83,6 +83,8 @@ impl IkeTransport {
             )));
         }
         let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))?;
+        // Bound every send: a paused/held flow must surface as an error, not block forever.
+        socket.set_write_timeout(Some(Duration::from_secs(2)))?;
         let bound = socket.local_addr()?;
         // If the kernel still reports an unspecified address (shouldn't happen once we
         // bound to a concrete IP) substitute the discovered egress so callers never see 0.0.0.0.
@@ -154,7 +156,17 @@ impl IkeTransport {
     }
 
     fn send_raw(&self, bytes: &[u8], dst: SocketAddr) -> Result<()> {
-        let n = self.socket.send_to(bytes, dst)?;
+        let n = match self.socket.send_to(bytes, dst) {
+            Ok(n) => n,
+            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
+                // A send that is held/blocked (e.g. a host firewall pausing the flow pending a
+                // verdict) must never stall the state machine: count the datagram as lost and let
+                // the retransmission schedule cover it.
+                warn!("UDP send to {} did not complete ({}); treating datagram as lost", dst, e);
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
         if n != bytes.len() {
             return Err(Error::Io(io::Error::new(
                 io::ErrorKind::WriteZero,
