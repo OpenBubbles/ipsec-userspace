@@ -448,7 +448,10 @@ impl Config {
         let apn = req_string(indiv, "apn", "imsIndividualCredentials")?;
         let local_id_template = req_string(ike_dict, "LocalIdentifier", "IKE")?;
         let local_id_str = if local_id_template.contains(SUBSCRIBER_ID_PLACEHOLDER) {
-            let subscriber_id = req_string(creds_root, "subscriberId", "credentials")?;
+            let subscriber_id = match req_string(creds_root, "subscriberId", "credentials") {
+                Ok(v) => v,
+                Err(top) => req_string(indiv, "subscriberId", "imsIndividualCredentials").map_err(|_| top)?,
+            };
             local_id_template.replace(SUBSCRIBER_ID_PLACEHOLDER, &subscriber_id)
         } else {
             local_id_template

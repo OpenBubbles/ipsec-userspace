@@ -550,7 +550,7 @@ fn decode_delete(buf: &[u8]) -> Result<DeletePayload> {
     if spi_size == 0 && num != 0 {
         return Err(Error::Decode(format!("Delete: SPI size 0 but {num} SPIs")));
     }
-    let mut spis = Vec::with_capacity(num);
+    let mut spis = Vec::with_capacity(num.min(r.remaining() / spi_size.max(1)));
     for _ in 0..num {
         spis.push(r.take(spi_size)?.to_vec());
     }

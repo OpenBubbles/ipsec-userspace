@@ -248,7 +248,7 @@ impl EspInbound {
         // RFC 4303 §2.4: the receiver MAY inspect the default padding; we only warn.
         let pad_ok = plain[payload_len..payload_len + pad_len].iter().enumerate().all(|(i, &b)| b == (i + 1) as u8);
         if !pad_ok {
-            warn!("ESP rx spi={:#010x} seq={}: non-standard padding bytes", spi, seq);
+            debug!("ESP rx spi={:#010x} seq={}: non-standard padding bytes", spi, seq);
         }
         if let Some(&first) = plain.first() {
             let want = if next_header == NEXT_HEADER_IPV4 { 4 } else { 6 };

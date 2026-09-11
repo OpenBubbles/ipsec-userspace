@@ -22,7 +22,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -66,6 +66,12 @@ const FRAGMENT_SET_TTL: Duration = Duration::from_secs(30);
 const CLOSE_ATTEMPTS: u32 = 2;
 /// Delay before a failed (non-timeout) rekey is attempted again.
 const REKEY_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// Upper bound on any config-derived interval (`Instant + Duration` must never overflow).
+const MAX_INTERVAL: Duration = Duration::from_secs(365 * 86400);
+/// Per inner-port receive queue depth; datagrams beyond it are dropped (counted).
+const INNER_QUEUE_DEPTH: usize = 256;
+/// Poll slice of the handshake-time keepalive ticker.
+const HANDSHAKE_KEEPALIVE_SLICE: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -101,6 +107,8 @@ pub struct TunnelStats {
     pub child_rekeys: u64,
     pub ike_rekeys: u64,
     pub peer_dpd_answered: u64,
+    /// Inbound inner datagrams dropped because the port's receive queue was full.
+    pub rx_queue_drops: u64,
     /// Instant of the last IKE / ESP / keepalive datagram received from the gateway.
     pub last_rx: Option<Instant>,
 }
@@ -146,6 +154,7 @@ struct Counters {
     child_rekeys: AtomicU64,
     ike_rekeys: AtomicU64,
     peer_dpd_answered: AtomicU64,
+    rx_queue_drops: AtomicU64,
 }
 
 struct Shared {
@@ -161,7 +170,7 @@ struct Shared {
     inbound: Mutex<Vec<EspInbound>>,
     /// Inner IP addresses assigned by the gateway (source addresses for `InnerUdpSocket`).
     assigned: AssignedConfig,
-    ports: Mutex<HashMap<u16, Sender<UdpDatagram>>>,
+    ports: Mutex<HashMap<u16, SyncSender<UdpDatagram>>>,
     alive: AtomicBool,
     stop: AtomicBool,
     dead_reason: Mutex<Option<String>>,
@@ -170,6 +179,8 @@ struct Shared {
     /// Creation instants of the current child SA / IKE SA (rekey scheduling).
     child_created: Mutex<Instant>,
     ike_created: Mutex<Instant>,
+    /// When the transport switched to 4500: the NAT-T keepalive cadence is anchored here.
+    natt_since: Instant,
 }
 
 /// Lock a mutex, recovering from poisoning (a panicked thread must not take the
@@ -219,6 +230,7 @@ impl Shared {
             child_rekeys: c.child_rekeys.load(Ordering::Relaxed),
             ike_rekeys: c.ike_rekeys.load(Ordering::Relaxed),
             peer_dpd_answered: c.peer_dpd_answered.load(Ordering::Relaxed),
+            rx_queue_drops: c.rx_queue_drops.load(Ordering::Relaxed),
             last_rx: *lock(&self.last_rx),
         }
     }
@@ -246,6 +258,40 @@ fn pick_free_port(used: &HashSet<u16>, start: u16) -> Option<u16> {
     (0..range)
         .map(|i| EPHEMERAL_PORT_LO + ((offset + i) % range) as u16)
         .find(|p| !used.contains(p))
+}
+
+/// A config interval in seconds as a `Duration`, clamped to `[1 s, MAX_INTERVAL]` so that
+/// `Instant + Duration` can never overflow on a hostile plist value.
+fn interval_secs(secs: u64) -> Duration {
+    Duration::from_secs(secs.max(1)).min(MAX_INTERVAL)
+}
+
+/// The first keepalive instant strictly after `now` on the cadence
+/// `anchor + k * interval` (k >= 1). The cadence is anchored at the switch to 4500 so the
+/// schedule does not restart when the keepalive thread is (re)started.
+fn next_keepalive(anchor: Instant, interval: Duration, now: Instant) -> Instant {
+    let mut next = anchor + interval;
+    while next <= now {
+        next += interval;
+    }
+    next
+}
+
+/// Run `body`, turning a panic into a call to `on_panic` with the panic message.
+/// Returns `true` when the body completed normally.
+fn run_guarded(body: impl FnOnce(), on_panic: impl FnOnce(String)) -> bool {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(()) => true,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into());
+            on_panic(msg);
+            false
+        }
+    }
 }
 
 /// Retransmit timeout after the `attempt`-th (0-based) send: `initial * backoff^attempt`.
@@ -520,7 +566,8 @@ fn ike_auth(cfg: &Config, transport: &IkeTransport, ike: &mut IkeInitiator) -> R
                     }
                     EapAction::Success { msk, .. } => {
                         info!("EAP-Success: MSK derived ({} bytes), TLS {:?}", msk.len(), eap.protocol_version());
-                        ike.set_msk(msk);
+                        // The Vec moves into SharedKeyAuth (ZeroizeOnDrop); `msk`/`emsk` zeroize on drop.
+                        ike.set_msk(msk.to_vec());
                         let msg = ike.build_auth_final()?;
                         info!("IKE_AUTH final (msgid {}): AUTH(method 2)", msg.header.message_id);
                         response = handshake_exchange(transport, ike, &msg, policy)?;
@@ -540,17 +587,43 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
     let ike = IkeInitiator::new(cfg, transport.local_addr(), transport.remote_addr())?;
     let (mut ike, nat) = sa_init(cfg, &transport, ike)?;
 
+    let keepalive_interval = interval_secs(cfg.ike.natt.keepalive_interval_secs);
+    let handshake_keepalives = AtomicU64::new(0);
+    let natt_since = Instant::now();
     if nat.detected || !cfg.ike.natt.disable_switch_to_natt_port {
         transport.switch_to_natt(cfg.gateway.natt_port);
         info!("switched to NAT-T: {} (non-ESP marker on)", transport.remote_addr());
         if !nat.detected {
             warn!("responder detected no NAT; it may reject UDP-encapsulated ESP on port {}", cfg.gateway.natt_port);
         }
+        // AOSP sends the first 0xFF immediately on the switch, then every interval
+        // regardless of traffic (DESIGN §12) — including during IKE_AUTH.
+        match transport.send_keepalive() {
+            Ok(()) => {
+                handshake_keepalives.fetch_add(1, Ordering::Relaxed);
+                debug!("NAT-T keepalive #1 sent (right after the switch to 4500)");
+            }
+            Err(e) => warn!("initial NAT-T keepalive failed: {e}"),
+        }
     } else {
         error!("staying on port {}: raw ESP cannot be carried by a userspace client, the tunnel will not pass traffic", cfg.gateway.ike_port);
     }
 
-    let (est, tls_version) = ike_auth(cfg, &transport, &mut ike)?;
+    // IKE_AUTH (EAP-TLS rounds, possibly many seconds) with the keepalive cadence running
+    // on the same socket; the ticker stops as soon as IKE_AUTH returns.
+    let ticker_stop = AtomicBool::new(false);
+    let auth_result = thread::scope(|scope| {
+        if transport.using_natt() {
+            let transport = &transport;
+            let stop = &ticker_stop;
+            let sent = &handshake_keepalives;
+            scope.spawn(move || handshake_keepalive_ticker(transport, stop, sent, natt_since, keepalive_interval));
+        }
+        let r = ike_auth(cfg, &transport, &mut ike);
+        ticker_stop.store(true, Ordering::SeqCst);
+        r
+    });
+    let (est, tls_version) = auth_result?;
     let handshake_duration = started.elapsed();
     let child = est.child;
     let assigned = est.assigned;
@@ -603,7 +676,9 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
         last_rx: Mutex::new(Some(now)),
         child_created: Mutex::new(child.created),
         ike_created: Mutex::new(now),
+        natt_since,
     });
+    shared.counters.keepalives_sent.store(handshake_keepalives.load(Ordering::Relaxed), Ordering::Relaxed);
 
     let rx_thread = spawn_named("epdg-rx", Arc::clone(&shared), rx_loop)?;
     let keepalive_thread = spawn_named("epdg-keepalive", Arc::clone(&shared), keepalive_loop)?;
@@ -619,11 +694,50 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
     })
 }
 
+/// Spawn a tunnel thread under a panic guard: a panicking thread marks the tunnel dead
+/// (waiters wake with `Error::Closed`) and stops the others instead of leaving a
+/// half-open tunnel that still reports `is_alive()`.
 fn spawn_named(name: &str, shared: Arc<Shared>, body: fn(Arc<Shared>)) -> Result<JoinHandle<()>> {
+    let guard = Arc::clone(&shared);
+    let thread_name = name.to_string();
     thread::Builder::new()
         .name(name.to_string())
-        .spawn(move || body(shared))
+        .spawn(move || {
+            run_guarded(
+                || body(shared),
+                |msg| {
+                    guard.mark_dead(format!("{thread_name} thread panicked: {msg}"));
+                    guard.stop.store(true, Ordering::SeqCst);
+                },
+            );
+        })
         .map_err(Error::Io)
+}
+
+/// Keepalive cadence during IKE_AUTH (before `Shared` exists): `anchor + k * interval`.
+fn handshake_keepalive_ticker(
+    transport: &IkeTransport,
+    stop: &AtomicBool,
+    sent: &AtomicU64,
+    anchor: Instant,
+    interval: Duration,
+) {
+    let mut next = next_keepalive(anchor, interval, Instant::now());
+    while !stop.load(Ordering::SeqCst) {
+        let now = Instant::now();
+        if now < next {
+            thread::sleep((next - now).min(HANDSHAKE_KEEPALIVE_SLICE));
+            continue;
+        }
+        next = next_keepalive(anchor, interval, now);
+        match transport.send_keepalive() {
+            Ok(()) => {
+                let n = sent.fetch_add(1, Ordering::Relaxed) + 1;
+                debug!("NAT-T keepalive #{n} sent (during IKE_AUTH)");
+            }
+            Err(e) => warn!("NAT-T keepalive failed: {e}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +799,12 @@ fn ike_request(
             debug!("{what} msgid {message_id}: no response after {:?}; retransmitting", timeout);
         }
     }
+    if outcome.is_err() {
+        // Free the session's single request slot (RFC 7296 §2.1: the unanswered message
+        // id is reused by the next request); otherwise every later DPD / rekey / DELETE
+        // would fail with "another request is outstanding".
+        lock(&shared.ike).abort_request();
+    }
     *lock(&shared.pending) = None;
     match &outcome {
         Ok(_) => debug!("{what} msgid {message_id}: response received"),
@@ -694,11 +814,22 @@ fn ike_request(
     outcome
 }
 
+/// Run a response handler under the IKE lock; a rejected response abandons the
+/// session's request slot (idempotent), so a later request can be built.
+fn settle<T>(shared: &Shared, handle: impl FnOnce(&mut IkeInitiator) -> Result<T>) -> Result<T> {
+    let mut ike = lock(&shared.ike);
+    let r = handle(&mut ike);
+    if r.is_err() {
+        ike.abort_request();
+    }
+    r
+}
+
 /// Empty INFORMATIONAL (liveness check); returns the round-trip time.
 fn do_dpd(shared: &Shared, policy: &RetransmitConfig) -> Result<Duration> {
     let started = Instant::now();
     let response = ike_request(shared, "DPD", policy, |ike| ike.build_dpd())?;
-    lock(&shared.ike).handle_informational_response(&response)?;
+    settle(shared, |ike| ike.handle_informational_response(&response))?;
     let rtt = started.elapsed();
     info!("DPD ok, rtt {:?}", rtt);
     Ok(rtt)
@@ -709,7 +840,7 @@ fn rekey_child(shared: &Shared) -> Result<()> {
     let policy = &shared.cfg.ike.retransmit;
     let old_spi_in = lock(&shared.ike).child().map(|c| c.spi_in).ok_or_else(|| Error::Protocol("no child SA to rekey".into()))?;
     let response = ike_request(shared, "CREATE_CHILD_SA (rekey child)", policy, |ike| ike.build_rekey_child())?;
-    let new = lock(&shared.ike).handle_rekey_child_response(&response)?;
+    let new = settle(shared, |ike| ike.handle_rekey_child_response(&response))?;
     let (outbound, inbound) = esp_pair(&new);
     lock(&shared.inbound).push(inbound);
     *shared.outbound.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(outbound);
@@ -718,7 +849,7 @@ fn rekey_child(shared: &Shared) -> Result<()> {
     info!("child SA rekeyed: SPI_in {:#010x} SPI_out {:#010x}; deleting old {:#010x}", new.spi_in, new.spi_out, old_spi_in);
 
     let response = ike_request(shared, "DELETE(ESP)", policy, |ike| ike.build_delete_child(old_spi_in))?;
-    lock(&shared.ike).handle_informational_response(&response)?;
+    settle(shared, |ike| ike.handle_informational_response(&response))?;
     lock(&shared.inbound).retain(|sa| sa.spi() != old_spi_in);
     Ok(())
 }
@@ -727,7 +858,7 @@ fn rekey_child(shared: &Shared) -> Result<()> {
 fn rekey_ike(shared: &Shared) -> Result<()> {
     let policy = &shared.cfg.ike.retransmit;
     let response = ike_request(shared, "CREATE_CHILD_SA (rekey IKE)", policy, |ike| ike.build_rekey_ike())?;
-    lock(&shared.ike).handle_rekey_ike_response(&response)?;
+    settle(shared, |ike| ike.handle_rekey_ike_response(&response))?;
     *lock(&shared.ike_created) = Instant::now();
     shared.counters.ike_rekeys.fetch_add(1, Ordering::Relaxed);
     {
@@ -735,7 +866,7 @@ fn rekey_ike(shared: &Shared) -> Result<()> {
         info!("IKE SA rekeyed: SPIs {:#018x}/{:#018x}; deleting the old IKE SA", ike.spi_i(), ike.spi_r());
     }
     let response = ike_request(shared, "DELETE(IKE) old SA", policy, |ike| ike.build_delete_ike())?;
-    lock(&shared.ike).handle_informational_response(&response)?;
+    settle(shared, |ike| ike.handle_informational_response(&response))?;
     Ok(())
 }
 
@@ -747,18 +878,22 @@ fn rx_loop(shared: Arc<Shared>) {
     let mut reassembler = Ipv6FragmentReassembler::new();
     let mut fragments = FragmentCollector::new();
     let mut last_evict = Instant::now();
+    let mut consecutive_errors: u32 = 0;
     while !shared.stop.load(Ordering::SeqCst) {
         match shared.transport.recv(RX_POLL) {
-            Ok(None) => {}
+            Ok(None) => consecutive_errors = 0,
             Ok(Some(Incoming::Keepalive)) => {
+                consecutive_errors = 0;
                 shared.touch_rx();
                 debug!("NAT-T keepalive received");
             }
             Ok(Some(Incoming::Esp(packet))) => {
+                consecutive_errors = 0;
                 shared.touch_rx();
                 handle_esp(&shared, &packet, &mut reassembler);
             }
             Ok(Some(Incoming::Ike(datagram))) => {
+                consecutive_errors = 0;
                 shared.touch_rx();
                 handle_ike_datagram(&shared, datagram, &mut fragments);
             }
@@ -766,8 +901,16 @@ fn rx_loop(shared: Arc<Shared>) {
                 if shared.stop.load(Ordering::SeqCst) {
                     break;
                 }
-                warn!("rx: socket error: {e}");
-                thread::sleep(Duration::from_millis(100));
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                // Exponential backoff 100 ms -> 5 s keeps a persistent socket error from
+                // becoming a 10 Hz warning loop.
+                let backoff = rx_error_backoff(consecutive_errors);
+                if consecutive_errors <= 3 || consecutive_errors.is_power_of_two() {
+                    warn!("rx: socket error ({consecutive_errors} in a row, next poll in {backoff:?}): {e}");
+                }
+                if !sleep_unless_stopped(&shared, backoff) {
+                    break;
+                }
             }
         }
         if last_evict.elapsed() >= Duration::from_secs(5) {
@@ -776,7 +919,15 @@ fn rx_loop(shared: Arc<Shared>) {
             last_evict = Instant::now();
         }
     }
+    if !shared.stop.load(Ordering::SeqCst) {
+        shared.mark_dead("rx thread exited");
+    }
     debug!("rx thread stopped");
+}
+
+/// Backoff after the `n`-th consecutive receive error: `100 ms * 2^(n-1)`, capped at 5 s.
+fn rx_error_backoff(n: u32) -> Duration {
+    Duration::from_millis(100u64.saturating_mul(1u64 << n.saturating_sub(1).min(6))).min(Duration::from_secs(5))
 }
 
 fn handle_esp(shared: &Shared, packet: &[u8], reassembler: &mut Ipv6FragmentReassembler) {
@@ -820,9 +971,16 @@ fn handle_esp(shared: &Shared, packet: &[u8], reassembler: &mut Ipv6FragmentReas
             match sender {
                 Some(tx) => {
                     debug!("rx: inner UDP {} -> {} ({} bytes)", dg.src, dg.dst, dg.payload.len());
-                    if tx.send(dg).is_err() {
-                        debug!("rx: inner port {port} receiver gone; dropping");
-                        lock(&shared.ports).remove(&port);
+                    match tx.try_send(dg) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            shared.counters.rx_queue_drops.fetch_add(1, Ordering::Relaxed);
+                            debug!("rx: inner port {port} queue full; dropping");
+                        }
+                        Err(TrySendError::Disconnected(_)) => {
+                            debug!("rx: inner port {port} receiver gone; dropping");
+                            lock(&shared.ports).remove(&port);
+                        }
                     }
                 }
                 None => debug!("rx: inner UDP {} -> {} ({} bytes) for unbound port; dropped", dg.src, dg.dst, dg.payload.len()),
@@ -950,14 +1108,15 @@ fn keepalive_loop(shared: Arc<Shared>) {
         warn!("not on the NAT-T port; NAT-T keepalives disabled");
         return;
     }
-    let interval = Duration::from_secs(shared.cfg.ike.natt.keepalive_interval_secs.max(1));
-    let mut next = Instant::now() + interval;
+    let interval = interval_secs(shared.cfg.ike.natt.keepalive_interval_secs);
+    // Continue the cadence started at the switch to 4500 (the handshake ticker's slots).
+    let mut next = next_keepalive(shared.natt_since, interval, Instant::now());
     while !shared.stop.load(Ordering::SeqCst) {
         let wait = next.saturating_duration_since(Instant::now());
         if !sleep_unless_stopped(&shared, wait) {
             break;
         }
-        next += interval;
+        next = next_keepalive(shared.natt_since, interval, Instant::now());
         if !shared.alive.load(Ordering::SeqCst) {
             continue;
         }
@@ -976,8 +1135,8 @@ fn timer_loop(shared: Arc<Shared>) {
     let cfg = &shared.cfg;
     let child_soft = soft_lifetime(cfg.child.lifetime_secs, cfg.ike.rekey_margin_fraction);
     let ike_soft = soft_lifetime(cfg.ike.lifetime_secs, cfg.ike.rekey_margin_fraction);
-    let dpd_interval = Duration::from_secs(cfg.ike.dpd.interval_secs.max(1));
-    let dpd_retry = Duration::from_secs(cfg.ike.dpd.retry_interval_secs);
+    let dpd_interval = interval_secs(cfg.ike.dpd.interval_secs);
+    let dpd_retry = Duration::from_secs(cfg.ike.dpd.retry_interval_secs).min(MAX_INTERVAL);
     info!(
         "timer: child rekey in {:?}, IKE rekey in {:?}, DPD {}",
         child_soft,
@@ -1104,7 +1263,7 @@ impl EpdgTunnel {
             }
             local_port
         };
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(INNER_QUEUE_DEPTH);
         ports.insert(port, tx);
         debug!("inner UDP port {port} bound");
         Ok(InnerUdpSocket { port, rx, shared: Arc::clone(&self.shared) })
@@ -1117,7 +1276,12 @@ impl EpdgTunnel {
 
     /// On-demand liveness check (empty INFORMATIONAL); returns the round-trip time.
     pub fn dpd(&self) -> Result<Duration> {
-        do_dpd(&self.shared, &self.shared.cfg.ike.retransmit)
+        let r = do_dpd(&self.shared, &self.shared.cfg.ike.retransmit);
+        if let Err(Error::Timeout(_)) = &r {
+            // AOSP: retransmission exhaustion tears the session down WITHOUT a DELETE.
+            self.shared.mark_dead("dead peer detection failed");
+        }
+        r
     }
 
     pub fn stats(&self) -> TunnelStats {
@@ -1143,12 +1307,23 @@ impl EpdgTunnel {
             };
             info!("closing tunnel: DELETE(IKE)");
             let r = ike_request(shared, "DELETE(IKE)", &policy, |ike| ike.build_delete_ike())
-                .and_then(|resp| lock(&shared.ike).handle_informational_response(&resp));
-            match &r {
-                Ok(()) => info!("IKE SA deleted"),
-                Err(e) => warn!("DELETE(IKE) not acknowledged: {e}"),
+                .and_then(|resp| settle(shared, |ike| ike.handle_informational_response(&resp)));
+            match r {
+                Ok(()) => {
+                    info!("IKE SA deleted");
+                    Ok(())
+                }
+                // The gateway's own DELETE(IKE) crossed ours: the rx thread answered it and
+                // marked the tunnel dead — a clean teardown by both sides.
+                Err(Error::Closed(reason)) if reason.contains("deleted by the gateway") => {
+                    info!("IKE SA deleted by the gateway while our DELETE was outstanding");
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("DELETE(IKE) not acknowledged: {e}");
+                    Err(e)
+                }
             }
-            r
         } else {
             debug!("close: tunnel already dead ({:?})", lock(&shared.dead_reason));
             Ok(())
@@ -1408,6 +1583,129 @@ mod tests {
         let s = TunnelStats::default();
         assert_eq!(s.keepalives_sent, 0);
         assert_eq!(s.esp_rx_packets, 0);
+        assert_eq!(s.rx_queue_drops, 0);
         assert!(s.last_rx.is_none());
+    }
+
+    #[test]
+    fn keepalive_cadence_is_anchored_at_the_natt_switch() {
+        let anchor = Instant::now();
+        let iv = Duration::from_secs(10);
+        // Started right at the switch: the next slot is anchor + 10 s, not now + 10 s.
+        assert_eq!(next_keepalive(anchor, iv, anchor), anchor + iv);
+        assert_eq!(next_keepalive(anchor, iv, anchor + Duration::from_secs(3)), anchor + iv);
+        // Started 25 s after the switch (long IKE_AUTH): continue on the 30 s slot.
+        assert_eq!(next_keepalive(anchor, iv, anchor + Duration::from_secs(25)), anchor + Duration::from_secs(30));
+        // Exactly on a slot: strictly after `now`.
+        assert_eq!(next_keepalive(anchor, iv, anchor + iv), anchor + Duration::from_secs(20));
+    }
+
+    #[test]
+    fn config_intervals_are_clamped() {
+        assert_eq!(interval_secs(0), Duration::from_secs(1));
+        assert_eq!(interval_secs(10), Duration::from_secs(10));
+        assert_eq!(interval_secs(u64::MAX), MAX_INTERVAL);
+        // Must not overflow `Instant + Duration`.
+        let _ = Instant::now() + interval_secs(u64::MAX);
+        let _ = next_keepalive(Instant::now(), interval_secs(u64::MAX), Instant::now());
+    }
+
+    #[test]
+    fn rx_error_backoff_grows_and_caps() {
+        assert_eq!(rx_error_backoff(1), Duration::from_millis(100));
+        assert_eq!(rx_error_backoff(2), Duration::from_millis(200));
+        assert_eq!(rx_error_backoff(4), Duration::from_millis(800));
+        assert_eq!(rx_error_backoff(7), Duration::from_secs(5));
+        assert_eq!(rx_error_backoff(u32::MAX), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn run_guarded_reports_panics() {
+        let mut seen = None;
+        assert!(run_guarded(|| {}, |m| seen = Some(m)));
+        assert!(seen.is_none());
+        assert!(!run_guarded(|| panic!("boom {}", 42), |m| seen = Some(m)));
+        assert_eq!(seen.as_deref(), Some("boom 42"));
+        assert!(!run_guarded(|| std::panic::panic_any(7u8), |m| seen = Some(m)));
+        assert_eq!(seen.as_deref(), Some("non-string panic payload"));
+    }
+
+    /// A `Shared` over a loopback socket that never sends anything: enough to exercise
+    /// the thread plumbing without a gateway.
+    fn test_shared() -> Arc<Shared> {
+        let fx = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
+        let cfg = Config::from_plist_files(
+            std::path::Path::new(&format!("{fx}tmobile_prod_bundle.plist")),
+            std::path::Path::new(&format!("{fx}tmobile_creds.plist")),
+            std::path::Path::new(&format!("{fx}client.crt")),
+            std::path::Path::new(&format!("{fx}client.key")),
+        )
+        .unwrap();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let transport = IkeTransport::bind(Some(lo), lo, 500).unwrap();
+        let ike = IkeInitiator::new(&cfg, transport.local_addr(), transport.remote_addr()).unwrap();
+        let sa = || EspSa {
+            spi: 0x1234_5678,
+            cipher: registry::cipher(ENCR_AES_CBC, Some(256)).unwrap(),
+            integrity: registry::integrity(AUTH_HMAC_SHA2_256_128).unwrap(),
+            enc_key: vec![1; 32],
+            auth_key: vec![2; 32],
+        };
+        let now = Instant::now();
+        Arc::new(Shared {
+            cfg,
+            transport,
+            ike: Mutex::new(ike),
+            request_lock: Mutex::new(()),
+            pending: Mutex::new(None),
+            pending_cv: Condvar::new(),
+            outbound: RwLock::new(Arc::new(EspOutbound::new(sa()))),
+            inbound: Mutex::new(vec![EspInbound::new(sa(), 64)]),
+            assigned: AssignedConfig::default(),
+            ports: Mutex::new(HashMap::new()),
+            alive: AtomicBool::new(true),
+            stop: AtomicBool::new(false),
+            dead_reason: Mutex::new(None),
+            counters: Counters::default(),
+            last_rx: Mutex::new(Some(now)),
+            child_created: Mutex::new(now),
+            ike_created: Mutex::new(now),
+            natt_since: now,
+        })
+    }
+
+    #[test]
+    fn a_panicking_tunnel_thread_marks_the_tunnel_dead() {
+        let shared = test_shared();
+        assert!(shared.is_alive());
+        // A waiter on the pending slot must be woken with Error::Closed, not hang.
+        let waiter = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                let mut slot = lock(&shared.pending);
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while shared.is_alive() && Instant::now() < deadline {
+                    slot = shared.pending_cv.wait_timeout(slot, Duration::from_millis(100)).unwrap().0;
+                }
+                shared.is_alive()
+            })
+        };
+        let h = spawn_named("epdg-test", Arc::clone(&shared), |_| panic!("hostile datagram")).unwrap();
+        assert!(h.join().is_ok(), "the guard swallows the panic");
+        assert!(!shared.is_alive());
+        assert!(shared.stop.load(Ordering::SeqCst), "the other threads are told to stop");
+        let reason = lock(&shared.dead_reason).clone().unwrap();
+        assert!(reason.contains("epdg-test thread panicked") && reason.contains("hostile datagram"), "{reason}");
+        assert!(!waiter.join().unwrap(), "waiter observed the dead tunnel");
+        assert!(matches!(shared.closed_error(), Error::Closed(_)));
+    }
+
+    #[test]
+    fn rx_thread_exit_marks_the_tunnel_dead_unless_stopping() {
+        let shared = test_shared();
+        // A normal stop: not dead by the rx thread's exit.
+        shared.stop.store(true, Ordering::SeqCst);
+        rx_loop(Arc::clone(&shared));
+        assert!(lock(&shared.dead_reason).is_none());
     }
 }

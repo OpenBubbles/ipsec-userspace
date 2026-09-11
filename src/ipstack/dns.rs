@@ -78,7 +78,9 @@ pub fn parse_response(buf: &[u8]) -> Result<Vec<IpAddr>> {
         rdata: Vec<u8>,
         rdata_pos: usize,
     }
-    let mut rrs: Vec<Rr> = Vec::with_capacity(usize::from(ancount));
+    // Each RR is at least 11 bytes (1-byte name + type/class/ttl/rdlength); bound the
+    // capacity by what the buffer can actually hold.
+    let mut rrs: Vec<Rr> = Vec::with_capacity(usize::from(ancount).min(buf.len() / 11));
     for _ in 0..ancount {
         let (owner, next) = read_name(buf, pos)?;
         pos = next;

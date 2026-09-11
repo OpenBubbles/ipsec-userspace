@@ -859,7 +859,14 @@ impl IkeInitiator {
                 ke.group, self.dh_group
             )));
         }
-        let shared = self.dh_pair.shared_secret(&ke.public)?;
+        let sa_dh = suite.dh.as_ref().map(|d| d.group_id()).unwrap_or(0);
+        if sa_dh != ke.group {
+            return Err(Error::Decode(format!(
+                "IKE_SA_INIT response SA selects DH group {sa_dh} but the KE payload carries group {}",
+                ke.group
+            )));
+        }
+        let shared = zeroize::Zeroizing::new(self.dh_pair.shared_secret(&ke.public)?);
         let keys = derive_ike_keys(&suite, &self.nonce_i, nr, &shared, self.spi_i, spi_r);
         drop(shared);
 
@@ -896,6 +903,11 @@ impl IkeInitiator {
     /// Update the local address (e.g. egress learned late); used by NAT-D evaluation.
     pub fn set_local_addr(&mut self, local: SocketAddr) {
         self.local = local;
+        // NAT_DETECTION_SOURCE_IP is hashed over the local port: a cached IKE_SA_INIT chain
+        // built for the old address must be rebuilt (only meaningful before the exchange).
+        if matches!(self.state, State::New | State::SaInitSent) {
+            self.sa_init_base = None;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -956,6 +968,9 @@ impl IkeInitiator {
         if !h.is_response() {
             return Err(Error::Protocol(format!("{what}: not a response")));
         }
+        if h.is_initiator() {
+            return Err(Error::Protocol(format!("{what}: response has the Initiator flag set")));
+        }
         if h.spi_i != self.spi_i || h.spi_r != self.spi_r {
             return Err(Error::Protocol(format!(
                 "{what}: SPIs {:#018x}/{:#018x} do not match the IKE SA",
@@ -1002,6 +1017,10 @@ impl IkeInitiator {
     }
 
     fn handle_auth_first(&mut self, msg: &IkeMessage) -> Result<AuthResponse> {
+        // The peer's rejection reason takes precedence over our IDr comparison.
+        if let Some(e) = msg.error_notify("IKE_AUTH") {
+            return Err(e);
+        }
         if let Some(id_r) = msg.id_r() {
             if !self.cfg.identity.accept_any_remote_id && *id_r != self.id_r_cfg {
                 return Err(Error::AuthFailed(format!(
@@ -1017,9 +1036,6 @@ impl IkeInitiator {
             self.id_r_received = Some(id_r.clone());
         } else {
             warn!("IKE_AUTH #1 response carries no IDr; post-EAP AUTH verification will need one");
-        }
-        if let Some(e) = msg.error_notify("IKE_AUTH") {
-            return Err(e);
         }
         if msg.auth().is_some() {
             warn!("IKE_AUTH #1 response unexpectedly carries AUTH (EAP-only requested); not verified (no certificate validation)");
@@ -1130,7 +1146,11 @@ impl IkeInitiator {
         if msg.ke().is_some() {
             warn!("final IKE_AUTH response carries an unexpected KE payload; ignored");
         }
-        let assigned = match msg.cp() {
+        let cfg_reply = msg.payloads.iter().find_map(|p| match p {
+            Payload::Cp(c) if c.cfg_type == CFG_REPLY => Some(c),
+            _ => None,
+        });
+        let assigned = match cfg_reply.or_else(|| msg.cp()) {
             Some(cp) if cp.cfg_type == CFG_REPLY => parse_cfg_reply(cp),
             Some(cp) => {
                 warn!("final IKE_AUTH response CP has type {} (expected CFG_REPLY); ignored", cp.cfg_type);
@@ -1277,6 +1297,22 @@ impl IkeInitiator {
             return Err(Error::Protocol(format!("{what}: another request is outstanding")));
         }
         Ok(())
+    }
+
+    /// Abandon the outstanding request (retransmissions exhausted, send failure, tunnel
+    /// closed) so the next request can be built. `our_msgid` is left unchanged: the
+    /// abandoned id was never answered, so the next request reuses it (RFC 7296 §2.1).
+    /// Rekey state (new SPI / nonce / DH pair) is dropped with it.
+    pub fn abort_request(&mut self) {
+        if !matches!(self.pending, Pending::None) {
+            warn!("abandoning the outstanding request (msgid {})", self.our_msgid);
+            self.pending = Pending::None;
+        }
+    }
+
+    /// True while a post-establishment request is outstanding.
+    pub fn has_pending_request(&self) -> bool {
+        !matches!(self.pending, Pending::None)
     }
 
     /// Empty INFORMATIONAL request (DPD).
@@ -1676,7 +1712,7 @@ impl IkeInitiator {
         if ke.group != group {
             return Err(Error::Protocol(format!("rekey IKE response KE group {} != ours {}", ke.group, group)));
         }
-        let shared = st.dh_pair.shared_secret(&ke.public)?;
+        let shared = zeroize::Zeroizing::new(st.dh_pair.shared_secret(&ke.public)?);
         let keys = derive_ike_keys_rekey(&suite, &self.keys.sk_d, &shared, &st.nonce_i, nr, st.spi_i, new_spi_r);
         drop(shared);
 
@@ -3066,5 +3102,158 @@ mod tests {
         .encode_plain()
         .unwrap();
         assert!(matches!(init.handle_sa_init_response(&reply), Err(Error::Decode(_))));
+    }
+
+    #[test]
+    fn abandoned_request_can_be_followed_by_another_with_the_same_message_id() {
+        // An unanswered DPD (retransmissions exhausted) must not wedge the session:
+        // the tunnel abandons it and the next request reuses the unanswered msgid.
+        let (mut init, resp, _) = establish(false);
+        let dpd = init.build_dpd().unwrap();
+        assert_eq!(dpd.header.message_id, 4);
+        let _ = init.encode(&dpd).unwrap();
+        assert!(init.has_pending_request());
+        assert!(matches!(init.build_rekey_child(), Err(Error::Protocol(_))));
+        init.abort_request();
+        assert!(!init.has_pending_request());
+        assert_eq!(init.next_message_id(), 4, "an abandoned request does not consume its message id");
+        // A rekey can now be started, on the same message id.
+        let rk = init.build_rekey_child().unwrap();
+        assert_eq!(rk.header.message_id, 4);
+        init.abort_request();
+        // And a DPD again, which completes normally.
+        let dpd2 = init.build_dpd().unwrap();
+        assert_eq!(dpd2.header.message_id, 4);
+        let _ = init.encode(&dpd2).unwrap();
+        let r = resp.seal_response(EXCH_INFORMATIONAL, 4, vec![]);
+        let rm = init.decode(&r).unwrap();
+        init.handle_informational_response(&rm).unwrap();
+        assert_eq!(init.next_message_id(), 5);
+        init.abort_request(); // no-op when idle
+        assert!(init.build_dpd().is_ok());
+    }
+
+    #[test]
+    fn first_auth_error_notify_takes_precedence_over_id_mismatch() {
+        let mut cfg = test_config();
+        cfg.identity.accept_any_remote_id = false;
+        let mut init = IkeInitiator::new(&cfg, local(), remote()).unwrap();
+        let mut resp = Responder::new();
+        run_sa_init(&mut init, &mut resp, false);
+        init.build_auth_initial().unwrap();
+        let r = resp.seal_response(
+            EXCH_IKE_AUTH,
+            1,
+            vec![
+                Payload::IdR(resp.id_r.clone()),
+                Payload::Notify(NotifyPayload::status(N_AUTHENTICATION_FAILED, vec![])),
+            ],
+        );
+        let rm = init.decode(&r).unwrap();
+        assert!(matches!(
+            init.handle_auth_response(&rm),
+            Err(Error::PeerNotify { notify_type: N_AUTHENTICATION_FAILED, .. })
+        ));
+    }
+
+    #[test]
+    fn response_with_initiator_flag_is_rejected() {
+        let (mut init, resp, _) = establish(false);
+        let dpd = init.build_dpd().unwrap();
+        let _ = init.encode(&dpd).unwrap();
+        let m = IkeMessage::new(resp.spi_i, resp.spi_r, EXCH_INFORMATIONAL, FLAG_INITIATOR | FLAG_RESPONSE, 4, vec![]);
+        let dg = vec![m.encode_encrypted(&resp.suite, &resp.keys().sk_er, &resp.keys().sk_ar).unwrap()];
+        let rm = init.decode(&dg).unwrap();
+        assert!(matches!(init.handle_informational_response(&rm), Err(Error::Protocol(_))));
+        assert_eq!(init.next_message_id(), 4, "not consumed");
+        assert!(init.has_pending_request(), "still waiting for the real response");
+        let r = resp.seal_response(EXCH_INFORMATIONAL, 4, vec![]);
+        let rm = init.decode(&r).unwrap();
+        init.handle_informational_response(&rm).unwrap();
+    }
+
+    #[test]
+    fn sa_init_response_sa_dh_must_match_the_ke_group() {
+        let mut cfg = test_config();
+        cfg.ike.proposals[0].dh_groups = vec![DH_MODP_2048, DH_MODP_3072];
+        let mut init = IkeInitiator::new(&cfg, local(), remote()).unwrap();
+        let mut resp = Responder::new();
+        let raw1 = init.build_sa_init(None).unwrap();
+        let raw2 = resp.sa_init_reply(&raw1);
+        // The responder echoes our proposal; select exactly one DH transform in the SA
+        // while the KE payload stays at group 14.
+        let with_sa_dh = |group: u16| {
+            let mut m = IkeMessage::decode_plain(&raw2).unwrap();
+            for p in &mut m.payloads {
+                if let Payload::Sa(sa) = p {
+                    let t = &mut sa.proposals[0].transforms;
+                    t.retain(|t| t.ttype != TT_DH);
+                    t.push(Transform::new(TT_DH, group));
+                }
+            }
+            assert_eq!(m.ke().unwrap().group, DH_MODP_2048);
+            m.encode_plain().unwrap()
+        };
+        let r = init.handle_sa_init_response(&with_sa_dh(DH_MODP_3072));
+        assert!(matches!(r, Err(Error::Decode(_))), "got {r:?}");
+        // A consistent SA/KE pair is fine.
+        assert!(matches!(init.handle_sa_init_response(&with_sa_dh(DH_MODP_2048)), Ok(SaInitOutcome::Established { .. })));
+    }
+
+    #[test]
+    fn set_local_addr_rebuilds_nat_d_source_hash() {
+        let cfg = test_config();
+        let mut init = IkeInitiator::new(&cfg, local(), remote()).unwrap();
+        let raw1 = init.build_sa_init(None).unwrap();
+        let first = IkeMessage::decode_plain(&raw1).unwrap();
+        let mut moved = local();
+        moved.set_port(local().port() + 1);
+        init.set_local_addr(moved);
+        let raw1b = init.build_sa_init(None).unwrap();
+        let second = IkeMessage::decode_plain(&raw1b).unwrap();
+        let nat_src = |m: &IkeMessage| m.notify(N_NAT_DETECTION_SOURCE_IP).unwrap().data.clone();
+        assert_ne!(nat_src(&first), nat_src(&second), "NAT_D_SRC follows the new local port");
+        assert_eq!(nat_src(&second), nat::nat_detection_hash(init.spi_i(), 0, Ipv4Addr::new(192, 0, 2, 0).into(), moved.port()).to_vec());
+        assert_eq!(first.nonce(), second.nonce(), "nonce and KE are kept");
+        assert_eq!(first.ke(), second.ke());
+    }
+
+    #[test]
+    fn final_response_uses_the_cfg_reply_even_after_another_cp() {
+        let cfg = test_config();
+        let mut init = IkeInitiator::new(&cfg, local(), remote()).unwrap();
+        let mut resp = Responder::new();
+        let raw1 = run_sa_init(&mut init, &mut resp, false);
+        let m1 = init.build_auth_initial().unwrap();
+        let _ = init.encode(&m1).unwrap();
+        let req_child = m1.sa().unwrap().proposals[0].clone();
+        let r = resp.seal_response(EXCH_IKE_AUTH, 1, vec![Payload::IdR(resp.id_r.clone()), Payload::Eap(vec![1, 1, 0, 5, 1])]);
+        let rm = init.decode(&r).unwrap();
+        assert!(matches!(init.handle_auth_response(&rm).unwrap(), AuthResponse::EapRequest(_)));
+        let m2 = init.build_auth_eap(&[2, 1, 0, 5, 1]).unwrap();
+        let _ = init.encode(&m2).unwrap();
+        let r = resp.seal_response(EXCH_IKE_AUTH, 2, vec![Payload::Eap(vec![3, 1, 0, 4])]);
+        let rm = init.decode(&r).unwrap();
+        assert!(matches!(init.handle_auth_response(&rm).unwrap(), AuthResponse::EapRequest(_)));
+        let msk = vec![0x5a; 64];
+        resp.msk = msk.clone();
+        init.set_msk(msk);
+        let m3 = init.build_auth_final().unwrap();
+        let _ = init.encode(&m3).unwrap();
+        let id_i = m1.id_i().unwrap().clone();
+        let expected = resp.expected_initiator_auth(&raw1, &id_i);
+        assert_eq!(m3.auth().unwrap().data, expected);
+        let auth = resp.auth_data(&resp.id_r.clone());
+        let mut payloads = vec![Payload::Cp(ConfigPayload { cfg_type: CFG_REQUEST, attributes: vec![] })];
+        payloads.extend(resp.final_payloads(&req_child, auth));
+        let r = resp.seal_response(EXCH_IKE_AUTH, 3, payloads);
+        let rm = init.decode(&r).unwrap();
+        match init.handle_auth_response(&rm).unwrap() {
+            AuthResponse::Established(est) => {
+                assert_eq!(est.assigned.internal_ipv4, vec![Ipv4Addr::new(10, 20, 30, 40)]);
+                assert_eq!(est.assigned.internal_ipv6.len(), 1);
+            }
+            other => panic!("expected Established, got {other:?}"),
+        }
     }
 }

@@ -42,6 +42,12 @@ pub const DEFAULT_MAX_FRAGMENT_LEN: usize = 1024;
 /// Exporter output length: MSK (64) | EMSK (64).
 const KEY_MATERIAL_LEN: usize = 128;
 const MSK_LEN: usize = 64;
+/// Upper bound on a declared inbound EAP-TLS flight (a TLS 1.2 handshake flight is far
+/// below this; RFC 5216 §2.1.5 fragments one TLS flight per EAP-TLS message). Bounds the
+/// buffer the peer's 32-bit L field can make us allocate.
+pub const MAX_INBOUND_TLS_FLIGHT: usize = 256 * 1024;
+/// Largest outbound fragment that still fits an EAP packet (RFC 3748 Length is u16).
+pub const MAX_OUTBOUND_FRAGMENT_LEN: usize = u16::MAX as usize - 10;
 
 /// Configuration for one EAP-TLS session.
 pub struct EapTlsConfig {
@@ -69,7 +75,7 @@ pub enum EapAction {
     /// Send this EAP packet to the peer (in an IKE_AUTH request carrying only `EAP`).
     Send(EapPacket),
     /// EAP-Success received after a completed handshake: keying material is ready.
-    Success { msk: Vec<u8>, emsk: Vec<u8> },
+    Success { msk: Zeroizing<Vec<u8>>, emsk: Zeroizing<Vec<u8>> },
     /// Fatal EAP-level failure (EAP-Failure received, or EAP-Success before completion).
     Failure(String),
 }
@@ -198,7 +204,9 @@ impl EapTlsClient {
     /// Build the rustls configuration up front so PEM / trust-store errors surface early.
     pub fn new(cfg: EapTlsConfig) -> Result<Self> {
         let tls_config = build_client_config(&cfg)?;
-        let max_fragment_len = if cfg.max_fragment_len == 0 { DEFAULT_MAX_FRAGMENT_LEN } else { cfg.max_fragment_len };
+        // Clamp so EAP hdr(4) + type(1) + flags(1) + L(4) + data always fits the 16-bit Length.
+        let max_fragment_len = if cfg.max_fragment_len == 0 { DEFAULT_MAX_FRAGMENT_LEN } else { cfg.max_fragment_len }
+            .min(MAX_OUTBOUND_FRAGMENT_LEN);
         Ok(EapTlsClient {
             identity: cfg.identity,
             tls_config,
@@ -226,7 +234,7 @@ impl EapTlsClient {
                     };
                     info!("EAP-Success received; EAP-TLS complete (MSK ready)");
                     self.state = State::Done;
-                    Ok(EapAction::Success { msk: msk.to_vec(), emsk: emsk.to_vec() })
+                    Ok(EapAction::Success { msk: Zeroizing::new(msk.to_vec()), emsk: Zeroizing::new(emsk.to_vec()) })
                 }
                 State::Done => Err(Error::protocol("EAP-Success received after the EAP session finished")),
                 State::Failed => Err(Error::protocol("EAP-Success received after the EAP session failed")),
@@ -393,6 +401,14 @@ impl EapTlsClient {
                     let capacity = td.length.ok_or_else(|| {
                         Error::Eap("EAP-TLS first fragment has M set but no L/length (more data than declared)".into())
                     })? as usize;
+                    // The declared length is peer-controlled (and pre-authentication): bound it
+                    // before it sizes a buffer, or a hostile L of 0xFFFFFFFF forces a 4 GiB
+                    // zero-fill at the M=0 fragment.
+                    if capacity > MAX_INBOUND_TLS_FLIGHT {
+                        return Err(Error::Eap(format!(
+                            "EAP-TLS declared length {capacity} exceeds the {MAX_INBOUND_TLS_FLIGHT} byte inbound flight limit"
+                        )));
+                    }
                     if td.data.len() > capacity {
                         return Err(Error::Eap(format!(
                             "EAP-TLS fragment carries {} bytes but declared total is {capacity}",
@@ -894,6 +910,25 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
     }
 
     #[test]
+    fn inbound_declared_length_above_cap_is_rejected_without_allocating() {
+        let mut c = EapTlsClient::new(client_cfg(false, false)).unwrap();
+        // A hostile first fragment declaring a 4 GiB flight must be rejected up front
+        // (the M=0 fragment would otherwise zero-fill the whole declared size).
+        let f = EapTlsData { flags: EAP_TLS_FLAG_M, length: Some(u32::MAX), data: vec![0x16; 5] };
+        assert!(matches!(c.reassemble(f), Err(Error::Eap(_))));
+        assert!(c.rx.is_none(), "no reassembly buffer is kept for a rejected length");
+        let f = EapTlsData { flags: EAP_TLS_FLAG_M, length: Some((MAX_INBOUND_TLS_FLIGHT + 1) as u32), data: vec![1] };
+        assert!(matches!(c.reassemble(f), Err(Error::Eap(_))));
+        // Exactly the cap is still accepted (and under-delivery zero-pads to it).
+        let f = EapTlsData { flags: EAP_TLS_FLAG_M, length: Some(MAX_INBOUND_TLS_FLIGHT as u32), data: vec![1] };
+        assert_eq!(c.reassemble(f).unwrap(), None);
+        let f = EapTlsData { flags: 0, length: None, data: vec![2] };
+        let out = c.reassemble(f).unwrap().unwrap();
+        assert_eq!(out.len(), MAX_INBOUND_TLS_FLIGHT);
+        assert_eq!(&out[..2], &[1, 2]);
+    }
+
+    #[test]
     fn inbound_under_delivery_is_zero_padded() {
         let mut c = EapTlsClient::new(client_cfg(false, false)).unwrap();
         let f = EapTlsData { flags: EAP_TLS_FLAG_M, length: Some(4), data: vec![1, 2] };
@@ -1159,7 +1194,7 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
                     assert_eq!(client.msk(), Some(&msk[..]));
                     let expected = if tls13 { ProtocolVersion::TLSv1_3 } else { ProtocolVersion::TLSv1_2 };
                     assert_eq!(client.protocol_version(), Some(expected));
-                    return (msk, stats, server);
+                    return (msk.to_vec(), stats, server);
                 }
                 EapAction::Failure(s) => panic!("client failure: {s}"),
             };

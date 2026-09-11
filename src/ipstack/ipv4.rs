@@ -38,7 +38,11 @@ pub fn build_udp_with_id(
     if total > u16::MAX as usize {
         return Err(Error::encode(format!("ipv4: packet too large ({total} bytes)")));
     }
-    let csum = udp_checksum(src.ip(), dst.ip(), &udp);
+    // RFC 768: a computed checksum of zero is transmitted as all ones (0 = "no checksum").
+    let csum = match udp_checksum(src.ip(), dst.ip(), &udp) {
+        0 => 0xffff,
+        c => c,
+    };
     udp[6..8].copy_from_slice(&csum.to_be_bytes());
 
     let mut pkt = Vec::with_capacity(total);
@@ -220,6 +224,26 @@ mod tests {
         zero[26] = 0;
         zero[27] = 0;
         assert!(matches!(parse(&zero), Ok(ParsedIp::Udp(_))));
+    }
+
+    #[test]
+    fn computed_zero_udp_checksum_is_sent_as_ffff() {
+        // RFC 768: a computed checksum of 0 is transmitted as all ones (0 means "none").
+        let (src, dst) = (s("10.0.0.1:1"), s("10.0.0.2:2"));
+        let payload = (0..=u16::MAX)
+            .map(|v| v.to_be_bytes())
+            .find(|p| udp_checksum(src.ip(), dst.ip(), &udp_segment(1, 2, p).unwrap()) == 0)
+            .expect("some 2-byte payload sums to zero");
+        let pkt = build_udp_with_id(src, dst, &payload, 0).unwrap();
+        assert_eq!(&pkt[26..28], &[0xff, 0xff], "checksum field must not be 0");
+        match parse(&pkt).unwrap() {
+            ParsedIp::Udp(d) => assert_eq!(d.payload, payload),
+            other => panic!("unexpected {other:?}"),
+        }
+        // A payload with a non-zero checksum is untouched.
+        let pkt = build_udp_with_id(src, dst, b"abc", 0).unwrap();
+        assert_ne!(&pkt[26..28], &[0xff, 0xff]);
+        assert_ne!(&pkt[26..28], &[0, 0]);
     }
 
     #[test]

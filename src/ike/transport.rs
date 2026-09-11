@@ -192,6 +192,12 @@ impl IkeTransport {
             let (n, src) = match self.socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(e) if is_timeout(&e) => return Ok(None),
+                Err(e) if is_transient(&e) => {
+                    // ICMP-derived errors on an unconnected UDP socket (Windows, Linux with
+                    // IP_RECVERR): the datagram is lost; the retransmit schedule covers it.
+                    warn!("UDP receive error treated as a lost datagram: {e}");
+                    continue;
+                }
                 Err(e) => return Err(Error::Io(e)),
             };
             let expected = self.remote_addr();
@@ -353,6 +359,13 @@ fn retransmit_timeout(policy: &RetransmitConfig, attempt: u32) -> Duration {
 
 fn is_timeout(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+}
+
+fn is_transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionAborted
+    )
 }
 
 /// Read (Fragment Number, Total Fragments) from an SKF datagram (RFC 7383 §2.5).

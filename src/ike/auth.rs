@@ -101,7 +101,7 @@ impl AuthMethod for SharedKeyAuth {
         if bool::from(expected.ct_eq(auth_data)) {
             Ok(())
         } else {
-            log::debug!("AUTH mismatch: got {} expected {}", hex::encode(auth_data), hex::encode(&expected));
+            log::debug!("AUTH mismatch: got {} bytes, expected {} bytes (values not logged)", auth_data.len(), expected.len());
             Err(Error::AuthFailed("responder AUTH (shared key MIC) does not verify".into()))
         }
     }

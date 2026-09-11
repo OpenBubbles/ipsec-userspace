@@ -491,7 +491,7 @@ pub(crate) fn open(buf: &[u8], expect: u8, suite: &Suite, sk_e: &[u8], sk_a: &[u
         )));
     }
     plaintext.truncate(plaintext.len() - pad_len - 1);
-    log::debug!(
+    log::trace!(
         "open: msgid={} skf={:?} first={} plaintext={}",
         header.message_id,
         skf,
