@@ -647,6 +647,29 @@ still proves off-prefix delivery end to end.
 Threading rule: only the stack thread touches `Interface`/`SocketSet`/`EspDevice` (behind one Mutex + Condvar); callers hold the lock only
 to enqueue/dequeue. The ESP rx thread never blocks on the stack lock for long (push + notify). All queues bounded; drops counted in stats.
 
+### 11.1 IP fragmentation shim around the smoltcp device (decision 2026-09-11)
+smoltcp 0.14 has **no IPv6 fragmentation or reassembly for `Medium::Ip`** (`proto-ipv6-fragmentation` only serves 6LoWPAN); it
+drops oversize IPv6 on send and answers an inbound Fragment header with ICMPv6 Parameter Problem. SIP over this tunnel needs both
+directions (1.5–3.7 KB 200 OK / NOTIFY arrive IPv6-fragmented from the P-CSCF; INVITEs can exceed 1280 bytes), so the tunnel
+wraps the device:
+- **Device MTU seen by smoltcp** = `cfg.child.inner_mtu_stack` (new, default 16384; ≥ `inner_mtu`) so smoltcp never refuses a large
+  UDP datagram. **Wire MTU** = `cfg.child.inner_mtu` (1280) is what fragments must fit.
+- **TX (`ipstack/frag.rs::fragment_for_wire(pkt, wire_mtu) -> Vec<Vec<u8>>`)**, applied in the TX sink before ESP: an IP packet
+  longer than `wire_mtu` is split — IPv6 per RFC 8200 §4.5 (insert a Fragment extension header after the base header; only the
+  base header is unfragmentable when no extension headers are present — reject/pass-through packets with other extension headers;
+  fragment payloads are multiples of 8 except the last; random 32-bit Identification; M flag on all but the last; Payload Length
+  recomputed per fragment); IPv4 per RFC 791 (honour DF: drop + count; else split with MF/offset, recompute header checksum and
+  Total Length). Packets ≤ `wire_mtu` pass through untouched. Each fragment is one ESP packet.
+- **RX (`ipstack/frag.rs::Ipv6Reassembler`)**, applied in `push_rx` before the device: reassemble IPv6 fragment sets keyed by
+  (src, dst, Identification): TreeMap offset→chunk, complete when contiguous from 0 and the M=0 tail seen; rebuild the packet
+  with the Fragment header removed, Next Header rewritten, Payload Length fixed; bounded (≤ 32 pending sets, ≤ 64 KiB each,
+  30 s eviction, counters in `StackStats`). IPv4 fragments pass straight through — smoltcp reassembles those itself
+  (`proto-ipv4-fragmentation`, `reassembly_timeout`).
+- `InnerUdpSocket::send_to` payload cap becomes `inner_mtu_stack − 48` (v6) / `− 28` (v4); oversize → `Error::Protocol`.
+- Tests: fragment→reassemble round trips (v6 sizes 1281, 1500, 3000, 8000; v4 3000 incl. DF drop), out-of-order/duplicate/missing
+  fragments, eviction; and the two-stack loopback harness must pass a 3000-byte **IPv6** UDP datagram both ways with the wire
+  MTU 1280 (each device sink asserts every packet it emits is ≤ 1280).
+
 ## 12. Tunnel facade (`tunnel.rs`)
 ```rust
 pub struct TunnelInfo { pub local_addr: SocketAddr, pub remote_addr: SocketAddr, pub nat: NatStatus, pub assigned: AssignedConfig,
@@ -770,6 +793,7 @@ CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 
 **Post-EAP IKE_AUTH request:** inner = one AUTH payload `00 00 00 28 | 02 00 00 00 | 32-byte HMAC` (40 B) → 7 pad + padlen → 48 B ciphertext; SK = 84; message = 112 B; SK next-payload 0x27.
 
 ## 15. Amendment log
+- 2026-09-11: §11.1 — IP fragmentation shim around the smoltcp device (smoltcp 0.14 lacks IPv6 frag/reassembly on Medium::Ip).
 - 2026-09-11 (§11 implemented, deviations): (a) smoltcp 0.14 has no IPv6 fragmentation/reassembly on `Medium::Ip` — §11's
   "IPv6 larger than the MTU is fragmented / inbound IPv6 fragments are reassembled" is false for 0.14; `send_to` refuses oversize
   IPv6 payloads instead (IPv4 fragments/reassembles as specified). (b) `InnerUdpSocket` / `UdpDatagram` live in `ipstack::stack`
