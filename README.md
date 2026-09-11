@@ -45,6 +45,38 @@ let reply = sock.recv_timeout(Duration::from_secs(5))?;  // Option<UdpDatagram {
 tunnel.close()?;                                         // INFORMATIONAL DELETE(IKE), stops all threads
 ```
 
+## NetStack
+
+`epdg::NetStack` (DESIGN.md §16) is one synchronous, object-safe socket/DNS abstraction implemented by both the host
+OS stack (`StdNetStack`: `std::net` sockets + the libc resolver) and the tunnel (`EpdgTunnel`: inner UDP sockets + the
+smoltcp DNS socket over the gateway-assigned servers). Application code — a SIP client, say — is written once against
+`&dyn NetStack` / `Arc<dyn NetStack>` and runs unchanged on either:
+
+```rust
+use std::time::Duration;
+use epdg::{EpdgTunnel, NetStack, StdNetStack};
+
+/// Resolve `host`, send `payload` to its first address on `port`, return the reply.
+fn ping(stack: &dyn NetStack, host: &str, port: u16, payload: &[u8]) -> std::io::Result<Option<Vec<u8>>> {
+    let addrs = stack.resolve(host, Duration::from_secs(5))?;        // this stack's resolver; IP literals are immediate
+    let sock = stack.bind_udp(0)?;                                   // ephemeral port
+    println!("{} {} -> {}:{port}", stack.name(), sock.local_addr(), addrs[0]);
+    sock.send_to((addrs[0], port).into(), payload)?;
+    Ok(sock.recv_timeout(Duration::from_secs(5))?.map(|(_peer, data)| data))
+}
+
+let os = StdNetStack::new();                                         // dual-stack [::] (or 0.0.0.0 without IPv6)
+ping(&os, "localhost", 5060, b"OPTIONS ...")?;
+let tunnel = EpdgTunnel::connect(&cfg)?;
+ping(&tunnel, "ueb2bprod.pc.t-mobile.com", 5060, b"OPTIONS ...")?;   // same code, inside the tunnel
+```
+
+`local_addrs()` gives the addresses the stack sources traffic from (SIP Via/Contact): the tunnel's inner addresses, or
+for the OS stack the bind address / the route-selected egress address per family. TCP (`connect_tcp`, `listen_tcp`,
+`TcpStreamLike` shared between a reader and a writer thread, `StreamIo` as `Read + Write` for TLS) is **std-only for
+now**: the tunnel returns `ErrorKind::Unsupported` until smoltcp's TCP socket is wired to the stack thread. Crate errors
+are mapped to `io::Error` by `netstack::to_io` (`Timeout` → `TimedOut`, `Closed` → `NotConnected`).
+
 CLI (stable path — handy for per-application firewall rules):
 
 ```bash
@@ -56,7 +88,7 @@ RUST_LOG=info ./target/debug/epdg-connect            # connect, resolve the P-CS
 ## Tests
 
 ```bash
-cargo test                          # 309 offline unit tests + the live test
+cargo test                          # 354 offline unit tests + the live test
 EPDG_SKIP_LIVE=1 cargo test         # skip the live test
 RUST_LOG=debug cargo test --test live_tmobile -- --nocapture   # live: hex dumps of every IKE datagram
 ```
@@ -65,10 +97,12 @@ The inner stack is tested offline with an in-process **two-stack loopback** (`ip
 on different IPv6 /64s (+ a v4 /32 each) whose device sinks feed each other — UDP both ways with exact endpoints,
 off-prefix routing, 3000-byte IPv4 and IPv6 datagrams fragmented at the wire MTU 1280 and reassembled, ICMP echo,
 bursts and fire-and-forget sends, `resolve()` against a tiny in-process DNS server on the far stack's port 53, timeouts,
-port allocation, queue bounds, shutdown semantics.
+port allocation, queue bounds, shutdown semantics. The `NetStack` abstraction runs one generic UDP exercise over both
+backends (loopback `StdNetStack`s and the two-stack loopback), the TCP exercise on `StdNetStack` over loopback, and the
+libc resolver against `localhost` only.
 
 `tests/live_tmobile.rs` drives `target/debug/epdg-connect` (stable path, so one firewall rule keeps working across rebuilds; set `EPDG_LIVE_INPROCESS=1` to run the tunnel inside the test process instead). It connects to the T-Mobile PROD ePDG with the fixture credentials, asserts an inner address,
-resolves `ueb2bprod.pc.t-mobile.com` with `tunnel.resolve` (smoltcp DNS over ESP — proves ESP in both directions),
+resolves `ueb2bprod.pc.t-mobile.com` through `&dyn NetStack` (smoltcp DNS over ESP — proves ESP in both directions and covers the tunnel's `NetStack` implementation),
 runs a DPD, observes NAT-T keepalives, and tears down cleanly. It needs UDP egress on 500/4500; a per-application
 firewall (e.g. Little Snitch) must allow the test binary or `target/debug/epdg-connect`.
 
@@ -78,7 +112,8 @@ firewall (e.g. Little Snitch) must allow the test binary or `target/debug/epdg-c
 keys, auth, nat, transport, `session::IkeInitiator` sans-I/O state machine) · `eap` (packet, tls) · `esp` (codec, replay)
 · `ipstack` (`device::EspDevice` — smoltcp `Medium::Ip` device over ESP; `stack::InnerStack` — `Interface` + `SocketSet`
 + the single stack thread, `InnerUdpSocket`, `resolve`) · `tunnel` (threads: rx demux, stack, keepalive, DPD/rekey
-timers; `EpdgTunnel` facade). Design contract and the byte-level facts mirrored from the AOSP client: `docs/DESIGN.md`,
+timers; `EpdgTunnel` facade) · `netstack` (`NetStack` / `UdpSocketLike` / `TcpStreamLike` / `TcpListenerLike` traits,
+`StdNetStack`, the tunnel implementations). Design contract and the byte-level facts mirrored from the AOSP client: `docs/DESIGN.md`,
 `docs/AOSP_FACTS*.md`.
 
 Threading of the inner stack (DESIGN.md §11): only the `epdg-stack` thread drives smoltcp (`Interface::poll`), behind

@@ -859,6 +859,16 @@ impl InnerUdpSocket {
     pub fn local_port(&self) -> u16 {
         self.port
     }
+
+    /// The socket's address as seen by peers: the first inner address of the stack
+    /// (IPv6 before IPv4, in the order they were assigned) with the bound port. The
+    /// socket is bound on *every* inner address; this is the one to advertise (SIP
+    /// Via/Contact) when a single address is needed. `[::]:port` if the stack has no
+    /// address at all.
+    pub fn local_addr(&self) -> SocketAddr {
+        let ip = self.stack.addresses().first().map(|(a, _)| *a).unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        SocketAddr::new(ip, self.port)
+    }
 }
 
 impl Drop for InnerUdpSocket {
@@ -899,7 +909,7 @@ impl std::fmt::Debug for InnerUdpSocket {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::OnceLock;
     use std::sync::atomic::AtomicU64;
@@ -969,9 +979,9 @@ mod tests {
     /// Two stacks whose devices feed each other over asynchronous wires; `a_wire` /
     /// `b_wire` record every IP packet A / B transmitted. Stops and joins every thread
     /// on drop.
-    struct Pair {
-        a: InnerStack,
-        b: InnerStack,
+    pub(crate) struct Pair {
+        pub(crate) a: InnerStack,
+        pub(crate) b: InnerStack,
         a_wire: Arc<Mutex<Vec<Vec<u8>>>>,
         b_wire: Arc<Mutex<Vec<Vec<u8>>>>,
         stop_wires: Arc<AtomicBool>,
@@ -1010,7 +1020,7 @@ mod tests {
         }
 
         /// A(v6 + v4, DNS = B) <-> B(v6 on another /64 + v4, DNS = A).
-        fn dual() -> Pair {
+        pub(crate) fn dual() -> Pair {
             Pair::new(
                 assigned(Some(A_V6), Some(A_V4), Some(B_V6), Some(B_V4)),
                 assigned(Some(B_V6), Some(B_V4), Some(A_V6), Some(A_V4)),
@@ -1592,14 +1602,15 @@ mod tests {
         })
     }
 
-    struct DnsServer {
+    pub(crate) struct DnsServer {
         stop: Arc<AtomicBool>,
-        seen: Arc<Mutex<Vec<(String, u16)>>>,
+        /// `(question name, qtype)` of every query received.
+        pub(crate) seen: Arc<Mutex<Vec<(String, u16)>>>,
         thread: Option<JoinHandle<()>>,
     }
 
     impl DnsServer {
-        fn start(stack: &InnerStack, answers: Vec<IpAddr>, rcode: u8) -> DnsServer {
+        pub(crate) fn start(stack: &InnerStack, answers: Vec<IpAddr>, rcode: u8) -> DnsServer {
             let sock = stack.bind_udp(53).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
             let seen = Arc::new(Mutex::new(Vec::new()));
@@ -1617,9 +1628,9 @@ mod tests {
         }
     }
 
-    const HOST: &str = "pcscf.example.test";
-    const ANS_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x53, 0, 0, 0, 0, 0x1);
-    const ANS_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
+    pub(crate) const HOST: &str = "pcscf.example.test";
+    pub(crate) const ANS_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0x53, 0, 0, 0, 0, 0x1);
+    pub(crate) const ANS_V4: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 53);
 
     #[test]
     fn dns_reply_encoder_round_trips_with_a_real_query() {

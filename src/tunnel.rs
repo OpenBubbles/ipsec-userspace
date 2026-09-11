@@ -1274,6 +1274,11 @@ impl EpdgTunnel {
         self.shared.stats()
     }
 
+    /// The inner smoltcp stack (for the `NetStack` implementation: inner addresses).
+    pub(crate) fn stack(&self) -> &InnerStack {
+        &self.shared.stack
+    }
+
     /// Send `DELETE(IKE)` (best effort, short timeout) and stop the threads.
     pub fn close(mut self) -> Result<()> {
         self.shutdown()

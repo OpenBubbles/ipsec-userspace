@@ -18,6 +18,7 @@
 //! - [`esp`]     — ESP codec, anti-replay, UDP encapsulation
 //! - [`ipstack`] — inner IP stack: smoltcp `Medium::Ip` device over ESP + stack thread (UDP, DNS)
 //! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`
+//! - [`netstack`] — `NetStack`: one UDP/TCP/DNS abstraction over the OS stack (`StdNetStack`) and the tunnel
 
 pub mod config;
 pub mod crypto;
@@ -26,8 +27,10 @@ pub mod error;
 pub mod esp;
 pub mod ike;
 pub mod ipstack;
+pub mod netstack;
 pub mod tunnel;
 
 pub use config::Config;
 pub use error::{Error, Result};
+pub use netstack::{NetStack, StdNetStack, StreamIo, TcpListenerLike, TcpStreamLike, UdpSocketLike};
 pub use tunnel::{EpdgTunnel, InnerUdpSocket, TunnelInfo};

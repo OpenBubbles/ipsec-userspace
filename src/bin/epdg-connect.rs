@@ -11,7 +11,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use epdg::{Config, EpdgTunnel, Error};
+use epdg::{Config, EpdgTunnel, Error, NetStack};
 
 const TARGET_HOST: &str = "ueb2bprod.pc.t-mobile.com";
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -77,22 +77,16 @@ fn main() {
     );
     let a = &info.assigned;
 
+    // The P-CSCF lookup goes through the NetStack abstraction (DESIGN.md §16), so a
+    // live run covers the tunnel implementation of the trait, not only the facade.
+    let stack: &dyn NetStack = &tunnel;
+    println!("netstack {}: local addresses {:?}", stack.name(), stack.local_addrs());
     let mut answers: Vec<IpAddr> = Vec::new();
     if do_dns {
         if a.dns_ipv4.is_empty() && a.dns_ipv6.is_empty() {
             println!("no DNS server assigned; skipping DNS check");
         } else {
-            for attempt in 1..=2 {
-                println!("  resolve {TARGET_HOST} via tunnel DNS v6 {:?} v4 {:?} (try {attempt}/2)", a.dns_ipv6, a.dns_ipv4);
-                match tunnel.resolve(TARGET_HOST, DNS_TIMEOUT) {
-                    Ok(v) => {
-                        println!("  answers: {v:?}");
-                        answers = v;
-                        break;
-                    }
-                    Err(e) => println!("  lookup failed: {e}"),
-                }
-            }
+            answers = lookup_pcscf(stack, TARGET_HOST, &format!("v6 {:?} v4 {:?}", a.dns_ipv6, a.dns_ipv4));
         }
     }
 
@@ -128,6 +122,22 @@ fn main() {
     if !alive {
         std::process::exit(1);
     }
+}
+
+/// Resolve the P-CSCF host name with the stack's own resolver (two attempts): the
+/// DNS round trip proves ESP in both directions when `stack` is the tunnel.
+fn lookup_pcscf(stack: &dyn NetStack, host: &str, servers: &str) -> Vec<IpAddr> {
+    for attempt in 1..=2 {
+        println!("  resolve {host} via {} DNS {servers} (try {attempt}/2)", stack.name());
+        match stack.resolve(host, DNS_TIMEOUT) {
+            Ok(v) => {
+                println!("  answers: {v:?}");
+                return v;
+            }
+            Err(e) => println!("  lookup failed: {e}"),
+        }
+    }
+    Vec::new()
 }
 
 // ---- TLS negotiation probe (diagnostic subcommand) ----
