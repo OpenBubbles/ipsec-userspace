@@ -14,11 +14,15 @@
 //!
 //! Everything is synchronous and object-safe. Errors are `io::Error`; the crate's
 //! [`Error`] is mapped by [`to_io`] (`Timeout` → `TimedOut`, `Closed` → `NotConnected`,
-//! `Config`/`Unsupported` → `InvalidInput`, the rest → `Other`, source preserved).
+//! `Config`/`Unsupported` → `InvalidInput`, the rest → `Other`; the crate error is
+//! kept as the payload, reachable through `io::Error::get_ref()` / `into_inner()`).
+//! Conditions a caller is expected to branch on have the same kind on both backends:
+//! a taken port in `bind_udp` is `AddrInUse`, a name that does not exist is
+//! `NotFound`, a resolver that did not answer is `TimedOut`.
 
 use std::fmt;
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,7 +40,8 @@ pub const TUNNEL_TCP_UNSUPPORTED: &str = "TCP over the ePDG tunnel is not implem
 /// A network stack: UDP sockets, TCP connections/listeners and a resolver, all
 /// sourced from the same place (the OS or the ePDG tunnel). Object-safe.
 pub trait NetStack: Send + Sync {
-    /// Bind a UDP socket on `local_port` (0 = ephemeral).
+    /// Bind a UDP socket on `local_port` (0 = ephemeral). A port that is already
+    /// bound is `Err(AddrInUse)` on every backend.
     fn bind_udp(&self, local_port: u16) -> io::Result<Box<dyn UdpSocketLike>>;
     /// Open a TCP connection to `remote` within `timeout`. Tunnel backend:
     /// `Err(ErrorKind::Unsupported)` for now.
@@ -46,7 +51,9 @@ pub trait NetStack: Send + Sync {
     fn listen_tcp(&self, local_port: u16) -> io::Result<Box<dyn TcpListenerLike>>;
     /// Resolve `host` to A/AAAA addresses with THIS stack's resolver, within
     /// `timeout`. IP literals (also bracketed, `[::1]`) return immediately without
-    /// touching the resolver. `Err(TimedOut)` when the resolver did not answer in time.
+    /// touching the resolver. `Err(TimedOut)` when the resolver did not answer in time,
+    /// `Err(NotFound)` when it answered that the name has no address. Any `timeout`
+    /// (including `Duration::MAX`) is accepted.
     fn resolve(&self, host: &str, timeout: Duration) -> io::Result<Vec<IpAddr>>;
     /// Addresses this stack sources traffic from (SIP Via/Contact): the tunnel's inner
     /// addresses; for the OS stack the configured bind address, else the
@@ -59,10 +66,15 @@ pub trait NetStack: Send + Sync {
 /// A bound UDP socket. `Send + Sync`: one thread may block in `recv_timeout` while
 /// others `send_to`.
 pub trait UdpSocketLike: Send + Sync {
-    /// Send one datagram to `dst`.
+    /// Send one datagram to `dst` (a v4-mapped `::ffff:a.b.c.d` destination is
+    /// treated as IPv4 on every backend). The OS backend is bound by the host's
+    /// maximum datagram size (macOS: 9216 bytes by default, `EMSGSIZE` beyond).
     fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()>;
     /// Wait up to `timeout` for one datagram: `Ok(Some((peer, payload)))`, `Ok(None)`
-    /// on timeout, `Err(NotConnected)` once the stack is closed.
+    /// on timeout, `Err(NotConnected)` once the stack is closed. Any `timeout` is
+    /// accepted; `Duration::MAX` waits until a datagram arrives. Receivers are
+    /// serialised (single consumer): a second thread calling `recv_timeout`
+    /// concurrently waits for the first call to return before its own timeout starts.
     fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<(SocketAddr, Vec<u8>)>>;
     /// The bound address (port always meaningful; the IP may be unspecified for a
     /// wildcard-bound OS socket).
@@ -77,11 +89,26 @@ pub trait TcpStreamLike: Send + Sync {
     /// Read into `buf`; `Ok(0)` = EOF; honours the read timeout
     /// (`Err(WouldBlock | TimedOut)` on expiry).
     fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
-    /// Write all of `buf` (honours the write timeout).
-    fn write_all(&self, buf: &[u8]) -> io::Result<()>;
+    /// Write some of `buf`, returning how much was accepted (the `io::Write::write`
+    /// contract: `Err` means nothing was written, so a caller — TLS in particular —
+    /// may retry the same bytes). Honours the write timeout.
+    fn write(&self, buf: &[u8]) -> io::Result<usize>;
+    /// Write all of `buf` by repeated [`write`](Self::write)s; `Err(WriteZero)` if a
+    /// write accepts nothing. Honours the write timeout per underlying write.
+    fn write_all(&self, mut buf: &[u8]) -> io::Result<()> {
+        while !buf.is_empty() {
+            match self.write(buf) {
+                Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "failed to write whole buffer")),
+                Ok(n) => buf = &buf[n..],
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
     /// Read timeout for subsequent `read`s (`None` = block forever).
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
-    /// Write timeout for subsequent `write_all`s (`None` = block forever).
+    /// Write timeout for subsequent `write`s (`None` = block forever).
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     /// Toggle Nagle's algorithm.
     fn set_nodelay(&self, nodelay: bool) -> io::Result<()>;
@@ -89,13 +116,15 @@ pub trait TcpStreamLike: Send + Sync {
     fn local_addr(&self) -> SocketAddr;
     /// The peer's end of the connection.
     fn peer_addr(&self) -> SocketAddr;
-    /// Shut down both directions (the peer reads EOF).
+    /// Shut down both directions (the peer reads EOF). Idempotent: `Ok(())` when
+    /// the connection is already down (shut down before, or closed by the peer).
     fn shutdown(&self) -> io::Result<()>;
 }
 
 /// A TCP listener.
 pub trait TcpListenerLike: Send + Sync {
-    /// Accept one connection, waiting at most `timeout`; `Ok(None)` on timeout.
+    /// Accept one connection, waiting at most `timeout`; `Ok(None)` on timeout. Any
+    /// `timeout` is accepted; `Duration::MAX` waits until a connection arrives.
     fn accept_timeout(&self, timeout: Duration) -> io::Result<Option<(Box<dyn TcpStreamLike>, SocketAddr)>>;
     /// The bound address (the port is what peers connect to).
     fn local_addr(&self) -> SocketAddr;
@@ -121,8 +150,16 @@ impl fmt::Debug for dyn TcpListenerLike {
 
 /// `std::io::Read + Write` adapter over any `&dyn TcpStreamLike` so TLS (e.g.
 /// `openssl::ssl::SslStream`) or any other `Read`/`Write` consumer can wrap it.
-/// `flush` is a no-op: `write` already writes everything (`write_all`).
+/// `write` is the stream's partial [`TcpStreamLike::write`] (an `Err` never consumed
+/// bytes, as `io::Write` requires); `flush` is a no-op (nothing is buffered here).
+/// `Debug` so `openssl::ssl::HandshakeError<StreamIo>` is `Display + Error`.
 pub struct StreamIo<'a>(pub &'a dyn TcpStreamLike);
+
+impl fmt::Debug for StreamIo<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamIo").field("local_addr", &self.0.local_addr()).field("peer_addr", &self.0.peer_addr()).finish()
+    }
+}
 
 impl io::Read for StreamIo<'_> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -132,8 +169,7 @@ impl io::Read for StreamIo<'_> {
 
 impl io::Write for StreamIo<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write_all(buf)?;
-        Ok(buf.len())
+        self.0.write(buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -141,8 +177,20 @@ impl io::Write for StreamIo<'_> {
     }
 }
 
-/// Map the crate's [`Error`] to an `io::Error`, keeping the original as the source:
-/// `Io(e)` → `e`; `Timeout` → `TimedOut`; `Closed` → `NotConnected`;
+/// `::ffff:a.b.c.d` → `a.b.c.d`; everything else unchanged.
+pub(crate) fn normalise(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
+            None => addr,
+        },
+        v4 => v4,
+    }
+}
+
+/// Map the crate's [`Error`] to an `io::Error`, keeping the original as the payload
+/// (`io::Error::get_ref()` / `into_inner()` downcast to [`Error`]; `Display` is the
+/// crate error's): `Io(e)` → `e`; `Timeout` → `TimedOut`; `Closed` → `NotConnected`;
 /// `Config` / `Unsupported` → `InvalidInput`; everything else → `Other`.
 pub fn to_io(e: Error) -> io::Error {
     let e = match e {
@@ -163,11 +211,37 @@ fn tunnel_tcp_unsupported<T>() -> io::Result<T> {
     Err(io::Error::new(ErrorKind::Unsupported, TUNNEL_TCP_UNSUPPORTED))
 }
 
-/// Parse an IP literal, accepting the bracketed IPv6 form (`[::1]`) and a zone-less
-/// address; `None` for anything that needs a resolver.
-pub(crate) fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+/// The tunnel resolver's errors as `io::Error`: a negative answer (NXDOMAIN, no
+/// record of that type, server failure, no addresses) is `NotFound` — the kind the
+/// std backend uses for an empty `getaddrinfo` result — everything else is [`to_io`].
+fn resolve_err_to_io(e: Error) -> io::Error {
+    match e {
+        Error::Protocol(m) if m.starts_with("DNS query failed") || m.ends_with("returned no addresses") => {
+            io::Error::new(ErrorKind::NotFound, Error::Protocol(m))
+        }
+        other => to_io(other),
+    }
+}
+
+/// Strip the bracket / zone decoration of `host` if it is an IPv6 literal:
+/// `(address text, zone)`.
+fn split_ip_literal(host: &str) -> (&str, Option<&str>) {
     let inner = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
-    inner.parse().ok()
+    match inner.split_once('%') {
+        Some((addr, zone)) => (addr, Some(zone)),
+        None => (inner, None),
+    }
+}
+
+/// Parse an IP literal, accepting the bracketed IPv6 form (`[::1]`) and a zone-less
+/// address; `None` for anything that needs a resolver (scoped literals such as
+/// `fe80::1%lo0` are refused by [`validate_hostname`] with a dedicated message: an
+/// `IpAddr` cannot carry the zone).
+pub(crate) fn parse_ip_literal(host: &str) -> Option<IpAddr> {
+    match split_ip_literal(host) {
+        (inner, None) => inner.parse().ok(),
+        (_, Some(_)) => None,
+    }
 }
 
 /// Cheap syntactic hostname check performed before a resolver is involved, so that
@@ -178,6 +252,11 @@ pub(crate) fn validate_hostname(host: &str) -> io::Result<()> {
     let invalid = |why: &str| Err(io::Error::new(ErrorKind::InvalidInput, format!("invalid host name {host:?}: {why}")));
     if host.is_empty() {
         return invalid("empty");
+    }
+    if let (addr, Some(zone)) = split_ip_literal(host)
+        && addr.parse::<Ipv6Addr>().is_ok()
+    {
+        return invalid(&format!("scoped IPv6 literal (zone {zone:?}) is not supported; an IpAddr cannot carry the zone"));
     }
     let name = host.strip_suffix('.').unwrap_or(host);
     if name.is_empty() {
@@ -206,7 +285,8 @@ pub(crate) fn validate_hostname(host: &str) -> io::Result<()> {
 
 impl UdpSocketLike for InnerUdpSocket {
     fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
-        InnerUdpSocket::send_to(self, dst, payload).map_err(to_io)
+        // smoltcp would route `::ffff:a.b.c.d` as plain IPv6 (to the gateway, lost).
+        InnerUdpSocket::send_to(self, normalise(dst), payload).map_err(to_io)
     }
 
     fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<(SocketAddr, Vec<u8>)>> {
@@ -237,7 +317,7 @@ impl NetStack for InnerStack {
         if let Some(ip) = parse_ip_literal(host) {
             return Ok(vec![ip]);
         }
-        InnerStack::resolve(self, host, timeout).map_err(to_io)
+        InnerStack::resolve(self, host, timeout).map_err(resolve_err_to_io)
     }
 
     fn local_addrs(&self) -> Vec<IpAddr> {
@@ -268,7 +348,7 @@ impl NetStack for EpdgTunnel {
         if let Some(ip) = parse_ip_literal(host) {
             return Ok(vec![ip]);
         }
-        EpdgTunnel::resolve(self, host, timeout).map_err(to_io)
+        EpdgTunnel::resolve(self, host, timeout).map_err(resolve_err_to_io)
     }
 
     fn local_addrs(&self) -> Vec<IpAddr> {
@@ -369,6 +449,10 @@ pub(crate) mod tests {
         drop(sa2);
         drop(sa);
         let sa = bind_fixed(a);
+        // A taken port is AddrInUse on every backend (a SIP client falls back to an
+        // ephemeral port on that kind).
+        let e = a.bind_udp(sa.local_addr().port()).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::AddrInUse, "{}: rebinding a bound port: {e}", a.name());
 
         let to_b = SocketAddr::new(b_ip, sb.local_addr().port());
         let to_a = SocketAddr::new(a_ip, sa.local_addr().port());
@@ -415,6 +499,15 @@ pub(crate) mod tests {
         let inner = e.get_ref().and_then(|s| s.downcast_ref::<Error>()).expect("the crate error is kept inside");
         assert!(matches!(inner, Error::Timeout("DNS response")));
         assert!(e.to_string().contains("DNS response"), "{e}");
+        assert!(e.into_inner().unwrap().downcast::<Error>().is_ok(), "into_inner downcasts to the crate error");
+        // The resolver-specific mapping: negative answers are NotFound, the rest as to_io.
+        let nx = resolve_err_to_io(Error::Protocol("DNS query failed (no answer of that type, NXDOMAIN or server failure)".into()));
+        assert_eq!(nx.kind(), ErrorKind::NotFound, "{nx}");
+        assert!(nx.get_ref().is_some_and(|s| s.is::<Error>()));
+        assert_eq!(resolve_err_to_io(Error::Protocol("DNS lookup of x returned no addresses".into())).kind(), ErrorKind::NotFound);
+        assert_eq!(resolve_err_to_io(Error::Protocol("no free inner DNS query slot".into())).kind(), ErrorKind::Other);
+        assert_eq!(resolve_err_to_io(Error::Timeout("DNS response")).kind(), ErrorKind::TimedOut);
+        assert_eq!(resolve_err_to_io(Error::Closed("gone".into())).kind(), ErrorKind::NotConnected);
         assert_eq!(to_io(Error::Closed("gone".into())).kind(), ErrorKind::NotConnected);
         assert_eq!(to_io(Error::Config("bad".into())).kind(), ErrorKind::InvalidInput);
         assert_eq!(to_io(Error::Unsupported("nope".into())).kind(), ErrorKind::InvalidInput);
@@ -436,6 +529,16 @@ pub(crate) mod tests {
         assert_eq!(parse_ip_literal("[localhost]"), None);
         assert_eq!(parse_ip_literal("[::1"), None);
         assert_eq!(parse_ip_literal(""), None);
+        // Scoped literals cannot become an IpAddr: not a literal, and validate_hostname
+        // names the reason instead of complaining about the characters.
+        for scoped in ["fe80::1%lo0", "[fe80::1%lo0]", "fe80::1%3"] {
+            assert_eq!(parse_ip_literal(scoped), None, "{scoped}");
+            let e = validate_hostname(scoped).unwrap_err();
+            assert_eq!(e.kind(), ErrorKind::InvalidInput);
+            assert!(e.to_string().contains("scoped IPv6 literal"), "{scoped}: {e}");
+        }
+        assert_eq!(normalise("[::ffff:10.0.0.2]:5060".parse().unwrap()), "10.0.0.2:5060".parse().unwrap());
+        assert_eq!(normalise("[::1]:1".parse().unwrap()), "[::1]:1".parse().unwrap());
     }
 
     #[test]
@@ -443,25 +546,38 @@ pub(crate) mod tests {
         for ok in ["localhost", "localhost.", "a.b", "pcscf.example.test", "x-y_z.example", "1.example", &"a".repeat(63)] {
             validate_hostname(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
         }
-        for bad in ["", ".", "a..b", ".a", "a b", "a/b", "ünïcode.example", &format!("{}.example", "x".repeat(64)), &"a.".repeat(128)] {
+        for bad in ["", ".", "a..b", ".a", "a b", "a/b", "ünïcode.example", "x%y", &format!("{}.example", "x".repeat(64)), &"a.".repeat(128)] {
             let e = validate_hostname(bad).expect_err(bad);
             assert_eq!(e.kind(), ErrorKind::InvalidInput, "{bad}");
         }
     }
 
     #[test]
-    fn stream_io_write_reports_the_whole_buffer() {
-        // A stub stream that records writes and serves a canned read.
-        struct Stub(std::sync::Mutex<Vec<u8>>);
+    fn stream_io_write_is_the_streams_partial_write_and_write_all_loops() {
+        // A stub stream that accepts at most 4 bytes per write, records them, serves
+        // a canned read, and fails outright when asked to.
+        struct Stub {
+            got: std::sync::Mutex<Vec<u8>>,
+            fail: std::sync::atomic::AtomicBool,
+            interrupt_once: std::sync::atomic::AtomicBool,
+        }
         impl TcpStreamLike for Stub {
             fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
                 let n = buf.len().min(3);
                 buf[..n].copy_from_slice(&b"abc"[..n]);
                 Ok(n)
             }
-            fn write_all(&self, buf: &[u8]) -> io::Result<()> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(())
+            fn write(&self, buf: &[u8]) -> io::Result<usize> {
+                use std::sync::atomic::Ordering::SeqCst;
+                if self.fail.load(SeqCst) {
+                    return Err(io::Error::new(ErrorKind::WouldBlock, "send timeout"));
+                }
+                if self.interrupt_once.swap(false, SeqCst) {
+                    return Err(io::Error::new(ErrorKind::Interrupted, "EINTR"));
+                }
+                let n = buf.len().min(4);
+                self.got.lock().unwrap().extend_from_slice(&buf[..n]);
+                Ok(n)
             }
             fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
                 Ok(())
@@ -483,15 +599,38 @@ pub(crate) mod tests {
             }
         }
         use io::{Read, Write};
-        let stub = Stub(std::sync::Mutex::new(Vec::new()));
+        let stub = Stub { got: std::sync::Mutex::new(Vec::new()), fail: false.into(), interrupt_once: false.into() };
         let mut io = StreamIo(&stub);
-        assert_eq!(io.write(b"hello").unwrap(), 5);
-        io.write_all(b" world").unwrap();
+        // io::Write::write is the partial write: it reports what the stream accepted.
+        assert_eq!(io.write(b"hello").unwrap(), 4);
+        assert_eq!(stub.got.lock().unwrap().as_slice(), b"hell");
+        // The provided TcpStreamLike::write_all loops (and retries after EINTR).
+        stub.interrupt_once.store(true, std::sync::atomic::Ordering::SeqCst);
+        stub.write_all(b"o world").unwrap();
+        io.write_all(b"!").unwrap();
         io.flush().unwrap();
-        assert_eq!(stub.0.lock().unwrap().as_slice(), b"hello world");
+        assert_eq!(stub.got.lock().unwrap().as_slice(), b"hello world!");
         let mut buf = [0u8; 8];
         assert_eq!(io.read(&mut buf).unwrap(), 3);
         assert_eq!(&buf[..3], b"abc");
+        // A failing write consumes nothing, through both entry points.
+        stub.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(io.write(b"zzz").unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(stub.write_all(b"zzz").unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(stub.got.lock().unwrap().as_slice(), b"hello world!");
+        assert!(format!("{io:?}").contains("StreamIo"), "{io:?}");
+    }
+
+    /// `openssl::ssl::HandshakeError<S>` is `Display + Error` only for `S: Debug`, so
+    /// a TLS handshake over `StreamIo` must propagate with `?` into `Box<dyn Error>`.
+    #[test]
+    fn stream_io_handshake_error_is_a_std_error() {
+        fn assert_error<E: std::error::Error + fmt::Display>() {}
+        assert_error::<openssl::ssl::HandshakeError<StreamIo<'static>>>();
+        fn into_box<'a>(e: openssl::ssl::HandshakeError<StreamIo<'a>>) -> Box<dyn std::error::Error + 'a> {
+            Box::new(e)
+        }
+        let _ = into_box;
     }
 
     // ---- tunnel backend (InnerStack over the two-stack loopback) -------------
@@ -530,10 +669,32 @@ pub(crate) mod tests {
         let seen = server.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 2, "only the host name reached the DNS server: {seen:?}");
         assert_eq!(stack.resolve("a..b", WAIT).unwrap_err().kind(), ErrorKind::InvalidInput);
+        // "Wait forever" must not panic (Instant + Duration::MAX overflows).
+        assert_eq!(stack.resolve(HOST, Duration::MAX).unwrap(), vec![IpAddr::V6(ANS_V6), IpAddr::V4(ANS_V4)]);
         // A silent server: our timeout, mapped to TimedOut.
         drop(server);
         let e = stack.resolve("other.example.test", Duration::from_millis(200)).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::TimedOut, "{e}");
+        // NXDOMAIN: NotFound, the same kind as the std backend's empty answer.
+        let _nx = DnsServer::start(&p.b, vec![], 3);
+        let e = stack.resolve("nope.example.test", WAIT).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound, "{e}");
+        assert!(e.get_ref().is_some_and(|s| s.is::<Error>()), "the crate error is the payload: {e}");
+    }
+
+    #[test]
+    fn tunnel_send_to_a_v4_mapped_destination_is_delivered_as_ipv4() {
+        let p = Pair::dual();
+        let sa = NetStack::bind_udp(&p.a, 0).unwrap();
+        let sb = NetStack::bind_udp(&p.b, 0).unwrap();
+        let b_v4 = p.b.local_addrs().into_iter().find(IpAddr::is_ipv4).expect("b has an IPv4 inner address");
+        let IpAddr::V4(b_v4) = b_v4 else { unreachable!() };
+        let mapped = SocketAddr::new(IpAddr::V6(b_v4.to_ipv6_mapped()), sb.local_addr().port());
+        sa.send_to(mapped, b"mapped").unwrap();
+        let (from, payload) = recv(&*sb, "b receives the datagram sent to its v4-mapped address");
+        assert_eq!(payload, b"mapped");
+        assert!(from.is_ipv4(), "{from}");
+        assert_eq!(from.port(), sa.local_addr().port());
     }
 
     #[test]

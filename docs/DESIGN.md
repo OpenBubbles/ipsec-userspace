@@ -848,7 +848,9 @@ pub trait NetStack: Send + Sync {
 }
 pub trait UdpSocketLike: Send + Sync {
     fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()>;
-    /// `Ok(None)` on timeout; `Err(NotConnected)` once the stack is closed.
+    /// `Ok(None)` on timeout; `Err(NotConnected)` once the stack is closed. Any `timeout` (incl. `Duration::MAX` =
+    /// wait for a datagram) is fine. Receivers are serialised (single consumer): a concurrent second `recv_timeout`
+    /// waits for the first to return before its own timeout starts. A v4-mapped `dst` in `send_to` is IPv4 on both backends.
     fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<(SocketAddr, Vec<u8>)>>;
     fn local_addr(&self) -> SocketAddr;
 }
@@ -857,23 +859,27 @@ pub trait UdpSocketLike: Send + Sync {
 pub trait TcpStreamLike: Send + Sync {
     /// Read into `buf`; `Ok(0)` = EOF; honours the read timeout (`Err(WouldBlock|TimedOut)` on expiry).
     fn read(&self, buf: &mut [u8]) -> io::Result<usize>;
-    fn write_all(&self, buf: &[u8]) -> io::Result<()>;
+    /// Partial write (`io::Write::write` contract: `Err` ⇒ nothing consumed, so TLS can retry the record).
+    fn write(&self, buf: &[u8]) -> io::Result<usize>;
+    /// Provided: loops over `write` (`WriteZero` on `Ok(0)`, retries `Interrupted`).
+    fn write_all(&self, buf: &[u8]) -> io::Result<()> { .. }
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()>;
     fn set_nodelay(&self, nodelay: bool) -> io::Result<()>;
     fn local_addr(&self) -> SocketAddr;
     fn peer_addr(&self) -> SocketAddr;
-    /// Shut down both directions.
+    /// Shut down both directions. Idempotent: `Ok(())` when already down (peer closed / shut down before).
     fn shutdown(&self) -> io::Result<()>;
 }
 pub trait TcpListenerLike: Send + Sync {
-    /// Accept one connection, waiting at most `timeout`; `Ok(None)` on timeout.
+    /// Accept one connection, waiting at most `timeout`; `Ok(None)` on timeout. Any `timeout` (incl. `Duration::MAX`) is fine.
     fn accept_timeout(&self, timeout: Duration) -> io::Result<Option<(Box<dyn TcpStreamLike>, SocketAddr)>>;
     fn local_addr(&self) -> SocketAddr;
 }
 /// `std::io::Read + Write` adapter over any `&dyn TcpStreamLike` so TLS (e.g. `openssl::ssl::SslStream`) can wrap it.
+/// `Debug` (so `HandshakeError<StreamIo>` is `Display + Error` and propagates with `?`); `write` = the partial write.
 pub struct StreamIo<'a>(pub &'a dyn TcpStreamLike);
-impl io::Read for StreamIo<'_> { .. }  impl io::Write for StreamIo<'_> { .. }
+impl fmt::Debug for StreamIo<'_> { .. }  impl io::Read for StreamIo<'_> { .. }  impl io::Write for StreamIo<'_> { .. }
 ```
 Implementations:
 - **`StdNetStack`** (`src/netstack/std_stack.rs`): `StdNetStack::new()` binds dual-stack `[::]` (falls back to `0.0.0.0` if IPv6 is
@@ -887,13 +893,23 @@ Implementations:
   (`(host, 0).to_socket_addrs()` = `getaddrinfo`), executed on a helper thread so `timeout` is honoured (`Err(TimedOut)` after
   `timeout`; helper detached); results deduplicated, order kept. `local_addrs` → the bind address if specific, else the egress address
   per family found with a `connect`ed-but-silent UDP socket (no packet is ever sent; families without a route omitted).
-  `recv_timeout` → `set_read_timeout` + `recv_from` into a 64 KiB buffer; `WouldBlock`/`TimedOut` → `Ok(None)`.
+  `recv_timeout` → `set_read_timeout` + `recv_from` into a 64 KiB buffer; `WouldBlock`/`TimedOut` → `Ok(None)`. Deadlines are
+  `Instant::now().checked_add(timeout)`; `None` (e.g. `Duration::MAX`) = no deadline (`recv`/`accept` until woken). `connect_tcp`
+  clamps a zero timeout to 1 ms (std rejects 0 with `InvalidInput`). `shutdown` maps `ENOTCONN` to `Ok(())`. `local_addrs` also
+  omits a link-local egress address (`fe80::/10`, `169.254/16`: unusable as Via/Contact without its zone). The OS's maximum
+  datagram size applies to `send_to` (macOS default 9216 bytes, `EMSGSIZE` beyond) whereas the tunnel fragments up to ~64 KiB.
 - **`EpdgTunnel: NetStack`** — `bind_udp` / `resolve` / `local_addrs` delegate to the tunnel (DNS = smoltcp's DNS socket over the
   assigned tunnel servers; the libc resolver cannot reach tunnel-internal servers); `connect_tcp` / `listen_tcp` return
   `Err(io::ErrorKind::Unsupported, "TCP over the ePDG tunnel is not implemented yet")`. `InnerUdpSocket: UdpSocketLike`.
   **`InnerStack: NetStack`** too (same delegation) so the trait is testable offline over the two-stack loopback harness.
 - Error mapping `epdg::Error → io::Error` (`netstack::to_io`): `Io(e)` → `e`; `Timeout` → `TimedOut`; `Closed` → `NotConnected`;
-  `Config`/`Unsupported` → `InvalidInput`; everything else → `Other`; the source is preserved (`io::Error::new(kind, e)`).
+  `Config`/`Unsupported` → `InvalidInput`; everything else → `Other`; the crate error is kept as the payload
+  (`io::Error::new(kind, e)`: `io::Error::get_ref()` / `into_inner()` downcast to `epdg::Error`; `Display` is the crate error's —
+  note `std::error::Error::source()` on the `io::Error` is `None`). Conditions a caller branches on have the same kind on both
+  backends: a taken port in `bind_udp` is `AddrInUse` (`InnerStack::bind_udp` returns `Error::Io(AddrInUse)` for it), a name that
+  does not exist is `NotFound` (the tunnel's `Error::Protocol("DNS query failed …" | "… returned no addresses")` is mapped to
+  `NotFound` by the `resolve` impls; other `Protocol` errors stay `Other`). Scoped IPv6 literals (`fe80::1%lo0`) are rejected with
+  `InvalidInput` ("scoped IPv6 literal … not supported": an `IpAddr` cannot carry the zone).
 - Exports: `epdg::netstack::{NetStack, UdpSocketLike, TcpStreamLike, TcpListenerLike, StreamIo, StdNetStack}` and the same from `epdg::`.
 
 Tests: one generic `fn exercise_udp<S: NetStack + ?Sized>(a: &S, b: &S)` run over BOTH backends (bind two sockets, send both ways,
@@ -903,8 +919,12 @@ echo, `recv_timeout` → `None` on silence, `local_addr` port matches, `local_ad
 on silence, `StreamIo` wraps a stream as `Read + Write`, connect to a closed port → error within the timeout. std resolve:
 `resolve("localhost")` contains a loopback; IP literal without the resolver; invalid label errors; a too-short timeout returns
 promptly (`TimedOut` or a fast error). Tunnel: `resolve` over the fake DNS server returns the fake answer; `connect_tcp` /
-`listen_tcp` → `Err(Unsupported)`; after close `recv_timeout` → `Err(NotConnected)`. `epdg-connect` performs its P-CSCF lookup and the
-DNS round trip through `&dyn NetStack` so the live run covers the tunnel implementation.
+`listen_tcp` → `Err(Unsupported)`; after close `recv_timeout` → `Err(NotConnected)`; NXDOMAIN → `NotFound`; a v4-mapped `send_to`
+destination is delivered as IPv4. std extras: `Duration::MAX` `recv_timeout`/`accept_timeout` woken by a send/connect (no panic);
+a write under a write timeout never loses or duplicates bytes (delivered == reported); `shutdown` after peer EOF is `Ok`;
+`connect_tcp(_, ZERO)` is not `InvalidInput`; `HandshakeError<StreamIo>: Error`. `epdg-connect` performs its P-CSCF lookup and the
+DNS round trip through `&dyn NetStack` and asserts `name() == "epdg-tunnel"`, `local_addrs()` == the assigned inner addresses and
+`bind_udp` (incl. `AddrInUse` on a taken port) so the live run covers the `EpdgTunnel` implementation.
 
 ## 15. Amendment log
 - 2026-09-11: §16 added — `NetStack` (UDP + TCP + DNS) with std (libc resolver, real TCP) and tunnel (UDP/DNS; TCP unsupported for now) implementations.

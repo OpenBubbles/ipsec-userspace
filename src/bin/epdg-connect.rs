@@ -81,6 +81,17 @@ fn main() {
     // live run covers the tunnel implementation of the trait, not only the facade.
     let stack: &dyn NetStack = &tunnel;
     println!("netstack {}: local addresses {:?}", stack.name(), stack.local_addrs());
+    // The EpdgTunnel implementation of the trait has no offline test (only the
+    // InnerStack one does): assert its delegation here, where a live tunnel exists.
+    assert_eq!(stack.name(), "epdg-tunnel");
+    let mut expected: Vec<IpAddr> = a.internal_ipv6.iter().map(|(v6, _)| IpAddr::V6(*v6)).collect();
+    expected.extend(a.internal_ipv4.iter().copied().map(IpAddr::V4));
+    assert_eq!(stack.local_addrs(), expected, "NetStack::local_addrs are the assigned inner addresses");
+    assert!(!expected.is_empty(), "no inner address assigned");
+    let probe = stack.bind_udp(0).expect("NetStack::bind_udp over the live tunnel");
+    assert_eq!(probe.local_addr().ip(), expected[0], "inner socket address is the first inner address");
+    assert_eq!(stack.bind_udp(probe.local_addr().port()).expect_err("port taken").kind(), std::io::ErrorKind::AddrInUse);
+    drop(probe);
     let mut answers: Vec<IpAddr> = Vec::new();
     if do_dns {
         if a.dns_ipv4.is_empty() && a.dns_ipv6.is_empty() {

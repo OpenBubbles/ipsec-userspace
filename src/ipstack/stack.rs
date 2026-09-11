@@ -49,6 +49,7 @@
 //!   [`SMOLTCP_DNS_RETRANSMIT_TIMEOUT`]).
 
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
@@ -625,7 +626,9 @@ impl InnerStack {
             pick_free_port(&st.udp, start).ok_or_else(|| Error::Config("no free inner UDP port".into()))?
         } else {
             if st.udp.contains_key(&port) {
-                return Err(Error::Config(format!("inner UDP port {port} is already bound")));
+                // `Io(AddrInUse)`, so the NetStack mapping (§16) yields the same kind
+                // as the OS backend and a caller can fall back to another port.
+                return Err(Error::Io(io::Error::new(io::ErrorKind::AddrInUse, format!("inner UDP port {port} is already bound"))));
             }
             port
         };
@@ -646,7 +649,9 @@ impl InnerStack {
     /// when nothing answered before `timeout`, `Error::Protocol` when every query
     /// failed (NXDOMAIN / no records / server failure).
     pub fn resolve(&self, name: &str, timeout: Duration) -> Result<Vec<IpAddr>> {
-        let deadline = Instant::now() + timeout;
+        // `Duration::MAX` overflows `Instant`; smoltcp's own retransmit give-up bounds
+        // the wait anyway, so a far-future deadline is "until the resolver gives up".
+        let deadline = Instant::now().checked_add(timeout).unwrap_or_else(|| Instant::now() + Duration::from_secs(1 << 30));
         let waiters = self.start_queries(name)?;
         self.shared.notify();
 
@@ -1470,7 +1475,8 @@ pub(crate) mod tests {
         }
         assert_eq!(p.a.stats().udp_bindings, 2);
         let e = p.a.bind_udp(s1.local_port()).unwrap_err();
-        assert!(matches!(e, Error::Config(ref m) if m.contains("already bound")), "{e}");
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::AddrInUse), "{e}");
+        assert!(e.to_string().contains("already bound"), "{e}");
         let port = s1.local_port();
         drop(s1);
         assert_eq!(p.a.stats().udp_bindings, 1);

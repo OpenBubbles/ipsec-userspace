@@ -3,7 +3,10 @@
 //!
 //! - UDP: `std::net::UdpSocket`. The default stack is a dual-stack `[::]` socket
 //!   (IPv4 peers appear as `::ffff:a.b.c.d`), so IPv4 destinations are mapped on send
-//!   and v4-mapped peers are normalised back to IPv4 on receive.
+//!   and v4-mapped peers are normalised back to IPv4 on receive. The largest datagram
+//!   `send_to` accepts is the OS's (macOS: `net.inet.udp.maxdgram`, 9216 bytes by
+//!   default; larger payloads fail with `EMSGSIZE`), whereas the tunnel fragments up
+//!   to ~64 KiB — keep SIP messages that must work on both under that limit.
 //! - TCP: `TcpStream::connect_timeout` / `TcpListener`. std listeners have no accept
 //!   timeout, so `accept_timeout` polls a non-blocking `accept` every
 //!   [`ACCEPT_POLL_INTERVAL`] until the deadline and hands back a blocking stream.
@@ -23,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, trace, warn};
 
-use super::{NetStack, TcpListenerLike, TcpStreamLike, UdpSocketLike, parse_ip_literal, validate_hostname};
+use super::{NetStack, TcpListenerLike, TcpStreamLike, UdpSocketLike, normalise, parse_ip_literal, validate_hostname};
 
 /// How often `accept_timeout` re-tries a non-blocking `accept` while waiting.
 pub const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -98,15 +101,10 @@ impl StdNetStack {
     }
 }
 
-/// `::ffff:a.b.c.d` → `a.b.c.d`; everything else unchanged.
-fn normalise(addr: SocketAddr) -> SocketAddr {
-    match addr {
-        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-            Some(v4) => SocketAddr::new(IpAddr::V4(v4), v6.port()),
-            None => addr,
-        },
-        v4 => v4,
-    }
+/// The moment `timeout` from now expires; `None` when it never does (`Duration::MAX`
+/// and friends overflow `Instant`, which must mean "wait forever", not a panic).
+fn deadline_after(timeout: Duration) -> Option<Instant> {
+    Instant::now().checked_add(timeout)
 }
 
 /// `a.b.c.d` → `::ffff:a.b.c.d` (for sending from a dual-stack IPv6 socket).
@@ -131,7 +129,9 @@ impl NetStack for StdNetStack {
 
     fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> io::Result<Box<dyn TcpStreamLike>> {
         let remote = normalise(remote);
-        let stream = TcpStream::connect_timeout(&remote, timeout)?;
+        // std refuses a zero timeout with InvalidInput; a zero budget is a (very
+        // short) timeout here, like everywhere else in this stack.
+        let stream = TcpStream::connect_timeout(&remote, timeout.max(MIN_TIMEOUT))?;
         let stream = StdTcpStream::new(stream)?;
         debug!("std TCP connected {} -> {}", stream.local, stream.peer);
         Ok(Box::new(stream))
@@ -199,7 +199,10 @@ impl NetStack for StdNetStack {
 
 /// The source address the OS would use towards `probe`, without sending anything:
 /// bind the family's wildcard, `connect` (route lookup only), read `local_addr`.
-/// `None` when the family has no route.
+/// `None` when the family has no route, or when the selected source is link-local
+/// (an `fe80::` / `169.254.` address without its zone is unusable as a SIP
+/// Via/Contact; that happens when the only IPv6 default route came from a router
+/// advertisement without a global prefix).
 fn egress_address(probe: SocketAddr) -> Option<IpAddr> {
     let wildcard = if probe.is_ipv6() { IpAddr::V6(Ipv6Addr::UNSPECIFIED) } else { IpAddr::V4(Ipv4Addr::UNSPECIFIED) };
     let sock = match UdpSocket::bind(SocketAddr::new(wildcard, 0)) {
@@ -214,7 +217,19 @@ fn egress_address(probe: SocketAddr) -> Option<IpAddr> {
         return None;
     }
     let ip = normalise(sock.local_addr().ok()?).ip();
+    if is_link_local(ip) {
+        trace!("egress probe: source towards {probe} is link-local ({ip}); not usable without its zone, omitted");
+        return None;
+    }
     (!ip.is_unspecified()).then_some(ip)
+}
+
+/// `fe80::/10` or `169.254.0.0/16`.
+fn is_link_local(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V6(v6) => v6.is_unicast_link_local(),
+        IpAddr::V4(v4) => v4.is_link_local(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -245,15 +260,16 @@ impl UdpSocketLike for StdUdpSocket {
         if buf.len() < UDP_RECV_BUFFER {
             buf.resize(UDP_RECV_BUFFER, 0);
         }
-        let deadline = Instant::now() + timeout;
+        let deadline = deadline_after(timeout);
         loop {
-            let left = deadline.saturating_duration_since(Instant::now()).max(MIN_TIMEOUT);
-            self.sock.set_read_timeout(Some(left))?;
+            // No deadline (an unrepresentably long timeout): block without a timeout.
+            let left = deadline.map(|d| d.saturating_duration_since(Instant::now()).max(MIN_TIMEOUT));
+            self.sock.set_read_timeout(left)?;
             match self.sock.recv_from(&mut buf) {
                 Ok((n, peer)) => return Ok(Some((normalise(peer), buf[..n].to_vec()))),
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => return Ok(None),
                 Err(e) if e.kind() == ErrorKind::Interrupted => {
-                    if Instant::now() >= deadline {
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
                         return Ok(None);
                     }
                 }
@@ -290,8 +306,10 @@ impl TcpStreamLike for StdTcpStream {
         (&self.inner).read(buf)
     }
 
-    fn write_all(&self, buf: &[u8]) -> io::Result<()> {
-        (&self.inner).write_all(buf)
+    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        // One `send`: on a write timeout the kernel returns what it accepted, or an
+        // error having accepted nothing — never both, so TLS may retry the record.
+        (&self.inner).write(buf)
     }
 
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
@@ -315,7 +333,12 @@ impl TcpStreamLike for StdTcpStream {
     }
 
     fn shutdown(&self) -> io::Result<()> {
-        self.inner.shutdown(Shutdown::Both)
+        match self.inner.shutdown(Shutdown::Both) {
+            // Already down (peer closed, or shut down before): ENOTCONN on the BSDs /
+            // macOS. Both directions are what the caller wanted; nothing to report.
+            Err(e) if e.kind() == ErrorKind::NotConnected => Ok(()),
+            r => r,
+        }
     }
 }
 
@@ -327,7 +350,7 @@ struct StdTcpListener {
 
 impl TcpListenerLike for StdTcpListener {
     fn accept_timeout(&self, timeout: Duration) -> io::Result<Option<(Box<dyn TcpStreamLike>, SocketAddr)>> {
-        let deadline = Instant::now() + timeout;
+        let deadline = deadline_after(timeout);
         loop {
             match self.inner.accept() {
                 Ok((stream, _)) => {
@@ -341,10 +364,12 @@ impl TcpListenerLike for StdTcpListener {
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
                     let now = Instant::now();
-                    if now >= deadline {
-                        return Ok(None);
-                    }
-                    thread::sleep((deadline - now).min(ACCEPT_POLL_INTERVAL));
+                    let nap = match deadline {
+                        Some(d) if now >= d => return Ok(None),
+                        Some(d) => (d - now).min(ACCEPT_POLL_INTERVAL),
+                        None => ACCEPT_POLL_INTERVAL,
+                    };
+                    thread::sleep(nap);
                 }
                 Err(e) => return Err(e),
             }
@@ -386,6 +411,15 @@ mod tests {
         assert_eq!(map_to_v6(v6), v6);
         assert_eq!(normalise(v6), v6);
         assert_eq!(normalise(v4), v4);
+        assert!(is_link_local(IpAddr::V6("fe80::1".parse().unwrap())));
+        assert!(is_link_local(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))));
+        assert!(!is_link_local(V6_LO) && !is_link_local(V4_LO));
+        assert!(!is_link_local(IpAddr::V6("2001:db8::1".parse().unwrap())));
+        // Unrepresentable deadlines mean "never", not a panic.
+        assert!(deadline_after(Duration::MAX).is_none());
+        assert!(deadline_after(Duration::from_secs(u64::MAX / 2)).is_none());
+        assert!(deadline_after(Duration::ZERO).is_some_and(|d| d <= Instant::now()));
+        assert!(deadline_after(WAIT).is_some_and(|d| d > Instant::now()));
     }
 
     #[test]
@@ -410,6 +444,7 @@ mod tests {
         for a in &addrs {
             assert!(!a.is_unspecified(), "{a}");
             assert!(!matches!(a, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some()), "{a} is v4-mapped");
+            assert!(!is_link_local(*a), "{a} is link-local (unusable as a Via/Contact without its zone)");
         }
         let mut dedup = addrs.clone();
         dedup.dedup();
@@ -503,6 +538,45 @@ mod tests {
         assert_eq!(peer, first.local_addr());
     }
 
+    /// `Duration::MAX` (and any timeout that overflows `Instant`) means "wait until
+    /// something happens" — the receiver / acceptor must wake up, not panic.
+    #[test]
+    fn wait_forever_timeouts_block_until_woken_instead_of_panicking() {
+        let stack = StdNetStack::with_bind_addr(V4_LO);
+        for timeout in [Duration::MAX, Duration::from_secs(u64::MAX / 2)] {
+            // UDP: a receiver blocked "forever" is woken by a datagram.
+            let shared: Arc<dyn UdpSocketLike> = Arc::from(stack.bind_udp(0).unwrap());
+            let receiver = {
+                let s = Arc::clone(&shared);
+                thread::spawn(move || s.recv_timeout(timeout))
+            };
+            thread::sleep(Duration::from_millis(20));
+            let sender = stack.bind_udp(0).unwrap();
+            sender.send_to(shared.local_addr(), b"wake").unwrap();
+            let (peer, payload) = receiver.join().expect("recv_timeout must not panic").unwrap().expect("datagram");
+            assert_eq!(payload, b"wake");
+            assert_eq!(peer, sender.local_addr());
+            // A finite timeout still works on the same socket afterwards (the read
+            // timeout is re-armed per call).
+            let started = Instant::now();
+            assert!(shared.recv_timeout(SILENCE).unwrap().is_none());
+            assert!(started.elapsed() < WAIT);
+
+            // TCP: an acceptor blocked "forever" is woken by a connection.
+            let listener: Arc<dyn TcpListenerLike> = Arc::from(stack.listen_tcp(0).unwrap());
+            let acceptor = {
+                let l = Arc::clone(&listener);
+                thread::spawn(move || l.accept_timeout(timeout))
+            };
+            thread::sleep(Duration::from_millis(20));
+            let client = stack.connect_tcp(listener.local_addr(), WAIT).unwrap();
+            let (server, peer) = acceptor.join().expect("accept_timeout must not panic").unwrap().expect("accepted");
+            assert_eq!(peer, client.local_addr());
+            assert_eq!(server.peer_addr(), client.local_addr());
+            assert!(listener.accept_timeout(SILENCE).unwrap().is_none());
+        }
+    }
+
     // ---- TCP ----------------------------------------------------------------
 
     /// The TCP exercise of DESIGN.md §16 on `lo`.
@@ -588,6 +662,12 @@ mod tests {
         client.shutdown().unwrap();
         server.set_read_timeout(Some(WAIT)).unwrap();
         assert_eq!(server.read(&mut buf).unwrap(), 0, "EOF after peer shutdown");
+        // The normal teardown after reading EOF: shutting down our side succeeds
+        // even though the OS (macOS: ENOTCONN) considers the connection gone already;
+        // so does shutting down twice.
+        server.shutdown().unwrap_or_else(|e| panic!("shutdown after peer EOF: {e}"));
+        server.shutdown().unwrap_or_else(|e| panic!("second shutdown: {e}"));
+        client.shutdown().unwrap_or_else(|e| panic!("shutdown of the already shut-down side: {e}"));
         // Writing to a shut-down stream fails (immediately or once the RST lands).
         let mut write_failed = false;
         for _ in 0..50 {
@@ -608,6 +688,77 @@ mod tests {
         let e = stack.connect_tcp(SocketAddr::new(lo, closed_port), Duration::from_secs(2)).unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(3), "{e} after {:?}", started.elapsed());
         assert_ne!(e.kind(), ErrorKind::Unsupported);
+        // A zero budget is a timeout (or the refusal), never InvalidInput about the timeout.
+        let e = stack.connect_tcp(SocketAddr::new(lo, closed_port), Duration::ZERO).unwrap_err();
+        assert_ne!(e.kind(), ErrorKind::InvalidInput, "{e}");
+        assert!(matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::ConnectionRefused | ErrorKind::WouldBlock), "{e}");
+    }
+
+    /// `StreamIo::write` (and `TcpStreamLike::write`) keep the `io::Write` contract
+    /// under a write timeout: an `Err` never consumed bytes. TLS relies on that to
+    /// retry a record; the old `write_all`-based adapter delivered a partial record
+    /// and then reported failure.
+    #[test]
+    fn write_under_a_write_timeout_never_loses_bytes() {
+        use io::Write;
+        let stack = StdNetStack::with_bind_addr(V4_LO);
+        let listener = stack.listen_tcp(0).unwrap();
+        let remote = listener.local_addr();
+        let connector = thread::spawn(move || StdNetStack::with_bind_addr(V4_LO).connect_tcp(remote, WAIT));
+        let (server, _) = listener.accept_timeout(WAIT).unwrap().expect("accepted");
+        let client = connector.join().unwrap().unwrap();
+        client.set_write_timeout(Some(Duration::from_millis(150))).unwrap();
+
+        // The peer does not read: fill the socket buffers until a write times out,
+        // accounting every byte the stream reported as accepted.
+        let chunk = vec![0x5au8; 256 * 1024];
+        let mut accepted = 0usize;
+        let mut io = StreamIo(&*client);
+        let started = Instant::now();
+        let e = loop {
+            match io.write(&chunk) {
+                Ok(0) => panic!("write returned Ok(0)"),
+                Ok(n) => accepted += n,
+                Err(e) => break e,
+            }
+            assert!(started.elapsed() < WAIT, "the write timeout never fired ({accepted} bytes accepted)");
+        };
+        assert!(matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{e}");
+        assert!(accepted > 0, "the socket buffers took nothing");
+
+        // Now read everything: exactly the accepted bytes arrive, then nothing more.
+        server.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut delivered = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match server.read(&mut buf) {
+                Ok(0) => panic!("unexpected EOF"),
+                Ok(n) => {
+                    assert!(buf[..n].iter().all(|&b| b == 0x5a));
+                    delivered += n;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        assert_eq!(delivered, accepted, "bytes delivered == bytes reported as written (none lost, none duplicated)");
+
+        // The stream is still usable and write_all works once the peer drains.
+        client.set_write_timeout(Some(WAIT)).unwrap();
+        let drainer = {
+            let server: Arc<dyn TcpStreamLike> = Arc::from(server);
+            thread::spawn(move || {
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut total = 0usize;
+                server.set_read_timeout(Some(WAIT)).unwrap();
+                while total < 1 << 20 {
+                    total += server.read(&mut buf).unwrap();
+                }
+                total
+            })
+        };
+        client.write_all(&vec![0x5au8; 1 << 20]).unwrap();
+        assert_eq!(drainer.join().unwrap(), 1 << 20);
     }
 
     #[test]
