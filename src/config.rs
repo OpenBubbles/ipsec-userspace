@@ -176,7 +176,15 @@ pub struct ChildConfig {
     pub cfg_requests: Vec<u16>,
     /// Carried, unused.
     pub install_policies: bool,
+    /// MTU of the inner (tunnelled) IP interface in bytes of IP packet; not in the
+    /// bundle, defaults to [`DEFAULT_INNER_MTU`]. The stack clamps it to
+    /// `[1280, 65535]`. IPv4 above it is fragmented by smoltcp; IPv6 must fit.
+    pub inner_mtu: usize,
 }
+
+/// Default inner MTU: the IPv6 minimum link MTU (RFC 8200 §5), which is also what
+/// AOSP's IKE client and the ePDG assume for the tunnelled link. Bundle-independent.
+pub const DEFAULT_INNER_MTU: usize = 1280;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildProposal {
@@ -578,6 +586,7 @@ impl Config {
             replay_window,
             cfg_requests: build_cfg_requests(tech)?,
             install_policies: dict_bool(first_child, "InstallPolicies", false)?,
+            inner_mtu: DEFAULT_INNER_MTU,
         };
 
         // --- IMS ---
@@ -821,6 +830,8 @@ mod tests {
         assert_eq!(c.child.cfg_requests, vec![1, 8, 3, 10, 2, 20, 21, 7]);
         assert_eq!(c.child.cfg_requests, default_cfg_requests());
         assert!(c.child.install_policies);
+        assert_eq!(c.child.inner_mtu, DEFAULT_INNER_MTU);
+        assert_eq!(c.child.inner_mtu, 1280);
     }
 
     #[test]

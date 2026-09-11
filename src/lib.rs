@@ -2,9 +2,9 @@
 //!
 //! Everything runs over plain UDP sockets: IKEv2 (RFC 7296) with EAP-only
 //! authentication (RFC 5998) carrying EAP-TLS (RFC 5216 / RFC 9190), tunnel-mode
-//! ESP (RFC 4303) encapsulated in UDP (RFC 3948), and a minimal inner IPv4/IPv6+UDP
-//! stack so callers can talk to hosts inside the tunnel (DNS, SIP). No raw sockets,
-//! no kernel IPsec, no privileges.
+//! ESP (RFC 4303) encapsulated in UDP (RFC 3948), and an inner IPv4/IPv6 stack
+//! (smoltcp over the ESP data plane) so callers can talk to hosts inside the tunnel
+//! (UDP sockets, DNS). No raw sockets, no kernel IPsec, no privileges.
 //!
 //! Driven entirely by a carrier-bundle style [`Config`] (see `docs/DESIGN.md`); the
 //! algorithm set is a registry (`crypto::registry`) so new transforms can be added
@@ -16,7 +16,7 @@
 //! - [`ike`]     — IKEv2 wire codec, key derivation, initiator state machine, transport
 //! - [`eap`]     — EAP framing and the EAP-TLS method (OpenSSL-backed)
 //! - [`esp`]     — ESP codec, anti-replay, UDP encapsulation
-//! - [`ipstack`] — inner IPv4/IPv6 + UDP packet build/parse
+//! - [`ipstack`] — inner IP stack: smoltcp `Medium::Ip` device over ESP + stack thread (UDP, DNS)
 //! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`
 
 pub mod config;

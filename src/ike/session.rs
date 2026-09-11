@@ -1876,6 +1876,7 @@ mod tests {
                 replay_window: 12,
                 cfg_requests: default_cfg_requests(),
                 install_policies: true,
+                inner_mtu: crate::config::DEFAULT_INNER_MTU,
             },
             ims: ImsConfig {
                 pcscf_address: String::new(),

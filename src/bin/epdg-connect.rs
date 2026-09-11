@@ -7,54 +7,17 @@
 //! Usage: epdg-connect [--bundle P] [--creds P] [--cert P] [--key P] [--hold SECS] [--no-dns]
 //! Defaults point at tests/fixtures/. Set RUST_LOG=debug for hex dumps.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use epdg::ipstack::dns::{QType, build_query, parse_response};
-use epdg::{Config, EpdgTunnel, Error, InnerUdpSocket, Result};
+use epdg::{Config, EpdgTunnel, Error};
 
 const TARGET_HOST: &str = "ueb2bprod.pc.t-mobile.com";
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)
-}
-
-fn resolve_over_tunnel(sock: &InnerUdpSocket, server: SocketAddr, name: &str, qtype: QType) -> Result<Vec<IpAddr>> {
-    let mut last_err: Option<Error> = None;
-    for attempt in 1..=2 {
-        let id: u16 = rand::random();
-        let query = build_query(id, name, qtype)?;
-        println!("  dns {:?} {} -> {} (id {:#06x}, try {}/2)", qtype, name, server, id, attempt);
-        sock.send_to(server, &query)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                last_err = Some(Error::Timeout("DNS response"));
-                break;
-            }
-            match sock.recv_timeout(remaining)? {
-                None => {
-                    last_err = Some(Error::Timeout("DNS response"));
-                    break;
-                }
-                Some(dg) => {
-                    if dg.src != server || dg.payload.len() < 2 || dg.payload[..2] != id.to_be_bytes() {
-                        continue;
-                    }
-                    match parse_response(&dg.payload) {
-                        Ok(a) => return Ok(a),
-                        Err(e) => {
-                            last_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or(Error::Timeout("DNS response")))
 }
 
 fn main() {
@@ -116,30 +79,20 @@ fn main() {
 
     let mut answers: Vec<IpAddr> = Vec::new();
     if do_dns {
-        let dns_server: Option<SocketAddr> = if !a.internal_ipv6.is_empty() && !a.dns_ipv6.is_empty() {
-            Some(SocketAddr::new(IpAddr::V6(a.dns_ipv6[0]), 53))
-        } else if !a.internal_ipv4.is_empty() && !a.dns_ipv4.is_empty() {
-            Some(SocketAddr::new(IpAddr::V4(a.dns_ipv4[0]), 53))
+        if a.dns_ipv4.is_empty() && a.dns_ipv6.is_empty() {
+            println!("no DNS server assigned; skipping DNS check");
         } else {
-            None
-        };
-        match dns_server {
-            None => println!("no DNS server of a usable family assigned; skipping DNS check"),
-            Some(server) => match tunnel.bind_udp(0) {
-                Err(e) => println!("bind inner UDP failed: {e}"),
-                Ok(sock) => {
-                    println!("inner UDP port {} -> DNS {}", sock.local_port(), server);
-                    for qtype in [QType::AAAA, QType::A] {
-                        match resolve_over_tunnel(&sock, server, TARGET_HOST, qtype) {
-                            Ok(v) => {
-                                println!("  {:?} answers: {:?}", qtype, v);
-                                answers.extend(v);
-                            }
-                            Err(e) => println!("  {:?} lookup failed: {e}", qtype),
-                        }
+            for attempt in 1..=2 {
+                println!("  resolve {TARGET_HOST} via tunnel DNS v6 {:?} v4 {:?} (try {attempt}/2)", a.dns_ipv6, a.dns_ipv4);
+                match tunnel.resolve(TARGET_HOST, DNS_TIMEOUT) {
+                    Ok(v) => {
+                        println!("  answers: {v:?}");
+                        answers = v;
+                        break;
                     }
+                    Err(e) => println!("  lookup failed: {e}"),
                 }
-            },
+            }
         }
     }
 

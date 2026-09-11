@@ -4,12 +4,10 @@
 //! (with a printed reason) when `EPDG_SKIP_LIVE` is set. Run with
 //! `RUST_LOG=debug cargo test --test live_tmobile -- --nocapture` for hex dumps.
 
-use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use epdg::ipstack::dns::{QType, build_query, parse_response};
-use epdg::{Config, EpdgTunnel, Error, InnerUdpSocket, Result};
+use epdg::{Config, EpdgTunnel, Error};
 
 const TARGET_HOST: &str = "ueb2bprod.pc.t-mobile.com";
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -18,46 +16,6 @@ const KEEPALIVE_OBSERVATION: Duration = Duration::from_secs(25);
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)
-}
-
-/// One DNS query over the tunnel: up to `DNS_TRIES` sends, `DNS_TIMEOUT` each.
-fn resolve_over_tunnel(sock: &InnerUdpSocket, server: SocketAddr, name: &str, qtype: QType) -> Result<Vec<IpAddr>> {
-    let mut last_err: Option<Error> = None;
-    for attempt in 1..=DNS_TRIES {
-        let id: u16 = rand::random();
-        let query = build_query(id, name, qtype)?;
-        println!("  dns {:?} {} -> {} (id {:#06x}, try {}/{})", qtype, name, server, id, attempt, DNS_TRIES);
-        sock.send_to(server, &query)?;
-        let deadline = Instant::now() + DNS_TIMEOUT;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                last_err = Some(Error::Timeout("DNS response"));
-                break;
-            }
-            match sock.recv_timeout(remaining)? {
-                None => {
-                    last_err = Some(Error::Timeout("DNS response"));
-                    break;
-                }
-                Some(dg) => {
-                    if dg.src != server || dg.payload.len() < 2 || dg.payload[..2] != id.to_be_bytes() {
-                        println!("  ignoring unrelated inner datagram from {} ({} bytes)", dg.src, dg.payload.len());
-                        continue;
-                    }
-                    match parse_response(&dg.payload) {
-                        Ok(answers) => return Ok(answers),
-                        Err(e) => {
-                            println!("  dns response parse failed: {e}");
-                            last_err = Some(e);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Err(last_err.unwrap_or(Error::Timeout("DNS response")))
 }
 
 #[test]
@@ -121,31 +79,23 @@ fn live_tmobile_tunnel() {
     if a.pcscf_ipv4.is_empty() && a.pcscf_ipv6.is_empty() {
         println!("note: no P-CSCF address in the CFG_REPLY (expected for this ePDG); resolving it via tunnel DNS");
     }
+    assert!(!a.dns_ipv4.is_empty() || !a.dns_ipv6.is_empty(), "no DNS server assigned: {a:?}");
 
     // --- DNS over the tunnel (proves ESP both ways) ---------------------------------
-    // First assigned DNS server of a family we have an inner address for (IPv6 first).
-    let dns_server: SocketAddr = if !a.internal_ipv6.is_empty() && !a.dns_ipv6.is_empty() {
-        SocketAddr::new(IpAddr::V6(a.dns_ipv6[0]), 53)
-    } else if !a.internal_ipv4.is_empty() && !a.dns_ipv4.is_empty() {
-        SocketAddr::new(IpAddr::V4(a.dns_ipv4[0]), 53)
-    } else {
-        panic!("no DNS server of a usable family assigned: {a:?}");
-    };
-    let sock = tunnel.bind_udp(0).expect("bind inner UDP socket");
-    println!("inner UDP port {} -> DNS {}", sock.local_port(), dns_server);
-
-    let mut answers: Vec<IpAddr> = Vec::new();
-    for qtype in [QType::AAAA, QType::A] {
-        match resolve_over_tunnel(&sock, dns_server, TARGET_HOST, qtype) {
+    // smoltcp DNS socket over the assigned servers: AAAA then A (DESIGN §11).
+    let mut answers = Vec::new();
+    for attempt in 1..=DNS_TRIES {
+        println!("  resolve {TARGET_HOST} via tunnel DNS v6 {:?} v4 {:?} (try {attempt}/{DNS_TRIES})", a.dns_ipv6, a.dns_ipv4);
+        match tunnel.resolve(TARGET_HOST, DNS_TIMEOUT) {
             Ok(v) => {
-                println!("  {:?} answers: {:?}", qtype, v);
-                answers.extend(v);
+                println!("  answers: {v:?}");
+                answers = v;
+                break;
             }
-            Err(e) => println!("  {:?} lookup failed: {e}", qtype),
+            Err(e) => println!("  lookup failed: {e}"),
         }
     }
     assert!(!answers.is_empty(), "no DNS answer for {TARGET_HOST} over the tunnel");
-    drop(sock);
 
     // --- on-demand DPD -----------------------------------------------------------------
     let rtt = tunnel.dpd().expect("dpd");
@@ -158,6 +108,7 @@ fn live_tmobile_tunnel() {
     let stats = tunnel.stats();
     println!("stats: {stats:?}");
     assert!(stats.keepalives_sent >= 2, "expected >= 2 keepalives in {:?}, sent {}", KEEPALIVE_OBSERVATION, stats.keepalives_sent);
+    assert!(stats.esp_tx_packets >= 1 && stats.esp_rx_packets >= 1, "ESP must have flowed both ways: {stats:?}");
 
     // --- close --------------------------------------------------------------------------
     match tunnel.close() {
@@ -177,5 +128,13 @@ fn live_tmobile_tunnel() {
     println!("  P-CSCF          v4 {:?} v6 {:?}", a.pcscf_ipv4, a.pcscf_ipv6);
     println!("  {TARGET_HOST} -> {:?}", answers);
     println!("  DPD rtt         {rtt:?}");
-    println!("  ESP tx/rx       {}/{} packets, keepalives {}", stats.esp_tx_packets, stats.esp_rx_packets, stats.keepalives_sent);
+    println!(
+        "  ESP tx/rx       {}/{} packets, keepalives {}, inner stack tx/rx {}/{} (drops {})",
+        stats.esp_tx_packets,
+        stats.esp_rx_packets,
+        stats.keepalives_sent,
+        stats.stack.tx_packets,
+        stats.stack.rx_packets,
+        stats.stack.rx_queue_drops + stats.stack.udp_queue_drops
+    );
 }

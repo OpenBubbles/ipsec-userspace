@@ -18,7 +18,19 @@ plist = "1"
 rand = "0.8"
 sha1 = "0.10"
 sha2 = "0.10"
-smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-fragmentation", "proto-ipv6-fragmentation", "socket-udp", "socket-tcp", "socket-dns", "socket-icmp"] }
+# Inner IP stack (DESIGN.md §11). The `*-count-N` / `*-size-N` features are smoltcp's
+# compile-time limits (its defaults: 2 addresses, 2 routes, 1 DNS server, 1 DNS result,
+# 1500-byte fragmentation/reassembly buffers, 1 reassembly slot). NOTE: in 0.14
+# `proto-ipv6-fragmentation` only covers 6LoWPAN; IPv6 over `Medium::Ip` is never
+# fragmented or reassembled (see `ipstack::stack`).
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std", "log", "medium-ip", "proto-ipv4", "proto-ipv6",
+    "proto-ipv4-fragmentation", "proto-ipv6-fragmentation",
+    "socket-udp", "socket-tcp", "socket-dns", "socket-icmp",
+    "iface-max-addr-count-8", "iface-max-route-count-4",
+    "dns-max-server-count-4", "dns-max-result-count-8",
+    "fragmentation-buffer-size-8192", "reassembly-buffer-size-8192", "reassembly-buffer-count-4",
+] }
 subtle = "2"
 thiserror = "2"
 zeroize = { version = "1", features = ["zeroize_derive"] }

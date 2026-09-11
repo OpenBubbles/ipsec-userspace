@@ -4,10 +4,14 @@
 //! and a maintenance thread (DPD, child/IKE rekey at the soft lifetime).
 //!
 //! Threads after establishment:
-//! - **rx**: `IkeTransport::recv` loop. ESP → `EspInbound::decapsulate` → inner IP/UDP
-//!   parse → the registered inner port's channel. IKE responses → the pending-request
-//!   slot (matched by `(SPIi, message id)`); IKE requests → `IkeInitiator::handle_peer_request`
-//!   → response sent; a peer `DELETE(IKE)` marks the tunnel dead.
+//! - **rx**: `IkeTransport::recv` loop. ESP → `EspInbound::decapsulate` → the inner IP
+//!   packet is pushed into the smoltcp stack (`InnerStack::push_rx`, no parsing here).
+//!   IKE responses → the pending-request slot (matched by `(SPIi, message id)`);
+//!   IKE requests → `IkeInitiator::handle_peer_request` → response sent; a peer
+//!   `DELETE(IKE)` marks the tunnel dead.
+//! - **stack** (`epdg-stack`): the smoltcp poll loop of [`InnerStack`] (DESIGN §11).
+//!   Its TX sink is `EspOutbound::encapsulate` + `IkeTransport::send_esp`; it delivers
+//!   inner UDP to [`InnerUdpSocket`] channels and completes [`EpdgTunnel::resolve`].
 //! - **keepalive**: one `0xFF` byte to `gateway:4500` every `keepalive_interval_secs`
 //!   on the same socket as IKE, regardless of traffic (AOSP behaviour, RFC 3948 §4).
 //! - **timer** (1 s tick): DPD after `dpd.interval_secs` without any rx, with
@@ -19,15 +23,14 @@
 //! policy and gets its response from the rx thread's pending slot. Nothing here
 //! logs key material.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 
 use crate::config::{Config, RetransmitConfig};
 use crate::crypto::registry;
@@ -41,14 +44,11 @@ use crate::ike::message::IkeMessage;
 use crate::ike::nat::NatStatus;
 use crate::ike::session::{AssignedConfig, AuthResponse, ChildSaInfo, IkeInitiator, PeerEvent, SaInitOutcome};
 use crate::ike::transport::{IkeTransport, Incoming};
-use crate::ipstack::ipv6::Ipv6FragmentReassembler;
-use crate::ipstack::udp::{ParsedIp, UdpDatagram, build_udp_packet, parse_ipv6_or_fragment};
+use crate::ipstack::{InnerStack, StackStats, TxSink};
 use crate::{Error, Result};
 
-/// Lowest port handed out by `bind_udp(0)` (IANA dynamic range).
-const EPHEMERAL_PORT_LO: u16 = 49152;
-/// Highest port handed out by `bind_udp(0)`.
-const EPHEMERAL_PORT_HI: u16 = 65535;
+pub use crate::ipstack::{InnerUdpSocket, UdpDatagram};
+
 /// Rx thread socket wait per iteration (also bounds thread-stop latency).
 const RX_POLL: Duration = Duration::from_millis(500);
 /// Sleep slice for the keepalive / timer threads.
@@ -67,8 +67,6 @@ const CLOSE_ATTEMPTS: u32 = 2;
 const REKEY_RETRY_DELAY: Duration = Duration::from_secs(60);
 /// Upper bound on any config-derived interval (`Instant + Duration` must never overflow).
 const MAX_INTERVAL: Duration = Duration::from_secs(365 * 86400);
-/// Per inner-port receive queue depth; datagrams beyond it are dropped (counted).
-const INNER_QUEUE_DEPTH: usize = 256;
 /// Poll slice of the handshake-time keepalive ticker.
 const HANDSHAKE_KEEPALIVE_SLICE: Duration = Duration::from_millis(50);
 
@@ -106,24 +104,20 @@ pub struct TunnelStats {
     pub child_rekeys: u64,
     pub ike_rekeys: u64,
     pub peer_dpd_answered: u64,
-    /// Inbound inner datagrams dropped because the port's receive queue was full.
+    /// Inbound inner UDP datagrams dropped because the port's receive queue was full
+    /// (same as `stack.udp_queue_drops`).
     pub rx_queue_drops: u64,
     /// Instant of the last IKE / ESP / keepalive datagram received from the gateway.
     pub last_rx: Option<Instant>,
-}
-
-/// A UDP "socket" inside the tunnel: sends build an inner IP+UDP packet from an
-/// assigned inner address and ESP-encapsulate it; receives come from the rx thread.
-pub struct InnerUdpSocket {
-    port: u16,
-    rx: Receiver<UdpDatagram>,
-    shared: Arc<Shared>,
+    /// Counters of the smoltcp inner stack (device queue, UDP delivery, DNS).
+    pub stack: StackStats,
 }
 
 /// An established ePDG tunnel. Dropping it closes the tunnel (best effort).
 pub struct EpdgTunnel {
     shared: Arc<Shared>,
     info: TunnelInfo,
+    stack_thread: Option<JoinHandle<()>>,
     rx_thread: Option<JoinHandle<()>>,
     keepalive_thread: Option<JoinHandle<()>>,
     timer_thread: Option<JoinHandle<()>>,
@@ -153,27 +147,28 @@ struct Counters {
     child_rekeys: AtomicU64,
     ike_rekeys: AtomicU64,
     peer_dpd_answered: AtomicU64,
-    rx_queue_drops: AtomicU64,
 }
 
 struct Shared {
     cfg: Config,
-    transport: IkeTransport,
+    /// Shared with the inner stack's TX sink (`send_esp`).
+    transport: Arc<IkeTransport>,
     ike: Mutex<IkeInitiator>,
     /// Held for the whole duration of one post-establishment request.
     request_lock: Mutex<()>,
     pending: Mutex<Option<PendingSlot>>,
     pending_cv: Condvar,
-    outbound: RwLock<Arc<EspOutbound>>,
+    /// Current outbound SA; shared with the inner stack's TX sink (`encapsulate`).
+    outbound: Arc<RwLock<Arc<EspOutbound>>>,
     /// Current inbound SA(s); the old one stays until its DELETE completes.
     inbound: Mutex<Vec<EspInbound>>,
-    /// Inner IP addresses assigned by the gateway (source addresses for `InnerUdpSocket`).
-    assigned: AssignedConfig,
-    ports: Mutex<HashMap<u16, SyncSender<UdpDatagram>>>,
+    /// The smoltcp inner IP stack (DESIGN §11): inner UDP sockets and DNS.
+    stack: InnerStack,
     alive: AtomicBool,
     stop: AtomicBool,
     dead_reason: Mutex<Option<String>>,
-    counters: Counters,
+    /// Shared with the inner stack's TX sink (ESP tx counters).
+    counters: Arc<Counters>,
     last_rx: Mutex<Option<Instant>>,
     /// Creation instants of the current child SA / IKE SA (rekey scheduling).
     child_created: Mutex<Instant>,
@@ -197,6 +192,8 @@ impl Shared {
         let reason = reason.into();
         if self.alive.swap(false, Ordering::SeqCst) {
             error!("tunnel dead: {reason}");
+            // Inner sockets / resolvers see Error::Closed with the same reason.
+            self.stack.close(reason.clone());
             *lock(&self.dead_reason) = Some(reason);
         }
         // Wake anyone waiting for a response so it returns Error::Closed.
@@ -218,6 +215,7 @@ impl Shared {
 
     fn stats(&self) -> TunnelStats {
         let c = &self.counters;
+        let stack = self.stack.stats();
         TunnelStats {
             esp_tx_packets: c.esp_tx_packets.load(Ordering::Relaxed),
             esp_tx_bytes: c.esp_tx_bytes.load(Ordering::Relaxed),
@@ -229,8 +227,9 @@ impl Shared {
             child_rekeys: c.child_rekeys.load(Ordering::Relaxed),
             ike_rekeys: c.ike_rekeys.load(Ordering::Relaxed),
             peer_dpd_answered: c.peer_dpd_answered.load(Ordering::Relaxed),
-            rx_queue_drops: c.rx_queue_drops.load(Ordering::Relaxed),
+            rx_queue_drops: stack.udp_queue_drops,
             last_rx: *lock(&self.last_rx),
+            stack,
         }
     }
 }
@@ -238,26 +237,6 @@ impl Shared {
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested)
 // ---------------------------------------------------------------------------
-
-/// Pick the inner source address for a packet to `dst`: an assigned inner address of
-/// the destination's family (the first one).
-fn pick_source_ip(assigned: &AssignedConfig, dst: IpAddr) -> Option<IpAddr> {
-    match dst {
-        IpAddr::V4(_) => assigned.internal_ipv4.first().map(|a| IpAddr::V4(*a)),
-        IpAddr::V6(_) => assigned.internal_ipv6.first().map(|(a, _)| IpAddr::V6(*a)),
-    }
-}
-
-/// Pick a free inner port in `49152..=65535`, scanning upward from `start` and
-/// wrapping around; `None` when every port is in use.
-fn pick_free_port(used: &HashSet<u16>, start: u16) -> Option<u16> {
-    let range = u32::from(EPHEMERAL_PORT_HI - EPHEMERAL_PORT_LO) + 1;
-    let start = start.clamp(EPHEMERAL_PORT_LO, EPHEMERAL_PORT_HI);
-    let offset = u32::from(start - EPHEMERAL_PORT_LO);
-    (0..range)
-        .map(|i| EPHEMERAL_PORT_LO + ((offset + i) % range) as u16)
-        .find(|p| !used.contains(p))
-}
 
 /// A config interval in seconds as a `Duration`, clamped to `[1 s, MAX_INTERVAL]` so that
 /// `Instant + Duration` can never overflow on a hostile plist value.
@@ -660,6 +639,11 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
 
     let (outbound, inbound) = esp_pair(&child);
     let now = Instant::now();
+    let transport = Arc::new(transport);
+    let outbound = Arc::new(RwLock::new(Arc::new(outbound)));
+    let counters = Arc::new(Counters::default());
+    counters.keepalives_sent.store(handshake_keepalives.load(Ordering::Relaxed), Ordering::Relaxed);
+    let stack = InnerStack::new(&assigned, esp_sink(&transport, &outbound, &counters), cfg.child.inner_mtu)?;
     let shared = Arc::new(Shared {
         cfg: cfg.clone(),
         transport,
@@ -667,21 +651,20 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
         request_lock: Mutex::new(()),
         pending: Mutex::new(None),
         pending_cv: Condvar::new(),
-        outbound: RwLock::new(Arc::new(outbound)),
+        outbound,
         inbound: Mutex::new(vec![inbound]),
-        assigned,
-        ports: Mutex::new(HashMap::new()),
+        stack,
         alive: AtomicBool::new(true),
         stop: AtomicBool::new(false),
         dead_reason: Mutex::new(None),
-        counters: Counters::default(),
+        counters,
         last_rx: Mutex::new(Some(now)),
         child_created: Mutex::new(child.created),
         ike_created: Mutex::new(now),
         natt_since,
     });
-    shared.counters.keepalives_sent.store(handshake_keepalives.load(Ordering::Relaxed), Ordering::Relaxed);
 
+    let stack_thread = spawn_named("epdg-stack", Arc::clone(&shared), stack_loop)?;
     let rx_thread = spawn_named("epdg-rx", Arc::clone(&shared), rx_loop)?;
     let keepalive_thread = spawn_named("epdg-keepalive", Arc::clone(&shared), keepalive_loop)?;
     let timer_thread = spawn_named("epdg-timer", Arc::clone(&shared), timer_loop)?;
@@ -689,11 +672,35 @@ fn connect_candidate(cfg: &Config, gateway: IpAddr) -> Result<EpdgTunnel> {
     Ok(EpdgTunnel {
         shared,
         info,
+        stack_thread: Some(stack_thread),
         rx_thread: Some(rx_thread),
         keepalive_thread: Some(keepalive_thread),
         timer_thread: Some(timer_thread),
         closed: false,
     })
+}
+
+/// The inner stack's TX sink: `EspOutbound::encapsulate` (current outbound SA, so a
+/// child rekey is picked up transparently) + `IkeTransport::send_esp`, counting ESP tx.
+/// Runs on the stack thread inside `Interface::poll`.
+fn esp_sink(transport: &Arc<IkeTransport>, outbound: &Arc<RwLock<Arc<EspOutbound>>>, counters: &Arc<Counters>) -> TxSink {
+    let transport = Arc::clone(transport);
+    let outbound = Arc::clone(outbound);
+    let counters = Arc::clone(counters);
+    Arc::new(move |inner: &[u8]| {
+        let sa = outbound.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let esp = sa.encapsulate(inner)?;
+        transport.send_esp(&esp)?;
+        counters.esp_tx_packets.fetch_add(1, Ordering::Relaxed);
+        counters.esp_tx_bytes.fetch_add(esp.len() as u64, Ordering::Relaxed);
+        trace!("tx inner IP packet {} bytes -> ESP {} bytes (SPI {:#010x} seq {})", inner.len(), esp.len(), sa.spi(), sa.seq());
+        Ok(())
+    })
+}
+
+/// Body of the `epdg-stack` thread: the smoltcp poll loop (DESIGN §11).
+fn stack_loop(shared: Arc<Shared>) {
+    shared.stack.run();
 }
 
 /// Spawn a tunnel thread under a panic guard: a panicking thread marks the tunnel dead
@@ -877,7 +884,6 @@ fn rekey_ike(shared: &Shared) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn rx_loop(shared: Arc<Shared>) {
-    let mut reassembler = Ipv6FragmentReassembler::new();
     let mut fragments = FragmentCollector::new();
     let mut last_evict = Instant::now();
     let mut consecutive_errors: u32 = 0;
@@ -892,7 +898,7 @@ fn rx_loop(shared: Arc<Shared>) {
             Ok(Some(Incoming::Esp(packet))) => {
                 consecutive_errors = 0;
                 shared.touch_rx();
-                handle_esp(&shared, &packet, &mut reassembler);
+                handle_esp(&shared, &packet);
             }
             Ok(Some(Incoming::Ike(datagram))) => {
                 consecutive_errors = 0;
@@ -916,7 +922,6 @@ fn rx_loop(shared: Arc<Shared>) {
             }
         }
         if last_evict.elapsed() >= Duration::from_secs(5) {
-            reassembler.evict(Instant::now());
             fragments.evict_stale();
             last_evict = Instant::now();
         }
@@ -932,7 +937,8 @@ fn rx_error_backoff(n: u32) -> Duration {
     Duration::from_millis(100u64.saturating_mul(1u64 << n.saturating_sub(1).min(6))).min(Duration::from_secs(5))
 }
 
-fn handle_esp(shared: &Shared, packet: &[u8], reassembler: &mut Ipv6FragmentReassembler) {
+/// Decapsulate one ESP datagram and hand the inner IP packet to the smoltcp stack.
+fn handle_esp(shared: &Shared, packet: &[u8]) {
     let spi = match packet.get(0..4) {
         Some(b) => u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
         None => {
@@ -966,34 +972,9 @@ fn handle_esp(shared: &Shared, packet: &[u8], reassembler: &mut Ipv6FragmentReas
     };
     shared.counters.esp_rx_packets.fetch_add(1, Ordering::Relaxed);
     shared.counters.esp_rx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
-    match parse_ipv6_or_fragment(&inner, reassembler) {
-        Ok(Some(ParsedIp::Udp(dg))) => {
-            let port = dg.dst.port();
-            let sender = lock(&shared.ports).get(&port).cloned();
-            match sender {
-                Some(tx) => {
-                    debug!("rx: inner UDP {} -> {} ({} bytes)", dg.src, dg.dst, dg.payload.len());
-                    match tx.try_send(dg) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            shared.counters.rx_queue_drops.fetch_add(1, Ordering::Relaxed);
-                            debug!("rx: inner port {port} queue full; dropping");
-                        }
-                        Err(TrySendError::Disconnected(_)) => {
-                            debug!("rx: inner port {port} receiver gone; dropping");
-                            lock(&shared.ports).remove(&port);
-                        }
-                    }
-                }
-                None => debug!("rx: inner UDP {} -> {} ({} bytes) for unbound port; dropped", dg.src, dg.dst, dg.payload.len()),
-            }
-        }
-        Ok(Some(ParsedIp::Other { version, protocol, src, dst })) => {
-            debug!("rx: inner IPv{version} protocol {protocol} {src} -> {dst} ignored");
-        }
-        Ok(None) => debug!("rx: inner IPv6 fragment stashed ({} bytes)", inner.len()),
-        Err(e) => debug!("rx: inner packet parse failed: {e}"),
-    }
+    trace!("rx: inner IP packet {} bytes -> stack", inner.len());
+    // No parsing here: smoltcp classifies, reassembles (IPv4) and delivers.
+    shared.stack.push_rx(inner);
 }
 
 fn handle_ike_datagram(shared: &Shared, datagram: Vec<u8>, fragments: &mut FragmentCollector) {
@@ -1249,26 +1230,22 @@ impl EpdgTunnel {
     }
 
     /// Create an inner UDP socket. `local_port == 0` picks a free port in
-    /// `49152..=65535`. The source IP is chosen per destination family on send.
+    /// `49152..=65535`. smoltcp picks the source address by destination family.
     pub fn bind_udp(&self, local_port: u16) -> Result<InnerUdpSocket> {
         if !self.shared.is_alive() {
             return Err(self.shared.closed_error());
         }
-        let mut ports = lock(&self.shared.ports);
-        let port = if local_port == 0 {
-            let used: HashSet<u16> = ports.keys().copied().collect();
-            let start = EPHEMERAL_PORT_LO + (rand::random::<u16>() % (EPHEMERAL_PORT_HI - EPHEMERAL_PORT_LO + 1));
-            pick_free_port(&used, start).ok_or_else(|| Error::Config("no free inner UDP port".into()))?
-        } else {
-            if ports.contains_key(&local_port) {
-                return Err(Error::Config(format!("inner UDP port {local_port} is already bound")));
-            }
-            local_port
-        };
-        let (tx, rx) = mpsc::sync_channel(INNER_QUEUE_DEPTH);
-        ports.insert(port, tx);
-        debug!("inner UDP port {port} bound");
-        Ok(InnerUdpSocket { port, rx, shared: Arc::clone(&self.shared) })
+        self.shared.stack.bind_udp(local_port)
+    }
+
+    /// Resolve `name` over the tunnel with the gateway-assigned DNS servers (smoltcp
+    /// DNS socket): AAAA then A, skipping a family we have no inner address for.
+    /// `Error::Timeout` when nothing answered within `timeout`.
+    pub fn resolve(&self, name: &str, timeout: Duration) -> Result<Vec<IpAddr>> {
+        if !self.shared.is_alive() {
+            return Err(self.shared.closed_error());
+        }
+        self.shared.stack.resolve(name, timeout)
     }
 
     /// True while the IKE SA is up (no peer DELETE, no DPD failure, not closed).
@@ -1333,12 +1310,15 @@ impl EpdgTunnel {
         shared.alive.store(false, Ordering::SeqCst);
         shared.stop.store(true, Ordering::SeqCst);
         shared.pending_cv.notify_all();
-        for h in [self.rx_thread.take(), self.keepalive_thread.take(), self.timer_thread.take()].into_iter().flatten() {
+        shared.stack.close("tunnel closed");
+        for h in [self.rx_thread.take(), self.keepalive_thread.take(), self.timer_thread.take(), self.stack_thread.take()]
+            .into_iter()
+            .flatten()
+        {
             if h.join().is_err() {
                 warn!("a tunnel thread panicked");
             }
         }
-        lock(&shared.ports).clear();
         info!("tunnel closed; stats: {:?}", shared.stats());
         result
     }
@@ -1361,120 +1341,13 @@ impl std::fmt::Debug for EpdgTunnel {
 }
 
 // ---------------------------------------------------------------------------
-// InnerUdpSocket
-// ---------------------------------------------------------------------------
-
-impl InnerUdpSocket {
-    /// Build `IP(src=assigned inner addr of dst's family, dst) | UDP | payload`,
-    /// ESP-encapsulate it and send it through the tunnel.
-    pub fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> Result<()> {
-        let shared = &self.shared;
-        if !shared.is_alive() {
-            return Err(shared.closed_error());
-        }
-        let src_ip = pick_source_ip(&shared.assigned, dst.ip()).ok_or_else(|| {
-            Error::Config(format!(
-                "no assigned inner {} address to reach {}",
-                if dst.is_ipv4() { "IPv4" } else { "IPv6" },
-                dst
-            ))
-        })?;
-        let src = SocketAddr::new(src_ip, self.port);
-        let inner = build_udp_packet(src, dst, payload)?;
-        let outbound = shared.outbound.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let esp = outbound.encapsulate(&inner)?;
-        shared.transport.send_esp(&esp)?;
-        shared.counters.esp_tx_packets.fetch_add(1, Ordering::Relaxed);
-        shared.counters.esp_tx_bytes.fetch_add(esp.len() as u64, Ordering::Relaxed);
-        debug!("tx inner UDP {} -> {} ({} bytes payload, {} bytes ESP, seq {})", src, dst, payload.len(), esp.len(), outbound.seq());
-        Ok(())
-    }
-
-    /// Wait up to `timeout` for a datagram addressed to this port. `Ok(None)` on timeout.
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<UdpDatagram>> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(dg) => Ok(Some(dg)),
-            Err(RecvTimeoutError::Timeout) => Ok(None),
-            Err(RecvTimeoutError::Disconnected) => Err(self.shared.closed_error()),
-        }
-    }
-
-    pub fn local_port(&self) -> u16 {
-        self.port
-    }
-}
-
-impl Drop for InnerUdpSocket {
-    fn drop(&mut self) {
-        lock(&self.shared.ports).remove(&self.port);
-    }
-}
-
-impl std::fmt::Debug for InnerUdpSocket {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("InnerUdpSocket").field("port", &self.port).finish()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests (offline)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    fn assigned(v4: bool, v6: bool) -> AssignedConfig {
-        AssignedConfig {
-            internal_ipv4: if v4 { vec![Ipv4Addr::new(10, 1, 2, 3), Ipv4Addr::new(10, 9, 9, 9)] } else { vec![] },
-            internal_ipv6: if v6 { vec![(Ipv6Addr::new(0x2607, 0xfb90, 0, 0, 0, 0, 0, 1), 64)] } else { vec![] },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn source_ip_matches_destination_family() {
-        let a = assigned(true, true);
-        assert_eq!(pick_source_ip(&a, "8.8.8.8".parse().unwrap()), Some("10.1.2.3".parse().unwrap()));
-        assert_eq!(pick_source_ip(&a, "2001:db8::1".parse().unwrap()), Some("2607:fb90::1".parse().unwrap()));
-    }
-
-    #[test]
-    fn source_ip_none_when_family_missing() {
-        let only_v6 = assigned(false, true);
-        assert_eq!(pick_source_ip(&only_v6, "8.8.8.8".parse().unwrap()), None);
-        assert!(pick_source_ip(&only_v6, "2001:db8::1".parse().unwrap()).is_some());
-        let only_v4 = assigned(true, false);
-        assert_eq!(pick_source_ip(&only_v4, "2001:db8::1".parse().unwrap()), None);
-        assert!(pick_source_ip(&only_v4, "1.1.1.1".parse().unwrap()).is_some());
-        assert_eq!(pick_source_ip(&AssignedConfig::default(), "1.1.1.1".parse().unwrap()), None);
-    }
-
-    #[test]
-    fn free_port_starts_at_requested_and_skips_used() {
-        let used: HashSet<u16> = [50000u16, 50001].into_iter().collect();
-        assert_eq!(pick_free_port(&used, 50000), Some(50002));
-        assert_eq!(pick_free_port(&used, 49999), Some(49999));
-        assert_eq!(pick_free_port(&HashSet::new(), 49152), Some(49152));
-    }
-
-    #[test]
-    fn free_port_wraps_and_clamps() {
-        let used: HashSet<u16> = [65535u16].into_iter().collect();
-        assert_eq!(pick_free_port(&used, 65535), Some(49152));
-        // Below the range → clamped to the range start.
-        assert_eq!(pick_free_port(&HashSet::new(), 80), Some(49152));
-    }
-
-    #[test]
-    fn free_port_none_when_exhausted() {
-        let used: HashSet<u16> = (EPHEMERAL_PORT_LO..=EPHEMERAL_PORT_HI).collect();
-        assert_eq!(pick_free_port(&used, 50000), None);
-        let mut almost = used.clone();
-        almost.remove(&60000);
-        assert_eq!(pick_free_port(&almost, 12), Some(60000));
-    }
+    use std::net::Ipv4Addr;
 
     #[test]
     fn retransmit_schedule_matches_aosp() {
@@ -1586,6 +1459,7 @@ mod tests {
         assert_eq!(s.keepalives_sent, 0);
         assert_eq!(s.esp_rx_packets, 0);
         assert_eq!(s.rx_queue_drops, 0);
+        assert_eq!(s.stack, StackStats::default());
         assert!(s.last_rx.is_none());
     }
 
@@ -1654,6 +1528,10 @@ mod tests {
             auth_key: vec![2; 32],
         };
         let now = Instant::now();
+        let transport = Arc::new(transport);
+        let outbound = Arc::new(RwLock::new(Arc::new(EspOutbound::new(sa()))));
+        let counters = Arc::new(Counters::default());
+        let stack = InnerStack::new(&AssignedConfig::default(), esp_sink(&transport, &outbound, &counters), 1280).unwrap();
         Arc::new(Shared {
             cfg,
             transport,
@@ -1661,14 +1539,13 @@ mod tests {
             request_lock: Mutex::new(()),
             pending: Mutex::new(None),
             pending_cv: Condvar::new(),
-            outbound: RwLock::new(Arc::new(EspOutbound::new(sa()))),
+            outbound,
             inbound: Mutex::new(vec![EspInbound::new(sa(), 64)]),
-            assigned: AssignedConfig::default(),
-            ports: Mutex::new(HashMap::new()),
+            stack,
             alive: AtomicBool::new(true),
             stop: AtomicBool::new(false),
             dead_reason: Mutex::new(None),
-            counters: Counters::default(),
+            counters,
             last_rx: Mutex::new(Some(now)),
             child_created: Mutex::new(now),
             ike_created: Mutex::new(now),

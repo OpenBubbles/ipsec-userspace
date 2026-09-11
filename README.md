@@ -9,7 +9,9 @@ carrier-bundle style configuration. Verified live against T-Mobile's production 
 - **EAP-TLS** (RFC 5216) over OpenSSL — the ePDG's EAP server only negotiates `TLS_RSA_WITH_AES_128_CBC_SHA`, which
   rustls cannot offer (see `docs/DESIGN.md` §9.3), so the TLS engine is the `openssl` crate.
 - Tunnel-mode **ESP** (RFC 4303) encapsulated in UDP/4500, anti-replay window, AES-256-CBC + HMAC-SHA2-256-128.
-- Minimal inner **IPv4/IPv6 + UDP** stack (+ IPv6 fragment reassembly, tiny DNS client) so you can talk to hosts inside the tunnel.
+- Inner IP stack = **smoltcp 0.14** over the ESP data plane (a `Medium::Ip` device: the tunnel-mode ESP payload *is* the IP
+  packet): IPv4/IPv6, inner UDP sockets (`EpdgTunnel::bind_udp`), a DNS resolver over the assigned servers
+  (`EpdgTunnel::resolve`), IPv4 fragmentation/reassembly; ICMP and TCP sockets are one method away in the same `SocketSet`.
 - Crypto for IKE/ESP via RustCrypto (`aes`/`cbc`/`hmac`/`sha2`) and `num-bigint` MODP DH, behind a transform registry
   (`crypto::registry`) so more algorithms can be added without touching protocol code.
 
@@ -35,10 +37,11 @@ use epdg::{Config, EpdgTunnel};
 let cfg = Config::from_plist_files(&bundle, &creds, &cert, &key)?;
 let tunnel = EpdgTunnel::connect(&cfg)?;                 // IKE_SA_INIT → IKE_AUTH/EAP-TLS → child SA
 let info = tunnel.info();                                // inner addresses, DNS, P-CSCF, SPIs, suites
-let sock = tunnel.bind_udp(0)?;                          // an inner UDP endpoint
-sock.send_to((info.assigned.dns_ipv6[0], 53).into(), &query)?;
-let reply = sock.recv_timeout(std::time::Duration::from_secs(5))?;
-tunnel.close()?;                                         // INFORMATIONAL DELETE(IKE)
+let pcscf = tunnel.resolve("ueb2bprod.pc.t-mobile.com", Duration::from_secs(5))?; // AAAA then A via the tunnel DNS
+let sock = tunnel.bind_udp(0)?;                          // an inner UDP endpoint (smoltcp socket)
+sock.send_to((pcscf[0], 5060).into(), &sip_register)?;   // source address picked by smoltcp per family
+let reply = sock.recv_timeout(Duration::from_secs(5))?;  // Option<UdpDatagram { src, dst, payload }>
+tunnel.close()?;                                         // INFORMATIONAL DELETE(IKE), stops all threads
 ```
 
 CLI (stable path — handy for per-application firewall rules):
@@ -52,22 +55,36 @@ RUST_LOG=info ./target/debug/epdg-connect            # connect, resolve the P-CS
 ## Tests
 
 ```bash
-cargo test                          # 316 offline unit tests + the live test
+cargo test                          # 309 offline unit tests + the live test
 EPDG_SKIP_LIVE=1 cargo test         # skip the live test
 RUST_LOG=debug cargo test --test live_tmobile -- --nocapture   # live: hex dumps of every IKE datagram
 ```
 
+The inner stack is tested offline with an in-process **two-stack loopback** (`ipstack::stack::tests`): two `InnerStack`s
+on different IPv6 /64s (+ a v4 /32 each) whose device sinks feed each other — UDP both ways with exact endpoints,
+off-prefix routing, a 3000-byte IPv4 datagram fragmented at MTU 1280 and reassembled, `resolve()` against a tiny
+in-process DNS server on the far stack's port 53, timeouts, port allocation, queue bounds, shutdown semantics.
+
 `tests/live_tmobile.rs` connects to the T-Mobile PROD ePDG with the fixture credentials, asserts an inner address,
-resolves `ueb2bprod.pc.t-mobile.com` through the tunnel (proves ESP in both directions), runs a DPD, observes
-NAT-T keepalives, and tears down cleanly. It needs UDP egress on 500/4500; a per-application firewall
-(e.g. Little Snitch) must allow the test binary or `target/debug/epdg-connect`.
+resolves `ueb2bprod.pc.t-mobile.com` with `tunnel.resolve` (smoltcp DNS over ESP — proves ESP in both directions),
+runs a DPD, observes NAT-T keepalives, and tears down cleanly. It needs UDP egress on 500/4500; a per-application
+firewall (e.g. Little Snitch) must allow the test binary or `target/debug/epdg-connect`.
 
 ## Layout
 
 `config` · `crypto` (traits, AES-CBC, HMAC-SHA2, MODP DH, registry) · `ike` (header/payload/message/fragment codecs,
 keys, auth, nat, transport, `session::IkeInitiator` sans-I/O state machine) · `eap` (packet, tls) · `esp` (codec, replay)
-· `ipstack` (ipv4, ipv6, udp, dns) · `tunnel` (threads: rx demux, keepalive, DPD/rekey timers; `EpdgTunnel` facade).
-Design contract and the byte-level facts mirrored from the AOSP client: `docs/DESIGN.md`, `docs/AOSP_FACTS*.md`.
+· `ipstack` (`device::EspDevice` — smoltcp `Medium::Ip` device over ESP; `stack::InnerStack` — `Interface` + `SocketSet`
++ the single stack thread, `InnerUdpSocket`, `resolve`) · `tunnel` (threads: rx demux, stack, keepalive, DPD/rekey
+timers; `EpdgTunnel` facade). Design contract and the byte-level facts mirrored from the AOSP client: `docs/DESIGN.md`,
+`docs/AOSP_FACTS*.md`.
+
+Threading of the inner stack (DESIGN.md §11): only the `epdg-stack` thread drives smoltcp (`Interface::poll`), behind
+one mutex + condvar. The ESP rx thread decapsulates and pushes the inner IP packet (`push_rx`, bounded queue,
+drop-oldest); `send_to` / `bind_udp` / `resolve` hold the lock only to enqueue and then notify; received datagrams
+reach `InnerUdpSocket::recv_timeout` through a bounded channel without touching the lock. smoltcp's compile-time
+limits are raised through Cargo features (8 addresses, 4 routes, 4 DNS servers, 8 DNS results, 8 KiB
+fragmentation/reassembly buffers); `child.inner_mtu` (default 1280) sets the inner MTU.
 
 ## Notes from the live bring-up
 
@@ -77,3 +94,7 @@ Design contract and the byte-level facts mirrored from the AOSP client: `docs/DE
 - It returns no `P_CSCF_IP*_ADDRESS` config attributes; resolve the P-CSCF hostname over the assigned tunnel DNS.
 - NAT_DETECTION_SOURCE_IP is deliberately hashed over `192.0.2.0` (as the AOSP client does) so the gateway always
   selects UDP-encapsulated ESP — the only kind a userspace client can carry.
+- smoltcp 0.14 has **no IPv6 fragmentation or reassembly on `Medium::Ip`** (its `proto-ipv6-fragmentation` feature
+  only covers 6LoWPAN): an IPv6 datagram larger than the inner MTU is refused by `send_to` up front, and an inbound
+  IPv6 Fragment header is dropped by smoltcp (ICMPv6 Parameter Problem). IPv4 fragments both ways. Large inner IPv6
+  traffic (e.g. SIP responses over UDP) therefore needs either a bigger `inner_mtu`, TCP, or a future smoltcp release.

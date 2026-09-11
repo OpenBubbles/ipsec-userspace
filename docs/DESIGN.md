@@ -116,6 +116,7 @@ pub struct ChildConfig {
     pub replay_window: u32,            // ReplayWindowSize (12) — codec rounds up to >= 32
     pub cfg_requests: Vec<u16>,        // CFG attribute types to request, in emission order (§8.3)
     pub install_policies: bool,        // carried, unused
+    pub inner_mtu: usize,              // inner interface MTU (bytes of IP packet); not in the bundle, default 1280 (§11)
 }
 pub struct ChildProposal { pub encryption: Vec<String>, pub integrity: Vec<String>, pub dh_groups: Vec<u16> /* PFS; empty */ }
 pub struct DpdConfig { pub enabled: bool, pub interval_secs: u64, pub retry_interval_secs: u64, pub max_retries: u32 }
@@ -630,9 +631,19 @@ pub struct UdpDatagram { pub src: SocketAddr, pub dst: SocketAddr, pub payload: 
 // (skip a family we have no inner address for), poll until get_query_result is Ok/Err; Error::Timeout after `timeout`.
 // TCP: not exposed yet — the seam is `socket::tcp::Socket` in the same SocketSet (one method away; do NOT implement now).
 ```
-MTU: inner MTU defaults to 1280 (config `child.inner_mtu`); outbound IPv6 larger than that is fragmented by smoltcp (feature on).
-Inbound IPv6/IPv4 fragments (large SIP responses) are reassembled by smoltcp — do not reimplement. Unknown/ICMP traffic is handled or
-dropped by smoltcp (ND/ICMPv6 echo replies are harmless and useful).
+MTU: inner MTU defaults to 1280 (config `child.inner_mtu`, clamped to `[1280, 65535]`). **Verified smoltcp 0.14 behaviour
+(amendment 2026-09-11, see §15):** outbound IPv4 larger than the MTU is fragmented by smoltcp (up to `FRAGMENTATION_BUFFER_SIZE`)
+and inbound IPv4 fragments are reassembled (up to `REASSEMBLY_BUFFER_SIZE`); **IPv6 is neither fragmented nor reassembled on
+`Medium::Ip`** — the `proto-ipv6-fragmentation` feature only covers 6LoWPAN, an oversize IPv6 packet is dropped at dispatch and an
+inbound IPv6 Fragment header gets an ICMPv6 Parameter Problem. `InnerUdpSocket::send_to` therefore refuses an IPv6 payload that
+does not fit one MTU-sized packet (`Error::Protocol`) instead of losing it silently, and refuses IPv4 payloads beyond the
+fragmentation buffer. Do not reimplement reassembly in this crate; if large inner IPv6 UDP is needed, raise `inner_mtu`, use TCP,
+or upgrade smoltcp. smoltcp's compile-time limits are set by Cargo features (`iface-max-addr-count-8`, `iface-max-route-count-4`,
+`dns-max-server-count-4`, `dns-max-result-count-8`, `fragmentation-buffer-size-8192`, `reassembly-buffer-size-8192`,
+`reassembly-buffer-count-4`); `smoltcp::config::*` exposes the effective values. Unknown/ICMP traffic is handled or dropped by
+smoltcp (ICMP port-unreachable replies are harmless). Routes: with `Medium::Ip` smoltcp never resolves a next hop and never
+blocks egress on a missing route (`has_neighbor` is unconditionally true), so the default routes are nominal — the loopback test
+still proves off-prefix delivery end to end.
 Threading rule: only the stack thread touches `Interface`/`SocketSet`/`EspDevice` (behind one Mutex + Condvar); callers hold the lock only
 to enqueue/dequeue. The ESP rx thread never blocks on the stack lock for long (push + notify). All queues bounded; drops counted in stats.
 
@@ -759,6 +770,14 @@ CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 
 **Post-EAP IKE_AUTH request:** inner = one AUTH payload `00 00 00 28 | 02 00 00 00 | 32-byte HMAC` (40 B) → 7 pad + padlen → 48 B ciphertext; SK = 84; message = 112 B; SK next-payload 0x27.
 
 ## 15. Amendment log
+- 2026-09-11 (§11 implemented, deviations): (a) smoltcp 0.14 has no IPv6 fragmentation/reassembly on `Medium::Ip` — §11's
+  "IPv6 larger than the MTU is fragmented / inbound IPv6 fragments are reassembled" is false for 0.14; `send_to` refuses oversize
+  IPv6 payloads instead (IPv4 fragments/reassembles as specified). (b) `InnerUdpSocket` / `UdpDatagram` live in `ipstack::stack`
+  and are re-exported from `tunnel` (same public paths `epdg::InnerUdpSocket`, `epdg::tunnel::InnerUdpSocket`). (c) `resolve`
+  starts the AAAA and A queries together (one per family we have an address for) and returns AAAA answers first; a family whose
+  query fails is skipped, `Error::Timeout` only when nothing answered, `Error::Protocol` when every query failed. (d) smoltcp's
+  compile-time limits are raised via Cargo features (see §11); `child.inner_mtu` (default 1280, bundle-independent) added to §2's
+  `ChildConfig`. (e) `TunnelStats` gains `stack: StackStats` (device queue drops, UDP delivery/drops, DNS queries).
 - 2026-09-11: §11 rewritten — inner IP stack is smoltcp (Medium::Ip Device over ESP); hand-rolled ipstack + DNS codec removed; `EpdgTunnel::resolve` added.
 - 2026-09-11: §9.3 — ePDG EAP-TLS server requires TLS_RSA_WITH_AES_128_CBC_SHA; EAP-TLS moved from rustls to OpenSSL (no pluggable backend).
 - 2026-09-11: retransmit corrected to 5 sends; §14.1 KAT layouts added from the critic pass (docs/AOSP_FACTS_CRITIC.md).
