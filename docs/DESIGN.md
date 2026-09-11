@@ -821,7 +821,56 @@ CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 
 
 **Post-EAP IKE_AUTH request:** inner = one AUTH payload `00 00 00 28 | 02 00 00 00 | 32-byte HMAC` (40 B) → 7 pad + padlen → 48 B ciphertext; SK = 84; message = 112 B; SK next-payload 0x27.
 
+
+## 16. `NetStack` — one socket/DNS abstraction over the OS stack and the tunnel (2026-09-11)
+
+Purpose: application code (the SIP client) is written once against `epdg::netstack::NetStack` and runs unchanged over the host
+OS stack or inside the ePDG tunnel. Object-safe (consumers hold `Arc<dyn NetStack>`), synchronous, UDP + DNS only for now.
+
+```rust
+// src/netstack/mod.rs
+pub trait NetStack: Send + Sync {
+    /// Bind a UDP socket on `local_port` (0 = ephemeral) on this stack.
+    fn bind_udp(&self, local_port: u16) -> io::Result<Box<dyn UdpSocketLike>>;
+    /// Resolve `host` to A/AAAA addresses with THIS stack's resolver, within `timeout`. IP literals return immediately.
+    fn resolve(&self, host: &str, timeout: Duration) -> io::Result<Vec<IpAddr>>;
+    /// Addresses this stack sources traffic from (SIP Via/Contact): the tunnel's inner addresses; for the OS stack the
+    /// configured bind address, else the route-selected egress address per family.
+    fn local_addrs(&self) -> Vec<IpAddr>;
+    /// Backend name for logs: "std" / "epdg-tunnel".
+    fn name(&self) -> &'static str;
+}
+pub trait UdpSocketLike: Send + Sync {
+    fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()>;
+    /// `Ok(None)` on timeout; `Err(NotConnected)` once the stack is closed.
+    fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<(SocketAddr, Vec<u8>)>>;
+    fn local_addr(&self) -> SocketAddr;
+}
+```
+Implementations:
+- **`StdNetStack`** (`src/netstack/std_stack.rs`): `StdNetStack::new()` binds dual-stack `[::]` (falls back to `0.0.0.0` if IPv6 is
+  unavailable); `with_bind_addr(IpAddr)` pins a family/address. `bind_udp` → `std::net::UdpSocket`; v4-mapped peers (`::ffff:a.b.c.d`)
+  are normalised to IPv4 on receive and mapped on send when the socket is dual-stack. `resolve` → **the libc resolver** via
+  `std::net::ToSocketAddrs` (`(host, 0).to_socket_addrs()` = `getaddrinfo`), executed on a helper thread so `timeout` is honoured
+  (`Err(TimedOut)` after `timeout`; the helper is detached); results deduplicated, order kept. `local_addrs` → the bind address if it
+  is specific, else the egress address per family found with a `connect`ed-but-silent UDP socket (no packet is ever sent; families
+  without a route are omitted). `recv_timeout` → `set_read_timeout` + `recv_from` into a 64 KiB buffer; `WouldBlock`/`TimedOut` → `Ok(None)`.
+- **`EpdgTunnel: NetStack`** — delegates to `bind_udp` / `resolve` / `info().assigned` (DNS = smoltcp's DNS socket over the assigned
+  tunnel servers; the libc resolver cannot reach tunnel-internal servers). `InnerUdpSocket: UdpSocketLike`. **`InnerStack: NetStack`**
+  too (same delegation) so the trait is testable offline over the two-stack loopback harness.
+- Error mapping `epdg::Error → io::Error` (`netstack::to_io`): `Io(e)` → `e`; `Timeout` → `TimedOut`; `Closed` → `NotConnected`;
+  `Config`/`Unsupported` → `InvalidInput`; everything else → `Other`; the source is preserved (`io::Error::new(kind, e)`).
+- Exports: `epdg::netstack::{NetStack, UdpSocketLike, StdNetStack}` and `epdg::{NetStack, UdpSocketLike, StdNetStack}`.
+
+Tests: one generic `fn exercise<S: NetStack + ?Sized>(a: &S, b: &S)` run over BOTH backends: bind two sockets, send both ways, echo,
+`recv_timeout` → `None` on silence, `local_addr` port matches, `local_addrs` non-empty, ephemeral ports distinct, `Arc<dyn NetStack>`
+usable. std: `resolve("localhost")` contains a loopback address; an IP literal resolves without touching the resolver; an invalid label
+errors; a too-short timeout yields `TimedOut` (or a fast error). Tunnel: over two `InnerStack`s with the existing fake DNS server,
+`resolve` returns the fake answer. `epdg-connect` performs its P-CSCF lookup and the DNS round trip through `&dyn NetStack` so the
+live run covers the tunnel implementation.
+
 ## 15. Amendment log
+- 2026-09-11: §16 added — `NetStack`/`UdpSocketLike` abstraction with std (libc resolver) and tunnel implementations.
 - 2026-09-11 (§11.1 implemented + §11 verifier fixes): (a) §11.1 lives in `ipstack/frag.rs`, applied inside `EspDevice` (TX) and
   `InnerStack::push_rx` (RX); `child.inner_mtu_stack` (default 16384) added to `ChildConfig`; DF is not honoured on TX (smoltcp
   sets it unconditionally) — see §11.1. (b) `auto-icmp-echo-reply` added to the smoltcp features (echo requests were ignored).
