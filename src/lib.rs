@@ -14,7 +14,7 @@
 //! - [`config`]  — configuration model + plist bundle parsing
 //! - [`crypto`]  — cipher / integrity / PRF / DH traits, implementations, registry
 //! - [`ike`]     — IKEv2 wire codec, key derivation, initiator state machine, transport
-//! - [`eap`]     — EAP framing and the EAP-TLS method (rustls-backed)
+//! - [`eap`]     — EAP framing and the EAP-TLS method (OpenSSL-backed)
 //! - [`esp`]     — ESP codec, anti-replay, UDP encapsulation
 //! - [`ipstack`] — inner IPv4/IPv6 + UDP packet build/parse
 //! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`

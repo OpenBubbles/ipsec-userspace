@@ -28,7 +28,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use log::{debug, error, info, warn};
-use rustls::pki_types::ServerName;
 
 use crate::config::{Config, RetransmitConfig};
 use crate::crypto::registry;
@@ -495,13 +494,11 @@ fn sa_init(cfg: &Config, transport: &IkeTransport, mut ike: IkeInitiator) -> Res
     Err(Error::Protocol(format!("IKE_SA_INIT did not complete after {MAX_SA_INIT_RETRIES} retries")))
 }
 
-fn eap_tls_config(cfg: &Config, gateway: IpAddr) -> Result<EapTlsConfig> {
-    let server_name = match &cfg.eap_tls.tls_server_name {
-        Some(name) if !name.is_empty() => ServerName::try_from(name.clone())
-            .map_err(|e| Error::Config(format!("invalid tls_server_name {name:?}: {e}")))?,
-        _ => ServerName::IpAddress(rustls::pki_types::IpAddr::from(gateway)),
-    };
-    Ok(EapTlsConfig {
+fn eap_tls_config(cfg: &Config) -> EapTlsConfig {
+    // SNI (and, when validating, the hostname check) only when a name is configured; the
+    // ePDG is addressed by IP and AOSP sends no SNI.
+    let server_name = cfg.eap_tls.tls_server_name.clone().filter(|n| !n.is_empty());
+    EapTlsConfig {
         identity: cfg.identity.eap_identity.clone(),
         client_cert_pem: cfg.eap_tls.client_cert_pem.clone(),
         client_key_pem: cfg.eap_tls.client_key_pem.clone(),
@@ -510,14 +507,14 @@ fn eap_tls_config(cfg: &Config, gateway: IpAddr) -> Result<EapTlsConfig> {
         server_name,
         max_fragment_len: cfg.eap_tls.max_fragment_len,
         allow_tls13: cfg.eap_tls.allow_tls13,
-    })
+    }
 }
 
 /// IKE_AUTH: initial request, EAP-TLS rounds, MSK, final AUTH. Returns the
 /// establishment result and the negotiated TLS version.
 fn ike_auth(cfg: &Config, transport: &IkeTransport, ike: &mut IkeInitiator) -> Result<(crate::ike::session::Established, String)> {
     let policy = &cfg.ike.retransmit;
-    let mut eap = EapTlsClient::new(eap_tls_config(cfg, transport.remote_addr().ip())?)?;
+    let mut eap = EapTlsClient::new(eap_tls_config(cfg))?;
 
     let msg = ike.build_auth_initial()?;
     info!("IKE_AUTH #1 (msgid {}): IDi/IDr/EAP_ONLY/SA/TSi/TSr/CP", msg.header.message_id);
@@ -526,7 +523,7 @@ fn ike_auth(cfg: &Config, transport: &IkeTransport, ike: &mut IkeInitiator) -> R
     loop {
         match ike.handle_auth_response(&response)? {
             AuthResponse::Established(est) => {
-                let tls_version = eap.protocol_version().map(|v| format!("{v:?}")).unwrap_or_else(|| "unknown".into());
+                let tls_version = eap.protocol_version().unwrap_or("unknown").to_string();
                 info!(
                     "IKE_AUTH complete: child SPI_in {:#010x} SPI_out {:#010x} ({}), TLS {}",
                     est.child.spi_in,
@@ -565,7 +562,12 @@ fn ike_auth(cfg: &Config, transport: &IkeTransport, ike: &mut IkeInitiator) -> R
                         response = handshake_exchange(transport, ike, &msg, policy)?;
                     }
                     EapAction::Success { msk, .. } => {
-                        info!("EAP-Success: MSK derived ({} bytes), TLS {:?}", msk.len(), eap.protocol_version());
+                        info!(
+                            "EAP-Success: MSK derived ({} bytes), TLS {} {}",
+                            msk.len(),
+                            eap.protocol_version().unwrap_or("unknown"),
+                            eap.cipher_name().unwrap_or("unknown")
+                        );
                         // The Vec moves into SharedKeyAuth (ZeroizeOnDrop); `msk`/`emsk` zeroize on drop.
                         ike.set_msk(msk.to_vec());
                         let msg = ike.build_auth_final()?;

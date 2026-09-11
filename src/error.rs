@@ -45,8 +45,9 @@ pub enum Error {
     #[error("eap error: {0}")]
     Eap(String),
 
+    /// TLS engine (OpenSSL) failure: handshake, certificate verification, exporter.
     #[error("tls error: {0}")]
-    Tls(#[from] rustls::Error),
+    Tls(String),
 
     /// No response after all retransmissions.
     #[error("timeout waiting for {0}")]

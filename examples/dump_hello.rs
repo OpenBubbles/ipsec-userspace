@@ -1,21 +1,21 @@
 //! Diagnostic: print the exact TLS ClientHello our EAP-TLS client sends (suites/extensions).
 use epdg::eap::packet::EapPacket;
 use epdg::eap::tls::{EapAction, EapTlsClient, EapTlsConfig};
-use rustls::pki_types::ServerName;
-use std::net::IpAddr;
 
 fn u16be(b: &[u8]) -> u16 { u16::from_be_bytes([b[0], b[1]]) }
 
 fn main() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
     let allow_tls13 = std::env::args().any(|a| a == "--tls13");
+    // `--sni <name>` adds a server_name extension; the default (like AOSP) sends none.
+    let server_name = std::env::args().skip_while(|a| a != "--sni").nth(1);
     let cfg = EapTlsConfig {
         identity: b"900999990302421609@prodepdg.t-mobile.com".to_vec(),
         client_cert_pem: std::fs::read_to_string(format!("{dir}client.crt")).unwrap(),
         client_key_pem: std::fs::read_to_string(format!("{dir}client.key")).unwrap(),
         validate_server: false,
         server_ca_pem: None,
-        server_name: ServerName::IpAddress("208.54.40.79".parse::<IpAddr>().unwrap().into()),
+        server_name,
         max_fragment_len: 1024,
         allow_tls13,
     };

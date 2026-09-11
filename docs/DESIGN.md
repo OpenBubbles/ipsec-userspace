@@ -562,6 +562,8 @@ crate.** The `EapTlsClient` / `EapTlsConfig` / `EapAction` API in `eap/tls.rs` (
 - `EapTlsConfig.server_name: ServerName<'static>` becomes `server_name: Option<String>` — SNI to send; `None` = no SNI
   (the default; AOSP sends none).
 - `Error::Tls` carries a `String` (no rustls type).
+- `protocol_version()` returns `Option<&str>` (OpenSSL name, e.g. `"TLSv1.2"`) and the new `cipher_name()` returns the
+  negotiated suite (e.g. `"AES128-SHA"`); both are known once the ServerHello has been processed.
 Engine rules: `SslMethod::tls_client()`, min/max proto TLS 1.2 (max 1.3 only when `allow_tls13`), `SslVerifyMode::NONE`
 unless `validate_server` (then the PEM CA bundle), client leaf cert + key (PKCS#8/PKCS#1/SEC1 PEM), cipher list
 `"DEFAULT:@SECLEVEL=1"` so `AES128-SHA` (0x002F) is offered alongside modern suites, no SNI unless configured,

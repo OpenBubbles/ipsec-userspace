@@ -1,4 +1,4 @@
-//! EAP-TLS method (RFC 5216; TLS 1.3 keying per RFC 9190), backed by rustls.
+//! EAP-TLS method (RFC 5216; TLS 1.3 keying per RFC 9190), backed by OpenSSL.
 //!
 //! Type 13. Type-Data = `Flags(1) | [TLS Message Length(4) if L] | TLS data`.
 //! Flags: L = 0x80 (length included), M = 0x40 (more fragments), S = 0x20 (start),
@@ -17,20 +17,28 @@
 //!   [`EapAction::Success`]; an EAP-Success before completion is a fatal [`EapAction::Failure`];
 //! - responses always echo the request identifier.
 //!
+//! TLS engine (`docs/DESIGN.md` §9.3): OpenSSL, because the T-Mobile ePDG negotiates only
+//! `TLS_RSA_WITH_AES_128_CBC_SHA` (0x002F, TLS 1.2) — RSA key exchange + CBC, which rustls does
+//! not implement. The cipher list is [`CIPHER_LIST`] so that suite is offered next to modern
+//! ones. The connection is driven sans-I/O through an in-memory duplex: the server's TLS bytes
+//! are queued into the duplex inbox, `SslStream::connect()` is stepped (`WANT_READ` = wait for
+//! the next server flight, `Ok` = handshake complete), and the outbox is drained into the
+//! EAP-TLS fragment queue after every step.
+//!
 //! Key material: 128 exporter bytes; MSK = `[..64]`, EMSK = `[64..]`.
 //! TLS 1.2: label `"client EAP encryption"`, no context (RFC 5216 §2.3).
 //! TLS 1.3: label `"EXPORTER_EAP_TLS_Key_Material"`, context `[0x0D]` (RFC 9190 §2.1).
 
-use std::io;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::net::IpAddr;
 
 use log::{debug, info, warn};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::{
-    AlertDescription, ClientConfig, ClientConnection, DigitallySignedStruct, ProtocolVersion, RootCertStore,
-    SignatureScheme,
-};
+use openssl::error::ErrorStack;
+use openssl::pkey::PKey;
+use openssl::ssl::{ErrorCode, Ssl, SslContext, SslMethod, SslOptions, SslRef, SslStream, SslVerifyMode, SslVersion};
+use openssl::x509::verify::X509CheckFlags;
+use openssl::x509::{X509, X509VerifyResult};
 use zeroize::Zeroizing;
 
 use super::packet::EapPacket;
@@ -48,6 +56,10 @@ const MSK_LEN: usize = 64;
 pub const MAX_INBOUND_TLS_FLIGHT: usize = 256 * 1024;
 /// Largest outbound fragment that still fits an EAP packet (RFC 3748 Length is u16).
 pub const MAX_OUTBOUND_FRAGMENT_LEN: usize = u16::MAX as usize - 10;
+/// OpenSSL cipher list for the TLS <= 1.2 ClientHello: `DEFAULT` at security level 1, so
+/// `AES128-SHA` (`TLS_RSA_WITH_AES_128_CBC_SHA`, 0x002F — the only suite the T-Mobile ePDG
+/// accepts) is offered alongside the ECDHE/AEAD suites.
+pub const CIPHER_LIST: &str = "DEFAULT:@SECLEVEL=1";
 
 /// Configuration for one EAP-TLS session.
 pub struct EapTlsConfig {
@@ -61,8 +73,10 @@ pub struct EapTlsConfig {
     pub validate_server: bool,
     /// Trust anchors (PEM bundle) used when `validate_server` is set.
     pub server_ca_pem: Option<String>,
-    /// TLS server name. `ServerName::IpAddress` sends no SNI (AOSP sends none).
-    pub server_name: ServerName<'static>,
+    /// TLS server name: sent as SNI (unless it is an IP literal, which RFC 6066 §3 forbids)
+    /// and, when `validate_server` is set, checked against the server certificate.
+    /// `None` = no SNI and no hostname check (the default; AOSP sends none).
+    pub server_name: Option<String>,
     /// Outbound fragment size in TLS-data bytes; 0 = [`DEFAULT_MAX_FRAGMENT_LEN`].
     pub max_fragment_len: usize,
     /// Also offer TLS 1.3 (AOSP is TLS 1.2 only).
@@ -173,13 +187,57 @@ struct RxBuffer {
     capacity: usize,
 }
 
+/// In-memory transport under the [`SslStream`]: OpenSSL reads the peer's TLS bytes from
+/// `inbox` (an empty inbox reads as `WouldBlock`, which `connect()` reports as
+/// `ErrorCode::WANT_READ`) and writes its own records into `outbox`.
+#[derive(Default)]
+struct Duplex {
+    inbox: VecDeque<u8>,
+    outbox: Vec<u8>,
+}
+
+impl Read for Duplex {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.inbox.is_empty() {
+            return Err(io::ErrorKind::WouldBlock.into());
+        }
+        self.inbox.read(buf)
+    }
+}
+
+impl Write for Duplex {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.outbox.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> { Ok(()) }
+}
+
+/// Protocol version and cipher suite as reported by OpenSSL once the ServerHello is in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Negotiated {
+    version: String,
+    cipher: String,
+}
+
+fn negotiated(ssl: &SslRef) -> Option<Negotiated> {
+    let cipher = ssl.current_cipher()?;
+    Some(Negotiated { version: ssl.version_str().to_string(), cipher: cipher.name().to_string() })
+}
+
 /// The EAP-TLS client state machine (sans-I/O, synchronous).
 pub struct EapTlsClient {
     identity: Vec<u8>,
-    tls_config: Arc<ClientConfig>,
-    server_name: ServerName<'static>,
+    tls_ctx: SslContext,
+    server_name: Option<String>,
+    validate_server: bool,
     max_fragment_len: usize,
-    conn: Option<ClientConnection>,
+    conn: Option<SslStream<Duplex>>,
+    /// `connect()` returned `Ok`: from here on inbound records are post-handshake data
+    /// (TLS 1.3 NewSessionTicket, the RFC 9190 commitment byte) consumed via `ssl_read`.
+    handshake_done: bool,
+    negotiated: Option<Negotiated>,
     rx: Option<RxBuffer>,
     /// Outbound TLS bytes awaiting transmission; `tx_offset` = bytes already sent.
     tx: Vec<u8>,
@@ -193,6 +251,8 @@ impl std::fmt::Debug for EapTlsClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EapTlsClient")
             .field("state", &self.state)
+            .field("handshake_done", &self.handshake_done)
+            .field("negotiated", &self.negotiated)
             .field("tx_pending", &(self.tx.len() - self.tx_offset))
             .field("rx_pending", &self.rx.as_ref().map(|r| (r.buf.len(), r.capacity)))
             .field("msk", &self.msk.as_ref().map(|_| "<derived>"))
@@ -201,18 +261,21 @@ impl std::fmt::Debug for EapTlsClient {
 }
 
 impl EapTlsClient {
-    /// Build the rustls configuration up front so PEM / trust-store errors surface early.
+    /// Build the OpenSSL context up front so PEM / trust-store errors surface early.
     pub fn new(cfg: EapTlsConfig) -> Result<Self> {
-        let tls_config = build_client_config(&cfg)?;
+        let tls_ctx = build_context(&cfg)?;
         // Clamp so EAP hdr(4) + type(1) + flags(1) + L(4) + data always fits the 16-bit Length.
         let max_fragment_len = if cfg.max_fragment_len == 0 { DEFAULT_MAX_FRAGMENT_LEN } else { cfg.max_fragment_len }
             .min(MAX_OUTBOUND_FRAGMENT_LEN);
         Ok(EapTlsClient {
             identity: cfg.identity,
-            tls_config,
-            server_name: cfg.server_name,
+            tls_ctx,
+            server_name: cfg.server_name.filter(|n| !n.is_empty()),
+            validate_server: cfg.validate_server,
             max_fragment_len,
             conn: None,
+            handshake_done: false,
+            negotiated: None,
             rx: None,
             tx: Vec::new(),
             tx_offset: 0,
@@ -284,9 +347,16 @@ impl EapTlsClient {
         }
     }
 
-    /// Negotiated TLS protocol version, once known.
-    pub fn protocol_version(&self) -> Option<ProtocolVersion> {
-        self.conn.as_ref().and_then(|c| c.protocol_version())
+    /// Negotiated TLS protocol version (OpenSSL's name, e.g. `"TLSv1.2"`), once the
+    /// ServerHello has been processed.
+    pub fn protocol_version(&self) -> Option<&str> {
+        self.negotiated.as_ref().map(|n| n.version.as_str())
+    }
+
+    /// Negotiated cipher suite (OpenSSL's name, e.g. `"AES128-SHA"`), once the ServerHello
+    /// has been processed.
+    pub fn cipher_name(&self) -> Option<&str> {
+        self.negotiated.as_ref().map(|n| n.cipher.as_str())
     }
 
     /// The 64-byte MSK, available as soon as the handshake completed.
@@ -350,15 +420,36 @@ impl EapTlsClient {
     }
 
     fn start_handshake(&mut self) -> Result<()> {
-        info!("EAP-TLS Start: opening TLS client session");
-        let mut conn = ClientConnection::new(self.tls_config.clone(), self.server_name.clone())?;
-        let mut tx = Vec::new();
-        drain_writes(&mut conn, &mut tx)?;
+        info!(
+            "EAP-TLS Start: opening TLS client session (SNI: {})",
+            self.server_name.as_deref().unwrap_or("none")
+        );
+        let mut ssl = Ssl::new(&self.tls_ctx).map_err(tls_err)?;
+        if let Some(name) = &self.server_name {
+            let ip = name.parse::<IpAddr>().ok();
+            match ip {
+                Some(_) => debug!("EAP-TLS: server_name {name:?} is an IP literal; no SNI is sent (RFC 6066 §3)"),
+                None => ssl.set_hostname(name).map_err(tls_err)?,
+            }
+            if self.validate_server {
+                let param = ssl.param_mut();
+                param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
+                match ip {
+                    Some(ip) => param.set_ip(ip),
+                    None => param.set_host(name),
+                }
+                .map_err(tls_err)?;
+            }
+        }
+        self.conn = Some(SslStream::new(ssl, Duplex::default()).map_err(tls_err)?);
+        self.handshake_done = false;
+        self.negotiated = None;
+        self.step_tls()?;
+        let tx = self.take_outbox();
         if tx.is_empty() {
             return Err(Error::Eap("TLS client produced no ClientHello".into()));
         }
         debug!("EAP-TLS ClientHello: {} bytes", tx.len());
-        self.conn = Some(conn);
         self.tx = tx;
         self.tx_offset = 0;
         Ok(())
@@ -467,21 +558,14 @@ impl EapTlsClient {
             .as_mut()
             .ok_or_else(|| Error::protocol("EAP-TLS data before the TLS session was started"))?;
         debug!("EAP-TLS feeding {} bytes to TLS", msg.len());
-        feed_reads(conn, msg)?;
-        let mut tx = Vec::new();
-        drain_writes(conn, &mut tx)?;
-        let handshaking = conn.is_handshaking();
-        debug!("EAP-TLS after TLS processing: {} bytes to send, handshaking={handshaking}", tx.len());
-
-        if !handshaking && self.msk.is_none() {
-            let version = conn
-                .protocol_version()
-                .ok_or_else(|| Error::Eap("TLS handshake complete but no protocol version".into()))?;
-            let (msk, emsk) = derive_key_material(conn, version)?;
-            info!("EAP-TLS handshake complete ({version:?}); MSK/EMSK derived");
-            self.msk = Some(msk);
-            self.emsk = Some(emsk);
-        }
+        conn.get_mut().inbox.extend(msg);
+        self.step_tls()?;
+        let tx = self.take_outbox();
+        debug!(
+            "EAP-TLS after TLS processing: {} bytes to send, handshake_done={}",
+            tx.len(),
+            self.handshake_done
+        );
 
         if !tx.is_empty() {
             self.tx = tx;
@@ -499,111 +583,110 @@ impl EapTlsClient {
                 .into(),
         ))
     }
-}
 
-// ---- rustls plumbing ------------------------------------------------------------------
+    // ---- OpenSSL plumbing ---------------------------------------------------------------
 
-/// Push TLS bytes into the connection and process them, looping until all are consumed.
-fn feed_reads(conn: &mut ClientConnection, msg: &[u8]) -> Result<()> {
-    let mut consumed = 0;
-    while consumed < msg.len() {
-        let mut rd = &msg[consumed..];
-        let n = conn
-            .read_tls(&mut rd)
-            .map_err(|e| Error::Eap(format!("TLS read_tls failed: {e}")))?;
-        if n == 0 {
-            return Err(Error::Eap("TLS engine refused input (connection closed?)".into()));
+    /// Advance the TLS engine over whatever is in the duplex inbox.
+    ///
+    /// Before completion this is one `connect()` step: `Ok` = handshake complete (the
+    /// MSK/EMSK are exported right away), `WANT_READ` = the next server flight is needed,
+    /// anything else = [`Error::Tls`]. After completion it lets OpenSSL consume
+    /// post-handshake records (TLS 1.3 NewSessionTicket, the RFC 9190 commitment byte).
+    fn step_tls(&mut self) -> Result<()> {
+        let conn = self
+            .conn
+            .as_mut()
+            .ok_or_else(|| Error::protocol("EAP-TLS data before the TLS session was started"))?;
+        if !self.handshake_done {
+            match conn.connect() {
+                Ok(()) => {
+                    self.handshake_done = true;
+                    let ssl = conn.ssl();
+                    let neg = negotiated(ssl)
+                        .ok_or_else(|| Error::Tls("handshake complete but OpenSSL reports no cipher suite".into()))?;
+                    let tls13 = ssl.version2() == Some(SslVersion::TLS1_3);
+                    let (msk, emsk) = derive_key_material(ssl, tls13)?;
+                    info!("EAP-TLS handshake complete: {} {}; MSK/EMSK derived", neg.version, neg.cipher);
+                    self.negotiated = Some(neg);
+                    self.msk = Some(msk);
+                    self.emsk = Some(emsk);
+                }
+                Err(e) if e.code() == ErrorCode::WANT_READ => {
+                    if let Some(neg) = negotiated(conn.ssl())
+                        && self.negotiated.as_ref() != Some(&neg)
+                    {
+                        info!("EAP-TLS ServerHello: {} {}", neg.version, neg.cipher);
+                        self.negotiated = Some(neg);
+                    }
+                    let leftover = conn.get_ref().inbox.len();
+                    debug!("EAP-TLS handshake in progress; waiting for the next server flight ({leftover} bytes buffered)");
+                }
+                Err(e) => return Err(handshake_error(conn.ssl(), e)),
+            }
+        } else {
+            let mut sink = [0u8; 256];
+            loop {
+                match conn.ssl_read(&mut sink) {
+                    Ok(0) => break,
+                    Ok(n) => debug!(
+                        "EAP-TLS: {n} bytes of TLS application data after the handshake ignored \
+                         (EAP-TLS carries none; RFC 9190 commitment message)"
+                    ),
+                    Err(e) if e.code() == ErrorCode::WANT_READ => break,
+                    Err(e) if e.code() == ErrorCode::ZERO_RETURN => {
+                        debug!("EAP-TLS: server sent close_notify after the handshake");
+                        break;
+                    }
+                    Err(e) => return Err(handshake_error(conn.ssl(), e)),
+                }
+            }
         }
-        consumed += n;
-        conn.process_new_packets().map_err(map_tls_error)?;
+        Ok(())
     }
-    Ok(())
-}
 
-/// Collect every pending outbound TLS record.
-fn drain_writes(conn: &mut ClientConnection, out: &mut Vec<u8>) -> Result<()> {
-    while conn.wants_write() {
-        let n = conn.write_tls(out).map_err(Error::Io)?;
-        if n == 0 {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn map_tls_error(e: rustls::Error) -> Error {
-    match e {
-        rustls::Error::AlertReceived(AlertDescription::HandshakeFailure) => Error::Eap(
-            "TLS handshake_failure alert from server: no common cipher suite (rustls offers only ECDHE + AEAD \
-             suites for TLS 1.2; a server insisting on RSA key exchange or CBC suites cannot be served)"
-                .into(),
-        ),
-        other => Error::Tls(other),
+    /// Collect every record OpenSSL wrote since the last call.
+    fn take_outbox(&mut self) -> Vec<u8> {
+        self.conn.as_mut().map(|c| std::mem::take(&mut c.get_mut().outbox)).unwrap_or_default()
     }
 }
 
-fn derive_key_material(
-    conn: &ClientConnection,
-    version: ProtocolVersion,
-) -> Result<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>)> {
-    let (label, context): (&[u8], Option<&[u8]>) = match version {
-        ProtocolVersion::TLSv1_3 => (b"EXPORTER_EAP_TLS_Key_Material", Some(&[0x0D])),
-        _ => (b"client EAP encryption", None),
+fn tls_err(e: ErrorStack) -> Error {
+    Error::Tls(e.to_string())
+}
+
+/// Map a failed `connect()`/`ssl_read()` to [`Error::Tls`], adding the X.509 verification
+/// result when the server certificate was the problem.
+fn handshake_error(ssl: &SslRef, e: openssl::ssl::Error) -> Error {
+    let mut msg = format!("handshake failed: {e}");
+    let vr = ssl.verify_result();
+    if vr != X509VerifyResult::OK {
+        msg.push_str(&format!(" (server certificate verification: {})", vr.error_string()));
+    }
+    if msg.contains("handshake failure") {
+        msg.push_str(" (the server rejected every offered cipher suite / protocol version)");
+    }
+    Error::Tls(msg)
+}
+
+/// `(MSK, EMSK)`, 64 bytes each.
+type KeyMaterial = (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>);
+
+fn derive_key_material(ssl: &SslRef, tls13: bool) -> Result<KeyMaterial> {
+    let (label, context): (&str, Option<&[u8]>) = if tls13 {
+        ("EXPORTER_EAP_TLS_Key_Material", Some(&[0x0D]))
+    } else {
+        ("client EAP encryption", None)
     };
-    let km = Zeroizing::new(
-        conn.export_keying_material(vec![0u8; KEY_MATERIAL_LEN], label, context)
-            .map_err(|e| Error::Eap(format!("TLS exporter failed: {e}")))?,
-    );
+    let mut km = Zeroizing::new([0u8; KEY_MATERIAL_LEN]);
+    ssl.export_keying_material(&mut km[..], label, context)
+        .map_err(|e| Error::Tls(format!("TLS exporter failed: {e}")))?;
     let msk = Zeroizing::new(km[..MSK_LEN].to_vec());
     let emsk = Zeroizing::new(km[MSK_LEN..].to_vec());
     Ok((msk, emsk))
 }
 
-/// Trust-all server certificate verifier (AOSP `validateServerCert=false`).
-#[derive(Debug)]
-struct NoVerify {
-    schemes: Vec<SignatureScheme>,
-}
-
-impl ServerCertVerifier for NoVerify {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.schemes.clone()
-    }
-}
-
-fn parse_certs(pem: &str, what: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let mut rd = io::Cursor::new(pem.as_bytes());
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
-        .collect::<std::result::Result<_, _>>()
+fn parse_certs(pem: &str, what: &str) -> Result<Vec<X509>> {
+    let certs = X509::stack_from_pem(pem.as_bytes())
         .map_err(|e| Error::config(format!("{what}: invalid certificate PEM: {e}")))?;
     if certs.is_empty() {
         return Err(Error::config(format!("{what}: no certificate found in PEM")));
@@ -611,112 +694,220 @@ fn parse_certs(pem: &str, what: &str) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
-fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
-    let mut rd = io::Cursor::new(pem.as_bytes());
-    rustls_pemfile::private_key(&mut rd)
-        .map_err(|e| Error::config(format!("client key: invalid PEM: {e}")))?
-        .ok_or_else(|| Error::config("client key: no private key found in PEM"))
-}
+/// The per-session OpenSSL context (`docs/DESIGN.md` §9.3): TLS 1.2 only unless
+/// `allow_tls13`, trust-all or the PEM CA bundle, client leaf + key, [`CIPHER_LIST`].
+fn build_context(cfg: &EapTlsConfig) -> Result<SslContext> {
+    let mut b = SslContext::builder(SslMethod::tls_client()).map_err(tls_err)?;
+    b.set_options(SslOptions::NO_COMPRESSION);
+    b.set_min_proto_version(Some(SslVersion::TLS1_2)).map_err(tls_err)?;
+    let max = if cfg.allow_tls13 { SslVersion::TLS1_3 } else { SslVersion::TLS1_2 };
+    b.set_max_proto_version(Some(max)).map_err(tls_err)?;
+    b.set_cipher_list(CIPHER_LIST).map_err(tls_err)?;
 
-fn build_client_config(cfg: &EapTlsConfig) -> Result<Arc<ClientConfig>> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let versions: &[&rustls::SupportedProtocolVersion] = if cfg.allow_tls13 {
-        &[&rustls::version::TLS12, &rustls::version::TLS13]
-    } else {
-        &[&rustls::version::TLS12]
-    };
-    let builder = ClientConfig::builder_with_provider(provider.clone()).with_protocol_versions(versions)?;
-
-    let builder = if cfg.validate_server {
+    if cfg.validate_server {
         let ca_pem = cfg.server_ca_pem.as_deref().ok_or_else(|| {
             Error::config("validate_server_cert is set but no server CA PEM was provided (no system trust store)")
         })?;
-        let mut roots = RootCertStore::empty();
-        for cert in parse_certs(ca_pem, "server CA")? {
-            roots.add(cert)?;
+        let anchors = parse_certs(ca_pem, "server CA")?;
+        let count = anchors.len();
+        for cert in anchors {
+            b.cert_store_mut()
+                .add_cert(cert)
+                .map_err(|e| Error::config(format!("server CA: cannot add trust anchor: {e}")))?;
         }
-        info!("EAP-TLS: validating server certificate against {} trust anchor(s)", roots.len());
-        builder.with_root_certificates(roots)
+        b.set_verify(SslVerifyMode::PEER);
+        info!(
+            "EAP-TLS: validating server certificate against {count} trust anchor(s); hostname check {}",
+            match cfg.server_name.as_deref() {
+                Some(n) if !n.is_empty() => format!("against {n:?}"),
+                _ => "off (no server_name configured)".into(),
+            }
+        );
     } else {
         warn!("EAP-TLS: server certificate validation DISABLED (trust-all, as configured)");
-        let schemes = provider.signature_verification_algorithms.supported_schemes();
-        builder.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify { schemes }))
-    };
+        b.set_verify(SslVerifyMode::NONE);
+    }
 
     let mut certs = parse_certs(&cfg.client_cert_pem, "client certificate")?;
     if certs.len() > 1 {
         debug!("EAP-TLS: client PEM has {} certificates; sending the leaf only", certs.len());
         certs.truncate(1);
     }
-    let key = parse_private_key(&cfg.client_key_pem)?;
-    let config = builder.with_client_auth_cert(certs, key)?;
-    Ok(Arc::new(config))
+    let key = PKey::private_key_from_pem(cfg.client_key_pem.as_bytes())
+        .map_err(|e| Error::config(format!("client key: invalid PEM: {e}")))?;
+    b.set_certificate(&certs[0])
+        .map_err(|e| Error::config(format!("client certificate: {e}")))?;
+    b.set_private_key(&key)
+        .map_err(|e| Error::config(format!("client key: {e}")))?;
+    b.check_private_key()
+        .map_err(|e| Error::config(format!("client certificate and key do not match: {e}")))?;
+    Ok(b.build())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-    use rustls::{DistinguishedName, ServerConfig, ServerConnection};
-    use std::net::{IpAddr, Ipv4Addr};
+    use openssl::ssl::SslContextBuilder;
 
     const CLIENT_CERT_PEM: &str = include_str!("../../tests/fixtures/client.crt");
     const CLIENT_KEY_PEM: &str = include_str!("../../tests/fixtures/client.key");
 
-    // Static EC P-256 test PKI (valid until 2126), generated once with the openssl CLI:
-    //   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 36500 \
-    //     -subj "/CN=epdg-test-ca" -addext "basicConstraints=critical,CA:TRUE" \
-    //     -addext "keyUsage=critical,keyCertSign,cRLSign" -keyout ca.key -out ca.crt
-    //   openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
-    //     -subj "/CN=epdg-test-server" -keyout server.key -out server.csr
+    // Static RSA-2048 test PKI (valid until 2126), generated once with the openssl CLI. RSA
+    // (not EC) so the server can do RSA key exchange, i.e. TLS_RSA_WITH_AES_128_CBC_SHA:
+    //   openssl req -x509 -newkey rsa:2048 -nodes -days 36500 -subj "/CN=epdg-test-rsa-ca" \
+    //     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" \
+    //     -keyout ca.key -out ca.crt
+    //   openssl req -new -newkey rsa:2048 -nodes -subj "/CN=epdg-test-rsa-server" -keyout server.key -out server.csr
     //   openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 36500 \
     //     -extfile <(printf "subjectAltName=IP:127.0.0.1,DNS:localhost\nbasicConstraints=CA:FALSE\n\
-    //                        keyUsage=digitalSignature\nextendedKeyUsage=serverAuth\n") -out server.crt
+    //                        keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n") -out server.crt
+    //   openssl req -new -newkey rsa:2048 -nodes -subj "/CN=epdg-test-rsa-client" -keyout client.key -out client.csr
+    //   openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 36500 \
+    //     -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\n") -out client.crt
     const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBljCCATugAwIBAgIUSVmbkn1ma9DZM1EstSjBVzx0vPswCgYIKoZIzj0EAwIw
-FzEVMBMGA1UEAwwMZXBkZy10ZXN0LWNhMCAXDTI2MDkxMTA2NTgxOFoYDzIxMjYw
-ODE4MDY1ODE4WjAXMRUwEwYDVQQDDAxlcGRnLXRlc3QtY2EwWTATBgcqhkjOPQIB
-BggqhkjOPQMBBwNCAARXVPwk2yGKTy0dObsooI/pCFtq2A7wIwoyrj8bEw0DA9CR
-6SdDenXTiVbVhVEa72qWvZtINhHAQxsqw2rsHJLCo2MwYTAdBgNVHQ4EFgQUrD07
-ivBZrHFEmKx3S2lzQ+FAAvMwHwYDVR0jBBgwFoAUrD07ivBZrHFEmKx3S2lzQ+FA
-AvMwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwID
-SQAwRgIhAPykK9NL9hoK5Ahs6fiu/TAU72rPUO12nf3oACZXB2mDAiEArUbK78pQ
-ZXvJixAi4hPuxxbH1U6BhWObym2/HOiLUAc=
+MIIDKTCCAhGgAwIBAgIUZSVBwyJCcwRWPIEljjP8QcRIJSMwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQZXBkZy10ZXN0LXJzYS1jYTAgFw0yNjA5MTEwODAzNDRa
+GA8yMTI2MDgxODA4MDM0NFowGzEZMBcGA1UEAwwQZXBkZy10ZXN0LXJzYS1jYTCC
+ASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMxP/R4vWKCWSF/3CMkJBv8N
+uEWRuIpdVxxNI8r0VzcVOP+SUpZYimWM0lxVX+tV1/V0CQe+ORwQHs4KUA3IQtAF
+LZ9O9pFz+7mHEbMUkFtyIAemNJdZdGzeuuUR/vBYtEzlVS4JZnLFD5SkUYt9H0ML
+68bdMuaCEFr31OZriNQoDhJ2zmajAvgVqQyIQymIkSYGlRkQVgYDYTZUNptly261
+pLCoTLUTW+5+fGTS7L+94wgXLUQkXr1KM4qyIHLFJtsTY6EJYQVMrKwao+ELteW2
+knxK+djzkToYPnI128ROvTrQ6cSbwx4aWzUaBl+SSMWqliGhy9cx51UXlA7xE0kC
+AwEAAaNjMGEwHQYDVR0OBBYEFHBLs5dKZbngI8VmdYvicY/Q8dLEMB8GA1UdIwQY
+MBaAFHBLs5dKZbngI8VmdYvicY/Q8dLEMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0P
+AQH/BAQDAgEGMA0GCSqGSIb3DQEBCwUAA4IBAQBGuHtflINDcjjsKIAoblmX380I
+EaWQWfvkMvOiiOqmzB/niTq0EYeD6hmqeNmae8PTQ/mh4oHtHBQyTIiZWTDw3ALK
+p80uZzBg1o6at564f7FfxW/NMOLLQZI8yT0Mqx0Jd994YHIY9bQVigBvVQBIABno
+hLYHBFACa/0STr2AWMOS22A7Hc8YN00riDSuHnX5lQdzrjfAayt8FjvnfPGGRNmr
+M6OYy3eX22l2eTjmp4z6Fye7JP7Geo1NNjm4EnrQEHKhmp9q9XiudT0+bhdJXB6D
+fOW14rrIi7moFkbmTTjH2kEnTGqk7BmO3D8xfNyANzPAq4ZBSIO+TvnQcOl1
 -----END CERTIFICATE-----
 ";
     const SERVER_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
-MIIBwzCCAWmgAwIBAgIUZh/yEw+WFVkQkqoNttOQkRcDWiUwCgYIKoZIzj0EAwIw
-FzEVMBMGA1UEAwwMZXBkZy10ZXN0LWNhMCAXDTI2MDkxMTA2NTgxOFoYDzIxMjYw
-ODE4MDY1ODE4WjAbMRkwFwYDVQQDDBBlcGRnLXRlc3Qtc2VydmVyMFkwEwYHKoZI
-zj0CAQYIKoZIzj0DAQcDQgAEsy5tLB4tIvteNdpzZ3Ai7IWg54BtZSk7qFGWc+f2
-noaz1moOG1eQceI5TdtLXINKakY+7v5RK+9zBiq/LVO2mKOBjDCBiTAaBgNVHREE
-EzARhwR/AAABgglsb2NhbGhvc3QwCQYDVR0TBAIwADALBgNVHQ8EBAMCB4AwEwYD
-VR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFJT07xOQaa5qAhtuDA0TW3FcqlyY
-MB8GA1UdIwQYMBaAFKw9O4rwWaxxRJisd0tpc0PhQALzMAoGCCqGSM49BAMCA0gA
-MEUCIH+XOABG6LVGV8SCN11nPrjRjhblFcBvvumhPJxzd7MxAiEA3RnpDfCN3QBW
-UbUVMJCch6so8IVIwkHjxJZQOdEIdGE=
+MIIDVzCCAj+gAwIBAgIUT3aewf+r0D//Nkhlh32glXDVbAYwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQZXBkZy10ZXN0LXJzYS1jYTAgFw0yNjA5MTEwODAzNDRa
+GA8yMTI2MDgxODA4MDM0NFowHzEdMBsGA1UEAwwUZXBkZy10ZXN0LXJzYS1zZXJ2
+ZXIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDQdTtkh4i2oLT/WBoS
+ZIfQs9/7T1p2q0gxFY3XWyIEF2OI3DUbv4JTC30YIhnnO7kXgct4ccTnzKpl4CF1
+uwICyFBoOlDWHp3Q576muW6/DKwrrGu7qJye8N/4r9/PVVTMoonGDNBPpMhEyU/A
+X9CV7GzhW//PLrOeMiy1WuxzMbd+20j3+cpHmZVP5+An5Dg+k7ogi8GfX2zV12oT
+0eK2brmN01xG7Cm9tUKBulC5PTp+uxe2wPuQE8DE0xb2XTZUIwXcEUBDQIsZ3Mff
+5JMPYUHfMXzDIDAEEueW7B0QwcV4lBsA/FZi3L4uPXMMGG0Rn7ANslwCwWwSZNOD
+AOQzAgMBAAGjgYwwgYkwGgYDVR0RBBMwEYcEfwAAAYIJbG9jYWxob3N0MAkGA1Ud
+EwQCMAAwCwYDVR0PBAQDAgWgMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQW
+BBQG11OPtJQWpULP6B5fb02fZJ7JoTAfBgNVHSMEGDAWgBRwS7OXSmW54CPFZnWL
+4nGP0PHSxDANBgkqhkiG9w0BAQsFAAOCAQEALNXAIckdvU9Ck8owUTQRcBx9iMOF
+HEWtRd2SPTjWM/xpmXojHmENyFLZfXOFxEvkvNT8TCNXVDU+qo0Xf4joUMyAlcMY
+gBJucTMtVxHe6HVHwUcsJNr1+8LKGr40yMs+JQpFoyTXz+WF1IHqxKfk6P2Sq+fv
+vXgeJSFRWJsiGIIV6H4J7yOeN1At5AElHsToFFd+zs4G1g/ZDyr2mKI03kmprWOp
+9tBRWf5D0VpkR1KNRXyPl2nYq17ULqvsEC1JMW8LG/lkp2E5YLx6A8qL8BcMRQ/A
+rexvNdpEeE6VFvwWo6HTTYcCUZMOGTqgj0scfLoOkWYcxNBIbHmRmTl47w==
 -----END CERTIFICATE-----
 ";
     const SERVER_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgy/+mW9SHraGtpU6f
-VZALz/3/qX+RTbYyOm9TV/KHBamhRANCAASzLm0sHi0i+1412nNncCLshaDngG1l
-KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDQdTtkh4i2oLT/
+WBoSZIfQs9/7T1p2q0gxFY3XWyIEF2OI3DUbv4JTC30YIhnnO7kXgct4ccTnzKpl
+4CF1uwICyFBoOlDWHp3Q576muW6/DKwrrGu7qJye8N/4r9/PVVTMoonGDNBPpMhE
+yU/AX9CV7GzhW//PLrOeMiy1WuxzMbd+20j3+cpHmZVP5+An5Dg+k7ogi8GfX2zV
+12oT0eK2brmN01xG7Cm9tUKBulC5PTp+uxe2wPuQE8DE0xb2XTZUIwXcEUBDQIsZ
+3Mff5JMPYUHfMXzDIDAEEueW7B0QwcV4lBsA/FZi3L4uPXMMGG0Rn7ANslwCwWwS
+ZNODAOQzAgMBAAECggEABEafiQTOKW/Jqt0tlgtdYYDH4sVhh3iDKfh6cw8fn4Zw
+qTPuSw20gblqNZpiutijUdslG7MtS7hwnFePuqrHTyzu9o7ggflWAfSjmQxd/5If
+UQVIMxHg4qnW4uU9EHa/wNU7hLVjruaJQuPx6C65DwjyOnuVidXnUmYmLgqqirNE
+r9byy4wWf6/OyY883AtK/I9EijV5F7jqQYxlq/UEcW9NpIPcLULCRXHp4Lp5B6XD
+ywE9XQNdxcVdYrJjitiAz4/RPVwRSynhF2pd1guQqAJPQWIxeDGNlMi16H1HnrR4
+7fDEmYT7jbfUkYUadhRLxuIX428pTV2oxPA+BdEosQKBgQD24cPlZ7N1TiUNdxsL
+a7NRL0rfS5CKWsoJ1h5EaTW9R/SoOkt9JMxDGY0asPsjI4KfDuuQzsczFX3206Wm
+L2BcIMtRtmt/5xmLDvIwhQ618JrKKyyGLqZFdT6AppX/OCVNdgk670IHQrZNdIYI
++QQvk0bVK9yq2VLmfcKZ1rNaMQKBgQDYKCxpTrooalmVgNgoQecRah0kGUzLhkrP
+drYF7n6An8CrV76vd2bWQpQpN3W7LPLRIhtcPZkF0WRzjEehQ3an7F7+OkvYyrjg
+A3E4mFWwBKCCt3eO2C05Se6Lmse5tdBsBisS3ufvOSoURxOse0iG6tMblv0/XJNv
+e0YG5+EnowKBgHr6v2CZJbX7dU2d1ST9Q1ffnQZaV+fzjc0UkgM1/YUKQP9D+rKe
+D/ok0jtHifJZEAo3nnSF7Iiv3g2EJHICC5gY5e8QVcBi2ECC83Xj8g4DirfGhelZ
+d44F91qSoQl/aGWLtNFcuaFwQ+uVbecuVD12ucQak1Ov6jHS14tWfgUhAoGAIjZx
+mRVp5521ojErhWuw7BO0mxMaEZim3KF4fAXcpfUjJLuVpeYrM7yEAOYTT1X09N8G
+H5psTvxufs90QvUPodKK0ohdmumzS1mgIQoTffGtiiMJ3GUg+1FVXWlZNW6ul3p+
+dNUtNrMAkwcQ+RrmRtyCH3rNiKrZdyq20b7/5ysCgYBnaQSiv75b0rrVtfy7Ujeb
+0gBSPBO+Xk/6SXgaFsyl1pyjvc8v05DEz5MvJTf2IsIik2TlPsv54WQ1thkL2dDy
+aQu35Pa8sADwOPzP+Fwr+S75P5RllsiU6+bykOYj4JCrM8gZwEVBTJj+qoKnQ42+
+dKsS9b3yOHiDI15KZMkicQ==
+-----END PRIVATE KEY-----
+";
+    const TEST_CLIENT_CERT_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDOTCCAiGgAwIBAgIUT3aewf+r0D//Nkhlh32glXDVbAcwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQZXBkZy10ZXN0LXJzYS1jYTAgFw0yNjA5MTEwODAzNDRa
+GA8yMTI2MDgxODA4MDM0NFowHzEdMBsGA1UEAwwUZXBkZy10ZXN0LXJzYS1jbGll
+bnQwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC9z7+IfdLvv96zy/6B
+LglhIyDxXU/OoDy3YI2bwoyYoa7S+d6sLJktqusiXh2UjHKE+OFK6HOmZ6b44H+J
+Z1R7gQpUVFdTIepsiAxfiim+tFVR90Z+ol5rznCVECFEObpjQsaM6HbBDgHfocNy
+6Lx643hnLuX9dmYiZo3/jB8ilpcv6daRdjyznODdhNJgU76jhLIEJcy1jAluPC5R
+/IhCE5HgQOwuIDNzlfMY91OB1cHZHG91HbMDDRZCOnVTYWmNLIHjyVLPyLOUXgP8
+e7puc9pOxUwa+CBFuQamj8t3pYqzEou3c/bhOvzzVFsxE420slAGUvc+vBRbqbWE
+jcovAgMBAAGjbzBtMAkGA1UdEwQCMAAwCwYDVR0PBAQDAgeAMBMGA1UdJQQMMAoG
+CCsGAQUFBwMCMB0GA1UdDgQWBBTtUEkGk9UcPJo9690KaGkbuDoYszAfBgNVHSME
+GDAWgBRwS7OXSmW54CPFZnWL4nGP0PHSxDANBgkqhkiG9w0BAQsFAAOCAQEAbSRR
+Dy0IwwAx9ttP/uTH0KqP89crXOWHJFzK1QpqlstLkTDekeHiHPZhTrtHpMHCkT3h
+/fIKG8UFR1Jb7jY0cEaOlAyp513l/Wpl9Qd4DD+/LlBqF+KSnAP2DFhqcj970/du
+RYQW0khntmoCtEnlarfGUaXBAJrxOOMpFzEKfZvKKVfY/Avplymr0Ebm8mHZoaoX
+dKzQDwMJFXPnTM/TxntZ9ujdWZQOEWJJSUqkFItpLUIxTVV68TuETOACGFXHhmci
+AOANxn8iqw7rRXj6IGGjJzGkqUZdxOyMUQgbHKpMheu63im6n+rXTQXDBUp8nA5m
+dhZ2H73yh2pGbiVGCw==
+-----END CERTIFICATE-----
+";
+    const TEST_CLIENT_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9z7+IfdLvv96z
+y/6BLglhIyDxXU/OoDy3YI2bwoyYoa7S+d6sLJktqusiXh2UjHKE+OFK6HOmZ6b4
+4H+JZ1R7gQpUVFdTIepsiAxfiim+tFVR90Z+ol5rznCVECFEObpjQsaM6HbBDgHf
+ocNy6Lx643hnLuX9dmYiZo3/jB8ilpcv6daRdjyznODdhNJgU76jhLIEJcy1jAlu
+PC5R/IhCE5HgQOwuIDNzlfMY91OB1cHZHG91HbMDDRZCOnVTYWmNLIHjyVLPyLOU
+XgP8e7puc9pOxUwa+CBFuQamj8t3pYqzEou3c/bhOvzzVFsxE420slAGUvc+vBRb
+qbWEjcovAgMBAAECggEAJIF6wGkWsyavUdw3kCfHBQgpE1LTgRV/Z/NpeN4ThV1/
+TrNg+LNBKK/ZNkxsmv/iHKHzTqFjcMs5qV8gGFCnxnMchfiMrP/2YrZNzug3PCbZ
+zABnbf6Tc1+KdpjaFRGXP/T9U+d3w4yKnrSxbv3FFkt+gjXaZQOrBA2+XLpZ2KBS
+G1DR8Th7C0W8qSj7NMtdJ/FAtQvxDhKskT0WxoiS03jI3v1B3ZdsybRK4k3mws3C
+TK8WcP5iS+67W/5KSe1QpZv7xxibDPGJQAc5UR2l2v9gNNFggBrZk/a0JoLN/bd/
++UA+R49mFy3gP+IiLGjfglLoSARTUoA0GHrxOmPDcQKBgQDdytiA1clb8tH4V8iV
+UwUHr7h1EyszqsNRN83ON6mm2duUZ6fVvTpSv8a1965CZEyo9wt8UOz5T8Q21nQC
+arpvpRKdmNYd3MU6uTGC7HdpbUhHi76CfI8816e3sBboJVHaI6H8b/lr7R5txeap
+UHTh5XXHqMGSCr9nLTiUMe/9PwKBgQDbFi8yIOSNkUgFQNcXXvaW9SFGGvUCrNrX
+9ZE80k6MEAzDVnQ1D8yS3GM/ZIQ9Q/4U9uBVsesjAJhKNR4NHBDAEJELPGkIlKPz
+ArVL6fyZYIWdTIPHwCh9vZOLms2SQ1vE778MQH0Ef5ezlqCpgjzB3MZgO+wDOFKd
+/uzoD77HEQKBgFSFa9JVJmIq/Adm9KKrO5x9Q48iGfGbnslBueVfYwCZv0sj4Vrb
+vPEx8jkARWE5tdkiJDdg453y3vSC7zzIjXnkb16tktNYgbTqREr/cFY19jiFsbkq
+XK+0A09GBMS9DB9UOvPnfCa7+z+cDlXxukkn16WZ0wKjo+Ne4VPgX/OjAoGBAJD9
+gYZ/VkKKX0t6ud5xrmgBGmA2/uciVkKN9ex2kh0HkirEUGu9ZPnceKI/d3TERqbB
+K34LHT4w6phRxu2OIVe6nwL8m9Zd6JKuvCTdWZp30nVjaeMMPL/acob1kA64HUec
+EqedFh+gAVmM2g7UbjkuTurpPSx0XdjKGScLJIrBAoGARg8tFUY8hoz3CO2z4sIm
+QxF+eM0Uh3ayaWES3piBELHxK4RhcsbrNrHQg5l43MazhuH+hKsrYa7zb5mhx2uP
+faUa5/97UXdp+Q369a+DnlvFGBpNFdwq3aKUEjdMUF5JFQw+Z1EPC6+6yA9q0V2l
+7NO/0MPv/XB0H9mUDhmZwpQ=
 -----END PRIVATE KEY-----
 ";
 
     const IDENTITY: &[u8] = b"900999990302421609@prodepdg.t-mobile.com";
 
+    /// The only suite the T-Mobile ePDG negotiates: TLS_RSA_WITH_AES_128_CBC_SHA (0x002F).
+    const TMOBILE_SUITE: &str = "AES128-SHA";
+    const TMOBILE_SUITE_ID: u16 = 0x002F;
+    const MODERN_SUITE: &str = "ECDHE-RSA-AES128-GCM-SHA256";
+
     fn client_cfg(validate: bool, tls13: bool) -> EapTlsConfig {
         EapTlsConfig {
             identity: IDENTITY.to_vec(),
-            client_cert_pem: CLIENT_CERT_PEM.to_string(),
-            client_key_pem: CLIENT_KEY_PEM.to_string(),
+            client_cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
+            client_key_pem: TEST_CLIENT_KEY_PEM.to_string(),
             validate_server: validate,
             server_ca_pem: if validate { Some(TEST_CA_PEM.to_string()) } else { None },
-            server_name: ServerName::from(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            server_name: None,
             max_fragment_len: 1024,
             allow_tls13: tls13,
         }
+    }
+
+    /// The real credential fixtures (issuer CA unknown to us).
+    fn fixture_client_cfg() -> EapTlsConfig {
+        EapTlsConfig { client_cert_pem: CLIENT_CERT_PEM.to_string(), client_key_pem: CLIENT_KEY_PEM.to_string(), ..client_cfg(false, false) }
     }
 
     fn request(id: u8, eap_type: u8, type_data: Vec<u8>) -> EapPacket {
@@ -736,6 +927,19 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
             EapAction::Send(p) => p,
             other => panic!("expected Send, got {other:?}"),
         }
+    }
+
+    /// Cipher suite ids offered by a ClientHello record (`16 03 01 len | 01 len3 | version(2)
+    /// random(32) session_id<1..> cipher_suites<2..> ...`).
+    fn client_hello_suites(record: &[u8]) -> Vec<u16> {
+        assert_eq!(record[0], 0x16, "handshake record");
+        assert_eq!(record[5], 0x01, "ClientHello");
+        let body = &record[9..];
+        let mut p = 2 + 32;
+        p += 1 + body[p] as usize;
+        let n = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        p += 2;
+        body[p..p + n].chunks(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect()
     }
 
     // ---- type-data codec ---------------------------------------------------------------
@@ -1003,6 +1207,7 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
         assert_eq!(td.data[1], 0x03);
         // ...ClientHello handshake type
         assert_eq!(td.data[5], 0x01);
+        assert!(c.protocol_version().is_none(), "nothing negotiated yet");
 
         // second Start is an error
         assert!(matches!(c.handle(&start_request(0x43)), Err(Error::Eap(_))));
@@ -1016,6 +1221,17 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
     }
 
     #[test]
+    fn client_hello_offers_tls_rsa_with_aes_128_cbc_sha() {
+        // The live finding behind the OpenSSL switch: the T-Mobile ePDG only accepts 0x002F.
+        let mut c = EapTlsClient::new(client_cfg(false, false)).unwrap();
+        let hello = expect_send(c.handle(&start_request(1)).unwrap());
+        let suites = client_hello_suites(&EapTlsData::decode(&hello.type_data).unwrap().data);
+        assert!(suites.contains(&TMOBILE_SUITE_ID), "ClientHello must offer 0x002F; offered {suites:04x?}");
+        // ...and still leads with a modern ECDHE/AEAD suite.
+        assert!(suites.iter().any(|s| matches!(s, 0xC02B | 0xC02C | 0xC02F | 0xC030)), "no ECDHE/GCM suite in {suites:04x?}");
+    }
+
+    #[test]
     fn config_errors_surface_at_new() {
         let mut cfg = client_cfg(false, false);
         cfg.client_key_pem = "garbage".into();
@@ -1025,95 +1241,166 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
         cfg.client_cert_pem = "".into();
         assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
 
+        // key that does not belong to the certificate
+        let mut cfg = client_cfg(false, false);
+        cfg.client_key_pem = SERVER_KEY_PEM.into();
+        assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
+
         let mut cfg = client_cfg(true, false);
         cfg.server_ca_pem = None;
+        assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
+
+        let mut cfg = client_cfg(true, false);
+        cfg.server_ca_pem = Some("not a pem".into());
         assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
 
         let cfg = client_cfg(true, false);
         assert!(EapTlsClient::new(cfg).is_ok());
     }
 
-    // ---- in-process end-to-end against a rustls server -------------------------------
+    #[test]
+    fn fixture_client_credentials_load() {
+        // The real tests/fixtures credentials (RSA-2048, PKCS#8 key) must build a client.
+        let c = EapTlsClient::new(fixture_client_cfg()).unwrap();
+        assert!(c.msk().is_none());
+        // A chain PEM (leaf first) is accepted; only the leaf is used.
+        let mut cfg = fixture_client_cfg();
+        cfg.client_cert_pem = format!("{CLIENT_CERT_PEM}{TEST_CA_PEM}");
+        assert!(EapTlsClient::new(cfg).is_ok());
+    }
 
-    /// Accepts any client certificate (we do not have the T-Mobile issuer CA) but still
-    /// verifies the CertificateVerify signature against the presented certificate.
+    #[test]
+    fn pkcs1_client_key_is_accepted() {
+        // Same key re-encoded as PKCS#1 ("BEGIN RSA PRIVATE KEY").
+        let rsa = PKey::private_key_from_pem(TEST_CLIENT_KEY_PEM.as_bytes()).unwrap().rsa().unwrap();
+        let pkcs1 = String::from_utf8(rsa.private_key_to_pem().unwrap()).unwrap();
+        assert!(pkcs1.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        let mut cfg = client_cfg(false, false);
+        cfg.client_key_pem = pkcs1;
+        assert!(EapTlsClient::new(cfg).is_ok());
+    }
+
+    // ---- in-process end-to-end against an OpenSSL server -----------------------------
+
+    /// The test peer: an OpenSSL server over the same in-memory duplex, driven with
+    /// `accept()` until it returns `Ok` and `ssl_read()` afterwards.
+    struct TestServer {
+        stream: SslStream<Duplex>,
+        done: bool,
+    }
+
+    /// Server context: RSA-2048 leaf + issuer (so the Certificate flight is > 1024 bytes on the
+    /// wire), client certificate required and verified against the test CA.
+    fn server_builder(min: SslVersion, max: SslVersion) -> SslContextBuilder {
+        let mut b = SslContext::builder(SslMethod::tls_server()).unwrap();
+        b.set_min_proto_version(Some(min)).unwrap();
+        b.set_max_proto_version(Some(max)).unwrap();
+        b.set_certificate(&X509::from_pem(SERVER_CERT_PEM.as_bytes()).unwrap()).unwrap();
+        b.set_private_key(&PKey::private_key_from_pem(SERVER_KEY_PEM.as_bytes()).unwrap()).unwrap();
+        b.add_extra_chain_cert(X509::from_pem(TEST_CA_PEM.as_bytes()).unwrap()).unwrap();
+        b.cert_store_mut().add_cert(X509::from_pem(TEST_CA_PEM.as_bytes()).unwrap()).unwrap();
+        b.set_verify(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT);
+        b
+    }
+
+    /// The T-Mobile ePDG: TLS 1.2, TLS_RSA_WITH_AES_128_CBC_SHA only.
+    fn tmobile_server() -> SslContext {
+        let mut b = server_builder(SslVersion::TLS1_2, SslVersion::TLS1_2);
+        b.set_cipher_list(&format!("{TMOBILE_SUITE}:@SECLEVEL=1")).unwrap();
+        b.build()
+    }
+
+    /// A modern TLS 1.2 server: ECDHE-RSA-AES128-GCM-SHA256 only.
+    fn modern_server() -> SslContext {
+        let mut b = server_builder(SslVersion::TLS1_2, SslVersion::TLS1_2);
+        b.set_cipher_list(MODERN_SUITE).unwrap();
+        b.build()
+    }
+
+    fn tls13_server() -> SslContext {
+        server_builder(SslVersion::TLS1_3, SslVersion::TLS1_3).build()
+    }
+
+    /// T-Mobile suite, but accepts any client certificate (we do not have the issuer CA of the
+    /// real fixture credentials); a certificate is still required and OpenSSL still checks
+    /// the CertificateVerify signature against it.
+    fn accept_any_client_server() -> SslContext {
+        let mut b = server_builder(SslVersion::TLS1_2, SslVersion::TLS1_2);
+        b.set_cipher_list(&format!("{TMOBILE_SUITE}:@SECLEVEL=1")).unwrap();
+        b.set_verify_callback(SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT, |_preverified, _ctx| true);
+        b.build()
+    }
+
+    impl TestServer {
+        fn new(ctx: &SslContext) -> TestServer {
+            let ssl = Ssl::new(ctx).unwrap();
+            TestServer { stream: SslStream::new(ssl, Duplex::default()).unwrap(), done: false }
+        }
+
+        /// Feed one complete client flight and step the server. Returns the server's verdict
+        /// and whatever it wants to send (the reply flight, or an alert on error).
+        fn step(&mut self, data: &[u8]) -> (std::result::Result<(), String>, Vec<u8>) {
+            self.stream.get_mut().inbox.extend(data);
+            let verdict = if !self.done {
+                match self.stream.accept() {
+                    Ok(()) => {
+                        self.done = true;
+                        Ok(())
+                    }
+                    Err(e) if e.code() == ErrorCode::WANT_READ => Ok(()),
+                    Err(e) => Err(format!("server TLS error: {e} (verify: {})", self.stream.ssl().verify_result().error_string())),
+                }
+            } else {
+                let mut sink = [0u8; 64];
+                loop {
+                    match self.stream.ssl_read(&mut sink) {
+                        Ok(0) => break Ok(()),
+                        Ok(_) => {}
+                        Err(e) if e.code() == ErrorCode::WANT_READ => break Ok(()),
+                        Err(e) => break Err(format!("server post-handshake TLS error: {e}")),
+                    }
+                }
+            };
+            (verdict, std::mem::take(&mut self.stream.get_mut().outbox))
+        }
+
+        /// [`Self::step`] for the happy path: panics on a server error, returns the reply flight.
+        fn feed(&mut self, data: &[u8]) -> Vec<u8> {
+            let (verdict, out) = self.step(data);
+            verdict.unwrap_or_else(|e| panic!("{e}"));
+            out
+        }
+
+        fn cipher(&self) -> String {
+            self.stream.ssl().current_cipher().unwrap().name().to_string()
+        }
+
+        fn saw_client_cert(&self) -> bool {
+            self.stream.ssl().peer_certificate().is_some()
+        }
+
+        /// RFC 5216 / RFC 9190 MSK from the server's exporter.
+        fn export_msk(&self) -> Vec<u8> {
+            let ssl = self.stream.ssl();
+            let (label, ctx): (&str, Option<&[u8]>) = if ssl.version2() == Some(SslVersion::TLS1_3) {
+                ("EXPORTER_EAP_TLS_Key_Material", Some(&[0x0D]))
+            } else {
+                ("client EAP encryption", None)
+            };
+            let mut km = [0u8; 128];
+            ssl.export_keying_material(&mut km, label, ctx).unwrap();
+            km[..64].to_vec()
+        }
+    }
+
     #[derive(Debug)]
-    struct AcceptAnyClientCert(Arc<rustls::crypto::CryptoProvider>);
-
-    impl ClientCertVerifier for AcceptAnyClientCert {
-        fn root_hint_subjects(&self) -> &[DistinguishedName] { &[] }
-
-        fn verify_client_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _now: UnixTime,
-        ) -> std::result::Result<ClientCertVerified, rustls::Error> {
-            Ok(ClientCertVerified::assertion())
-        }
-
-        fn verify_tls12_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-        }
-
-        fn verify_tls13_signature(
-            &self,
-            message: &[u8],
-            cert: &CertificateDer<'_>,
-            dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-        }
-
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            self.0.signature_verification_algorithms.supported_schemes()
-        }
-    }
-
-    fn server_config(tls13: bool) -> Arc<ServerConfig> {
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let versions: &[&rustls::SupportedProtocolVersion] =
-            if tls13 { &[&rustls::version::TLS13] } else { &[&rustls::version::TLS12] };
-        let certs = parse_certs(SERVER_CERT_PEM, "server").unwrap();
-        let key = parse_private_key(SERVER_KEY_PEM).unwrap();
-        let cfg = ServerConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(versions)
-            .unwrap()
-            .with_client_cert_verifier(Arc::new(AcceptAnyClientCert(provider)))
-            .with_single_cert(certs, key)
-            .unwrap();
-        Arc::new(cfg)
-    }
-
-    fn server_feed(server: &mut ServerConnection, data: &[u8]) {
-        let mut consumed = 0;
-        while consumed < data.len() {
-            let mut rd = &data[consumed..];
-            let n = server.read_tls(&mut rd).unwrap();
-            assert!(n > 0, "server refused input");
-            consumed += n;
-            server.process_new_packets().unwrap_or_else(|e| panic!("server TLS error: {e}"));
-        }
-    }
-
-    fn server_drain(server: &mut ServerConnection) -> Vec<u8> {
-        let mut out = Vec::new();
-        while server.wants_write() {
-            server.write_tls(&mut out).unwrap();
-        }
-        out
-    }
-
     struct Stats {
         client_fragments: usize,
         client_acks: usize,
         server_fragments: usize,
         server_acks: usize,
+        /// Largest server flight on the wire (before the fake EAP server fragments it).
+        max_server_flight: usize,
     }
 
     fn next_server_fragment(
@@ -1137,40 +1424,33 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
         }
     }
 
-    fn server_msk(tls13: bool) -> impl Fn(&ServerConnection) -> Vec<u8> {
-        move |s: &ServerConnection| {
-            let (label, ctx): (&[u8], Option<&[u8]>) = if tls13 {
-                (b"EXPORTER_EAP_TLS_Key_Material", Some(&[0x0D]))
-            } else {
-                (b"client EAP encryption", None)
-            };
-            s.export_keying_material(vec![0u8; 128], label, ctx).unwrap()[..64].to_vec()
-        }
-    }
-
-    /// Runs the E2E flow and asserts the client MSK equals the server's exporter output.
-    fn e2e_check(cfg: EapTlsConfig, tls13: bool, server_frag: usize, repeat_l: bool) -> Stats {
-        let export = server_msk(tls13);
-        let (msk, stats, server) = run_e2e(cfg, tls13, server_frag, repeat_l);
+    /// Runs the E2E flow and asserts the client MSK equals the server's exporter output and
+    /// that the expected version / suite was negotiated.
+    fn e2e_check(cfg: EapTlsConfig, server: SslContext, version: &str, suite: &str, server_frag: usize, repeat_l: bool) -> Stats {
+        let (msk, stats, client, server) = run_e2e(cfg, server, server_frag, repeat_l);
         assert_eq!(msk.len(), 64);
-        assert_eq!(msk, export(&server), "client MSK must equal the server's exporter output");
-        assert!(server.peer_certificates().is_some_and(|c| !c.is_empty()), "server must have seen the client cert");
+        assert_eq!(msk, server.export_msk(), "client MSK must equal the server's exporter output");
+        assert!(server.saw_client_cert(), "server must have seen the client cert");
+        assert_eq!(client.protocol_version(), Some(version));
+        assert_eq!(client.cipher_name(), Some(suite));
+        assert_eq!(server.cipher(), suite);
         stats
     }
 
     /// Fake EAP server: Identity -> Start -> data with fragmentation/ACKs both ways -> Success.
     /// `server_frag` is the server's outbound fragment size; `repeat_l` sets L on every
     /// server fragment (T-Mobile behaviour) instead of only the first. Returns the client
-    /// MSK, conversation statistics and the server connection (for exporter comparison).
+    /// MSK, conversation statistics and both endpoints (for exporter comparison).
     fn run_e2e(
         cfg: EapTlsConfig,
-        tls13: bool,
+        server_ctx: SslContext,
         server_frag: usize,
         repeat_l: bool,
-    ) -> (Vec<u8>, Stats, ServerConnection) {
-        let mut server = ServerConnection::new(server_config(tls13)).unwrap();
+    ) -> (Vec<u8>, Stats, EapTlsClient, TestServer) {
+        let mut server = TestServer::new(&server_ctx);
         let mut client = EapTlsClient::new(cfg).unwrap();
-        let mut stats = Stats { client_fragments: 0, client_acks: 0, server_fragments: 0, server_acks: 0 };
+        let mut stats =
+            Stats { client_fragments: 0, client_acks: 0, server_fragments: 0, server_acks: 0, max_server_flight: 0 };
         let mut id: u8 = 0xF0; // wraps around 0xFF -> 0x00 during the run
 
         let r = expect_send(client.handle(&request(id, EAP_TYPE_IDENTITY, vec![])).unwrap());
@@ -1192,9 +1472,7 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
                     assert_eq!(emsk.len(), 64);
                     assert_ne!(msk, emsk);
                     assert_eq!(client.msk(), Some(&msk[..]));
-                    let expected = if tls13 { ProtocolVersion::TLSv1_3 } else { ProtocolVersion::TLSv1_2 };
-                    assert_eq!(client.protocol_version(), Some(expected));
-                    return (msk.to_vec(), stats, server);
+                    return (msk.to_vec(), stats, client, server);
                 }
                 EapAction::Failure(s) => panic!("client failure: {s}"),
             };
@@ -1211,7 +1489,7 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
                     req = tls_request(id, &next_server_fragment(&s_tx, &mut s_off, server_frag, repeat_l, &mut stats));
                     continue;
                 }
-                assert!(!server.is_handshaking(), "client finished but server still handshaking");
+                assert!(server.done, "client finished but server still handshaking");
                 assert!(client.msk().is_some(), "client must have derived the MSK before the final ACK");
                 req = EapPacket { code: EAP_CODE_SUCCESS, identifier: id, eap_type: None, type_data: vec![] };
                 continue;
@@ -1238,11 +1516,11 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
                 continue;
             }
             assert_eq!(buf.len(), cap, "client message shorter than declared");
-            server_feed(&mut server, &buf);
-            s_tx = server_drain(&mut server);
+            s_tx = server.feed(&buf);
             s_off = 0;
+            stats.max_server_flight = stats.max_server_flight.max(s_tx.len());
             if s_tx.is_empty() {
-                assert!(!server.is_handshaking());
+                assert!(server.done);
                 req = EapPacket { code: EAP_CODE_SUCCESS, identifier: id, eap_type: None, type_data: vec![] };
                 continue;
             }
@@ -1251,76 +1529,129 @@ KTuoUZZz5/aehrPWag4bV5Bx4jlN20tcg0pqRj7u/lEr73MGKr8tU7aY
     }
 
     #[test]
-    fn e2e_tls12_trust_all_fragmented_both_ways() {
-        let stats = e2e_check(client_cfg(false, false), false, 700, false);
+    fn e2e_tmobile_tls_rsa_aes128_cbc_sha_fragmented_both_ways() {
+        let stats = e2e_check(client_cfg(false, false), tmobile_server(), "TLSv1.2", TMOBILE_SUITE, 700, false);
         // Client flight (RSA-2048 cert + CKE + CV + CCS + Finished) exceeds 1024 -> >= 2 fragments,
         // each non-final one acked by the server.
-        assert!(stats.client_fragments >= 3, "expected ClientHello + >=2 flight fragments, got {}", stats.client_fragments);
-        assert!(stats.server_acks >= 1);
-        // Server flight (~1 KB+) split at 700 -> at least 2 server fragments and >= 1 client ACK,
-        // plus the final post-handshake ACK.
-        assert!(stats.server_fragments >= 3);
-        assert!(stats.client_acks >= 2);
+        assert!(stats.client_fragments >= 3, "expected ClientHello + >=2 flight fragments, got {stats:?}");
+        assert!(stats.server_acks >= 1, "{stats:?}");
+        // Server flight (leaf + issuer cert) exceeds 1024 on the wire; split at 700 -> at least
+        // 2 server fragments and >= 1 client ACK, plus the final post-handshake ACK.
+        assert!(stats.max_server_flight > 1024, "{stats:?}");
+        assert!(stats.server_fragments >= 3, "{stats:?}");
+        assert!(stats.client_acks >= 2, "{stats:?}");
     }
 
     #[test]
-    fn e2e_tls12_repeated_l_on_every_server_fragment() {
-        let stats = e2e_check(client_cfg(false, false), false, 500, true);
-        assert!(stats.server_fragments >= 3);
+    fn e2e_tmobile_repeated_l_on_every_server_fragment() {
+        let stats = e2e_check(client_cfg(false, false), tmobile_server(), "TLSv1.2", TMOBILE_SUITE, 500, true);
+        assert!(stats.server_fragments >= 3, "{stats:?}");
     }
 
     #[test]
-    fn e2e_tls12_unfragmented_server_flight() {
+    fn e2e_tmobile_unfragmented_server_flight() {
         // Large server fragment size -> every server message is a single unfragmented EAP-TLS request.
-        let stats = e2e_check(client_cfg(false, false), false, 65536, false);
-        assert_eq!(stats.client_acks, 1, "only the final post-handshake ACK");
-        assert!(stats.client_fragments >= 3);
+        let stats = e2e_check(client_cfg(false, false), tmobile_server(), "TLSv1.2", TMOBILE_SUITE, 65536, false);
+        assert_eq!(stats.client_acks, 1, "only the final post-handshake ACK: {stats:?}");
+        assert!(stats.client_fragments >= 3, "{stats:?}");
     }
 
     #[test]
-    fn e2e_tls12_with_server_validation() {
+    fn e2e_tmobile_with_server_validation() {
+        // Chain validation only (no server_name -> no SNI, no hostname check).
+        e2e_check(client_cfg(true, false), tmobile_server(), "TLSv1.2", TMOBILE_SUITE, 900, false);
+        // DNS name: SNI is sent and checked against the SAN.
         let mut cfg = client_cfg(true, false);
-        cfg.server_name = ServerName::try_from("localhost").unwrap();
-        e2e_check(cfg, false, 900, false);
-        // IP SAN works too.
-        e2e_check(client_cfg(true, false), false, 900, false);
+        cfg.server_name = Some("localhost".into());
+        e2e_check(cfg, tmobile_server(), "TLSv1.2", TMOBILE_SUITE, 900, false);
+        // IP literal: no SNI, checked against the IP SAN.
+        let mut cfg = client_cfg(true, false);
+        cfg.server_name = Some("127.0.0.1".into());
+        e2e_check(cfg, tmobile_server(), "TLSv1.2", TMOBILE_SUITE, 900, false);
     }
 
-    #[test]
-    fn e2e_tls12_validation_fails_against_untrusted_server() {
-        let mut cfg = client_cfg(true, false);
-        // Trust the client cert instead of the server cert -> chain validation must fail.
-        cfg.server_ca_pem = Some(CLIENT_CERT_PEM.to_string());
-        let mut server = ServerConnection::new(server_config(false)).unwrap();
+    /// Drives Start + the server's first flight and returns the client's verdict on it.
+    fn first_server_flight_result(cfg: EapTlsConfig, server_ctx: SslContext) -> Result<EapAction> {
+        let mut server = TestServer::new(&server_ctx);
         let mut client = EapTlsClient::new(cfg).unwrap();
         let hello = expect_send(client.handle(&start_request(1)).unwrap());
-        let td = EapTlsData::decode(&hello.type_data).unwrap();
-        server_feed(&mut server, &td.data);
-        let flight = server_drain(&mut server);
-        let req = tls_request(2, &EapTlsData { flags: 0, length: Some(flight.len() as u32), data: flight });
-        match client.handle(&req) {
-            Err(Error::Tls(e)) => assert!(matches!(e, rustls::Error::InvalidCertificate(_)), "{e}"),
+        let flight = server.feed(&EapTlsData::decode(&hello.type_data).unwrap().data);
+        assert!(!flight.is_empty(), "server produced no reply to the ClientHello");
+        client.handle(&tls_request(2, &EapTlsData { flags: 0, length: Some(flight.len() as u32), data: flight }))
+    }
+
+    #[test]
+    fn e2e_validation_fails_against_untrusted_server() {
+        let mut cfg = client_cfg(true, false);
+        // Trust the client cert instead of the CA -> chain validation must fail.
+        cfg.server_ca_pem = Some(TEST_CLIENT_CERT_PEM.to_string());
+        match first_server_flight_result(cfg, tmobile_server()) {
+            Err(Error::Tls(e)) => assert!(e.contains("certificate verify failed"), "{e}"),
             other => panic!("expected a TLS certificate error, got {other:?}"),
         }
     }
 
     #[test]
+    fn e2e_validation_fails_on_hostname_mismatch() {
+        let mut cfg = client_cfg(true, false);
+        cfg.server_name = Some("epdg.example.invalid".into());
+        match first_server_flight_result(cfg, tmobile_server()) {
+            Err(Error::Tls(e)) => assert!(e.contains("hostname mismatch"), "{e}"),
+            other => panic!("expected a hostname mismatch error, got {other:?}"),
+        }
+        // Trust-all ignores the name entirely.
+        let mut cfg = client_cfg(false, false);
+        cfg.server_name = Some("epdg.example.invalid".into());
+        e2e_check(cfg, tmobile_server(), "TLSv1.2", TMOBILE_SUITE, 900, false);
+    }
+
+    #[test]
+    fn e2e_modern_ecdhe_rsa_aes128_gcm_sha256() {
+        let stats = e2e_check(client_cfg(false, false), modern_server(), "TLSv1.2", MODERN_SUITE, 700, false);
+        assert!(stats.client_fragments >= 3, "{stats:?}");
+    }
+
+    #[test]
+    fn e2e_fixture_credentials_against_tmobile_suite() {
+        // The real client certificate/key fixtures complete the T-Mobile handshake.
+        let stats = e2e_check(fixture_client_cfg(), accept_any_client_server(), "TLSv1.2", TMOBILE_SUITE, 700, false);
+        assert!(stats.client_fragments >= 3, "{stats:?}");
+    }
+
+    #[test]
     fn e2e_tls13_when_allowed() {
-        let stats = e2e_check(client_cfg(false, true), true, 800, false);
-        assert!(stats.client_fragments >= 2);
+        let stats = e2e_check(client_cfg(false, true), tls13_server(), "TLSv1.3", "TLS_AES_256_GCM_SHA384", 800, false);
+        assert!(stats.client_fragments >= 2, "{stats:?}");
+    }
+
+    #[test]
+    fn tls13_only_server_is_rejected_by_default() {
+        // allow_tls13 = false caps the ClientHello at TLS 1.2: a 1.3-only server refuses it
+        // ("unsupported protocol") and its protocol_version alert fails the client handshake.
+        let mut server = TestServer::new(&tls13_server());
+        let mut client = EapTlsClient::new(client_cfg(false, false)).unwrap();
+        let hello = expect_send(client.handle(&start_request(1)).unwrap());
+        let (verdict, alert) = server.step(&EapTlsData::decode(&hello.type_data).unwrap().data);
+        assert!(matches!(&verdict, Err(e) if e.contains("unsupported protocol")), "{verdict:?}");
+        assert_eq!(alert.first(), Some(&0x15), "server must answer with an alert record");
+        let req = tls_request(2, &EapTlsData { flags: 0, length: Some(alert.len() as u32), data: alert });
+        match client.handle(&req) {
+            Err(Error::Tls(e)) => assert!(e.contains("protocol version"), "{e}"),
+            other => panic!("expected a TLS protocol version error, got {other:?}"),
+        }
     }
 
     #[test]
     fn e2e_success_arriving_early_is_fatal() {
         // Drive up to the client's flight, then inject EAP-Success before the server Finished.
-        let mut server = ServerConnection::new(server_config(false)).unwrap();
+        let mut server = TestServer::new(&tmobile_server());
         let mut client = EapTlsClient::new(client_cfg(false, false)).unwrap();
         let hello = expect_send(client.handle(&start_request(1)).unwrap());
-        server_feed(&mut server, &EapTlsData::decode(&hello.type_data).unwrap().data);
-        let flight = server_drain(&mut server);
+        let flight = server.feed(&EapTlsData::decode(&hello.type_data).unwrap().data);
         let req = tls_request(2, &EapTlsData { flags: 0, length: Some(flight.len() as u32), data: flight });
         let f1 = expect_send(client.handle(&req).unwrap());
         assert!(EapTlsData::decode(&f1.type_data).unwrap().has_m());
+        assert_eq!(client.cipher_name(), Some(TMOBILE_SUITE), "suite is known once the ServerHello is in");
         let s = EapPacket { code: EAP_CODE_SUCCESS, identifier: 3, eap_type: None, type_data: vec![] };
         assert!(matches!(client.handle(&s).unwrap(), EapAction::Failure(_)));
         assert!(client.msk().is_none());
