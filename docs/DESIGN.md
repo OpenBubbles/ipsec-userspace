@@ -508,14 +508,15 @@ impl EapPacket {
 ### 9.2 EAP-TLS (RFC 5216 §3.1): Type 13; type_data = `Flags(1) | [TLS Message Length(4) if L] | TLS data`.
 ```rust
 pub struct EapTlsConfig { pub identity: Vec<u8>, pub client_cert_pem: String, pub client_key_pem: String, pub validate_server: bool,
-                          pub server_ca_pem: Option<String>, pub server_name: rustls::pki_types::ServerName<'static>, pub max_fragment_len: usize, pub allow_tls13: bool }
+                          pub server_ca_pem: Option<String>, pub server_name: Option<String> /* SNI; None = none */, pub max_fragment_len: usize, pub allow_tls13: bool }
 pub enum EapAction { Send(EapPacket), Success { msk: Vec<u8>, emsk: Vec<u8> }, Failure(String) }
 pub struct EapTlsClient { /* rustls ClientConnection, rx buffer(+expected len), tx queue, state, msk */ }
 impl EapTlsClient {
     pub fn new(cfg: EapTlsConfig) -> Result<Self>;
     /// Feed ANY EAP packet from the peer (Request/Identity, Request/TLS, Success, Failure) and get the action.
     pub fn handle(&mut self, packet: &EapPacket) -> Result<EapAction>;
-    pub fn protocol_version(&self) -> Option<rustls::ProtocolVersion>;
+    pub fn protocol_version(&self) -> Option<&str>;   // e.g. "TLSv1.2"
+    pub fn cipher_name(&self) -> Option<&str>;        // e.g. "AES128-SHA"
     pub fn msk(&self) -> Option<&[u8]>;
 }
 ```
@@ -543,7 +544,7 @@ Behavior:
 - Success (code 3) → if msk derived → `Success{msk,emsk}` else `Failure`. Failure (code 4) → `Failure`.
 - Unknown request type → `Send(nak(id, &[EAP_TYPE_TLS]))`.
 - Responses always echo the request identifier.
-- rustls: `ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+- (superseded by §9.3 — OpenSSL engine) rustls: `ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
   .with_protocol_versions(&[&TLS12, (&TLS13 if allow_tls13)])`; when `!validate_server` use
   `.dangerous().with_custom_certificate_verifier(Arc::new(NoVerify))` where `NoVerify: rustls::client::danger::ServerCertVerifier`
   returns `ServerCertVerified::assertion()` / `HandshakeSignatureValid::assertion()` and

@@ -81,7 +81,20 @@ fn live_tmobile_tunnel() {
 
     // --- connect ------------------------------------------------------------------
     let t0 = Instant::now();
-    let tunnel = EpdgTunnel::connect(&cfg).expect("EpdgTunnel::connect");
+    let tunnel = match EpdgTunnel::connect(&cfg) {
+        Ok(t) => t,
+        Err(e) => {
+            if matches!(e, Error::Timeout(_)) {
+                eprintln!(
+                    "no IKE response from the ePDG. If a per-application firewall (e.g. Little Snitch) is active, \
+                     allow outbound UDP 500/4500 for this test binary ({}) — or run target/debug/epdg-connect, \
+                     whose path is stable.",
+                    std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default()
+                );
+            }
+            panic!("EpdgTunnel::connect failed: {e}");
+        }
+    };
     let info = tunnel.info().clone();
     println!("TunnelInfo: {info:#?}");
     println!(
@@ -103,10 +116,11 @@ fn live_tmobile_tunnel() {
         !a.internal_ipv4.is_empty() || !a.internal_ipv6.is_empty(),
         "no internal address assigned: {a:?}"
     );
-    assert!(
-        !a.pcscf_ipv4.is_empty() || !a.pcscf_ipv6.is_empty(),
-        "no P-CSCF address assigned: {a:?}"
-    );
+    // The T-Mobile PROD ePDG hands out no P_CSCF_IP{4,6}_ADDRESS attributes (observed live);
+    // the P-CSCF is found by resolving its hostname over the tunnel instead (below).
+    if a.pcscf_ipv4.is_empty() && a.pcscf_ipv6.is_empty() {
+        println!("note: no P-CSCF address in the CFG_REPLY (expected for this ePDG); resolving it via tunnel DNS");
+    }
 
     // --- DNS over the tunnel (proves ESP both ways) ---------------------------------
     // First assigned DNS server of a family we have an inner address for (IPv6 first).
