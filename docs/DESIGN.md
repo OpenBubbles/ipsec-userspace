@@ -551,6 +551,23 @@ Behavior:
   `.with_client_auth_cert(certs, key)`. Parse PEMs with `rustls_pemfile`. `server_name` = `ServerName::IpAddress(gateway ip)`
   by default (rustls sends no SNI for IPs).
 
+
+### 9.3 TLS backend (live finding, 2026-09-11)
+A live probe through the real IKE/EAP path showed the T-Mobile ePDG's EAP-TLS server negotiates ONLY
+`TLS_RSA_WITH_AES_128_CBC_SHA` (0x002F), TLS 1.2, no extended-master-secret: an ECDHE+AEAD-only ClientHello
+(what rustls sends) is answered with IKE `AUTHENTICATION_FAILED` before any ServerHello; a ClientHello that also
+lists RSA-kx/CBC suites gets a ServerHello picking 0x002F even when ECDHE-GCM is listed first. rustls implements
+neither RSA key exchange nor CBC suites by design, so EAP-TLS needs a pluggable engine:
+- `trait TlsEngine` in `eap/tls.rs`: `start() -> Vec<u8>` (ClientHello), `feed(&[u8]) -> Vec<u8>` (records to send),
+  `is_handshaking()`, `export_keying_material(label, context, len)`, `protocol_version()`, `cipher_suite()`.
+- `RustlsEngine` (existing behaviour) and `OpensslEngine` (cargo feature `openssl`, default on; `openssl` crate 0.10,
+  in-memory `SslStream` over a duplex buffer, `SSL_VERIFY_NONE` unless `validate_server_cert`, client cert + key,
+  cipher list = OpenSSL DEFAULT at `@SECLEVEL=1` so `AES128-SHA` is offered, TLS 1.2 (1.3 if `allow_tls13`), no SNI,
+  MSK via RFC 5705 export `"client EAP encryption"` / no context / 128 bytes).
+- Config `eap_tls.tls_backend`: `"auto"` (OpenSSL when compiled in, else rustls) | `"rustls"` | `"openssl"`.
+Server certificate seen: DigiCert Global G2 TLS RSA SHA256 2020 CA1 -> CN=nsp.epc.mnc260.mcc310.pub.3gppnetwork.org
+(GSM Association), valid 2026-08-10..2027-02-24 — a public-CA chain, so real validation is possible later.
+
 ## 10. ESP (`esp/codec.rs`, `esp/replay.rs`)
 ESP-in-UDP datagram (no marker): `SPI(4) | Seq(4) | IV(iv_len) | E( payload | pad | PadLen(1) | NextHeader(1) ) | ICV(icv_len)`.
 Pad: RFC 4303 §2.4 bytes 1,2,3,… so that (payload + pad + 2) % block_len == 0 (and ≥ 4-byte alignment). NextHeader:
@@ -706,5 +723,6 @@ CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 
 **Post-EAP IKE_AUTH request:** inner = one AUTH payload `00 00 00 28 | 02 00 00 00 | 32-byte HMAC` (40 B) → 7 pad + padlen → 48 B ciphertext; SK = 84; message = 112 B; SK next-payload 0x27.
 
 ## 15. Amendment log
+- 2026-09-11: §9.3 added — ePDG EAP-TLS server requires TLS_RSA_WITH_AES_128_CBC_SHA; OpenSSL engine + `tls_backend` config.
 - 2026-09-11: retransmit corrected to 5 sends; §14.1 KAT layouts added from the critic pass (docs/AOSP_FACTS_CRITIC.md).
 - 2026-09-11: §2/§6/§8/§9/§12 patched from the AOSP extraction (fake NAT source, transform/payload/CP order, TLS 1.2-only, IDr-from-first-response).
