@@ -65,14 +65,14 @@ pub const CIPHER_LIST: &str = "DEFAULT:@SECLEVEL=1";
 pub struct EapTlsConfig {
     /// EAP-Response/Identity body (raw bytes, no NUL, no realm added).
     pub identity: Vec<u8>,
-    /// Client certificate PEM; may contain a chain (leaf first). Only the leaf is sent (AOSP).
-    pub client_cert_pem: String,
-    /// Client private key PEM (PKCS#8, PKCS#1 or SEC1).
-    pub client_key_pem: String,
-    /// Validate the server certificate against `server_ca_pem`. `false` = trust-all (AOSP default).
+    /// Client (leaf) certificate, one DER `Certificate`; it is the only certificate sent (AOSP).
+    pub client_cert_der: Vec<u8>,
+    /// Client private key, unencrypted PKCS#8 DER (`PrivateKeyInfo`).
+    pub client_key_der: Vec<u8>,
+    /// Validate the server certificate against `server_ca_der`. `false` = trust-all (AOSP default).
     pub validate_server: bool,
-    /// Trust anchors (PEM bundle) used when `validate_server` is set.
-    pub server_ca_pem: Option<String>,
+    /// Trust anchors, one DER `Certificate` each, used when `validate_server` is set.
+    pub server_ca_der: Vec<Vec<u8>>,
     /// TLS server name: sent as SNI (unless it is an IP literal, which RFC 6066 §3 forbids)
     /// and, when `validate_server` is set, checked against the server certificate.
     /// `None` = no SNI and no hostname check (the default; AOSP sends none).
@@ -260,7 +260,7 @@ impl std::fmt::Debug for EapTlsClient {
 }
 
 impl EapTlsClient {
-    /// Build the OpenSSL context up front so PEM / trust-store errors surface early.
+    /// Build the OpenSSL context up front so DER / trust-store errors surface early.
     pub fn new(cfg: EapTlsConfig) -> Result<Self> {
         let tls_ctx = build_context(&cfg)?;
         // Clamp so EAP hdr(4) + type(1) + flags(1) + L(4) + data always fits the 16-bit Length.
@@ -684,17 +684,8 @@ fn derive_key_material(ssl: &SslRef, tls13: bool) -> Result<KeyMaterial> {
     Ok((msk, emsk))
 }
 
-fn parse_certs(pem: &str, what: &str) -> Result<Vec<X509>> {
-    let certs = X509::stack_from_pem(pem.as_bytes())
-        .map_err(|e| Error::config(format!("{what}: invalid certificate PEM: {e}")))?;
-    if certs.is_empty() {
-        return Err(Error::config(format!("{what}: no certificate found in PEM")));
-    }
-    Ok(certs)
-}
-
 /// The per-session OpenSSL context (`docs/DESIGN.md` §9.3): TLS 1.2 only unless
-/// `allow_tls13`, trust-all or the PEM CA bundle, client leaf + key, [`CIPHER_LIST`].
+/// `allow_tls13`, trust-all or the DER trust anchors, client leaf + key (DER), [`CIPHER_LIST`].
 fn build_context(cfg: &EapTlsConfig) -> Result<SslContext> {
     let mut b = SslContext::builder(SslMethod::tls_client()).map_err(tls_err)?;
     b.set_options(SslOptions::NO_COMPRESSION);
@@ -704,15 +695,18 @@ fn build_context(cfg: &EapTlsConfig) -> Result<SslContext> {
     b.set_cipher_list(CIPHER_LIST).map_err(tls_err)?;
 
     if cfg.validate_server {
-        let ca_pem = cfg.server_ca_pem.as_deref().ok_or_else(|| {
-            Error::config("validate_server_cert is set but no server CA PEM was provided (no system trust store)")
-        })?;
-        let anchors = parse_certs(ca_pem, "server CA")?;
-        let count = anchors.len();
-        for cert in anchors {
+        if cfg.server_ca_der.is_empty() {
+            return Err(Error::config(
+                "validate_server_cert is set but no server CA certificate was provided (no system trust store)",
+            ));
+        }
+        let count = cfg.server_ca_der.len();
+        for (i, der) in cfg.server_ca_der.iter().enumerate() {
+            let cert = X509::from_der(der)
+                .map_err(|e| Error::config(format!("server CA #{i}: invalid DER certificate: {e}")))?;
             b.cert_store_mut()
                 .add_cert(cert)
-                .map_err(|e| Error::config(format!("server CA: cannot add trust anchor: {e}")))?;
+                .map_err(|e| Error::config(format!("server CA #{i}: cannot add trust anchor: {e}")))?;
         }
         b.set_verify(SslVerifyMode::PEER);
         info!(
@@ -727,14 +721,11 @@ fn build_context(cfg: &EapTlsConfig) -> Result<SslContext> {
         b.set_verify(SslVerifyMode::NONE);
     }
 
-    let mut certs = parse_certs(&cfg.client_cert_pem, "client certificate")?;
-    if certs.len() > 1 {
-        debug!("EAP-TLS: client PEM has {} certificates; sending the leaf only", certs.len());
-        certs.truncate(1);
-    }
-    let key = PKey::private_key_from_pem(cfg.client_key_pem.as_bytes())
-        .map_err(|e| Error::config(format!("client key: invalid PEM: {e}")))?;
-    b.set_certificate(&certs[0])
+    let cert = X509::from_der(&cfg.client_cert_der)
+        .map_err(|e| Error::config(format!("client certificate: invalid DER: {e}")))?;
+    let key = PKey::private_key_from_pkcs8(&cfg.client_key_der)
+        .map_err(|e| Error::config(format!("client key: invalid PKCS#8 DER: {e}")))?;
+    b.set_certificate(&cert)
         .map_err(|e| Error::config(format!("client certificate: {e}")))?;
     b.set_private_key(&key)
         .map_err(|e| Error::config(format!("client key: {e}")))?;
@@ -891,13 +882,22 @@ faUa5/97UXdp+Q369a+DnlvFGBpNFdwq3aKUEjdMUF5JFQw+Z1EPC6+6yA9q0V2l
     const TMOBILE_SUITE_ID: u16 = 0x002F;
     const MODERN_SUITE: &str = "ECDHE-RSA-AES128-GCM-SHA256";
 
+    /// Test PEM fixtures → the DER the engine takes (the one place PEM is converted).
+    fn cert_der(pem: &str) -> Vec<u8> {
+        crate::pem::certificate_pem_to_der(pem).unwrap()
+    }
+
+    fn key_der(pem: &str) -> Vec<u8> {
+        crate::pem::private_key_pem_to_pkcs8_der(pem).unwrap()
+    }
+
     fn client_cfg(validate: bool, tls13: bool) -> EapTlsConfig {
         EapTlsConfig {
             identity: IDENTITY.to_vec(),
-            client_cert_pem: TEST_CLIENT_CERT_PEM.to_string(),
-            client_key_pem: TEST_CLIENT_KEY_PEM.to_string(),
+            client_cert_der: cert_der(TEST_CLIENT_CERT_PEM),
+            client_key_der: key_der(TEST_CLIENT_KEY_PEM),
             validate_server: validate,
-            server_ca_pem: if validate { Some(TEST_CA_PEM.to_string()) } else { None },
+            server_ca_der: if validate { vec![cert_der(TEST_CA_PEM)] } else { Vec::new() },
             server_name: None,
             max_fragment_len: 1024,
             allow_tls13: tls13,
@@ -906,7 +906,7 @@ faUa5/97UXdp+Q369a+DnlvFGBpNFdwq3aKUEjdMUF5JFQw+Z1EPC6+6yA9q0V2l
 
     /// The real credential fixtures (issuer CA unknown to us).
     fn fixture_client_cfg() -> EapTlsConfig {
-        EapTlsConfig { client_cert_pem: CLIENT_CERT_PEM.to_string(), client_key_pem: CLIENT_KEY_PEM.to_string(), ..client_cfg(false, false) }
+        EapTlsConfig { client_cert_der: cert_der(CLIENT_CERT_PEM), client_key_der: key_der(CLIENT_KEY_PEM), ..client_cfg(false, false) }
     }
 
     fn request(id: u8, eap_type: u8, type_data: Vec<u8>) -> EapPacket {
@@ -1233,24 +1233,37 @@ faUa5/97UXdp+Q369a+DnlvFGBpNFdwq3aKUEjdMUF5JFQw+Z1EPC6+6yA9q0V2l
     #[test]
     fn config_errors_surface_at_new() {
         let mut cfg = client_cfg(false, false);
-        cfg.client_key_pem = "garbage".into();
+        cfg.client_key_der = b"garbage".to_vec();
         assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
 
         let mut cfg = client_cfg(false, false);
-        cfg.client_cert_pem = "".into();
+        cfg.client_cert_der = Vec::new();
         assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
 
         // key that does not belong to the certificate
         let mut cfg = client_cfg(false, false);
-        cfg.client_key_pem = SERVER_KEY_PEM.into();
+        cfg.client_key_der = key_der(SERVER_KEY_PEM);
         assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
 
         let mut cfg = client_cfg(true, false);
-        cfg.server_ca_pem = None;
+        cfg.server_ca_der = Vec::new();
         assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
 
         let mut cfg = client_cfg(true, false);
-        cfg.server_ca_pem = Some("not a pem".into());
+        cfg.server_ca_der = vec![b"not a certificate".to_vec()];
+        assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
+
+        // PEM where DER is expected is an error, not a fallback (no format detection).
+        let mut cfg = client_cfg(false, false);
+        cfg.client_cert_der = TEST_CLIENT_CERT_PEM.as_bytes().to_vec();
+        assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
+
+        let mut cfg = client_cfg(false, false);
+        cfg.client_key_der = TEST_CLIENT_KEY_PEM.as_bytes().to_vec();
+        assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
+
+        let mut cfg = client_cfg(true, false);
+        cfg.server_ca_der = vec![TEST_CA_PEM.as_bytes().to_vec()];
         assert!(matches!(EapTlsClient::new(cfg), Err(Error::Config(_))));
 
         let cfg = client_cfg(true, false);
@@ -1262,20 +1275,22 @@ faUa5/97UXdp+Q369a+DnlvFGBpNFdwq3aKUEjdMUF5JFQw+Z1EPC6+6yA9q0V2l
         // The real tests/fixtures credentials (RSA-2048, PKCS#8 key) must build a client.
         let c = EapTlsClient::new(fixture_client_cfg()).unwrap();
         assert!(c.msk().is_none());
-        // A chain PEM (leaf first) is accepted; only the leaf is used.
+        // A chain PEM (leaf first) converts to the leaf's DER alone, which builds a client.
         let mut cfg = fixture_client_cfg();
-        cfg.client_cert_pem = format!("{CLIENT_CERT_PEM}{TEST_CA_PEM}");
+        cfg.client_cert_der = cert_der(&format!("{CLIENT_CERT_PEM}{TEST_CA_PEM}"));
+        assert_eq!(cfg.client_cert_der, cert_der(CLIENT_CERT_PEM));
         assert!(EapTlsClient::new(cfg).is_ok());
     }
 
     #[test]
     fn pkcs1_client_key_is_accepted() {
-        // Same key re-encoded as PKCS#1 ("BEGIN RSA PRIVATE KEY").
+        // Same key re-encoded as PKCS#1 ("BEGIN RSA PRIVATE KEY") converts to the same PKCS#8 DER.
         let rsa = PKey::private_key_from_pem(TEST_CLIENT_KEY_PEM.as_bytes()).unwrap().rsa().unwrap();
         let pkcs1 = String::from_utf8(rsa.private_key_to_pem().unwrap()).unwrap();
         assert!(pkcs1.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
         let mut cfg = client_cfg(false, false);
-        cfg.client_key_pem = pkcs1;
+        cfg.client_key_der = key_der(&pkcs1);
+        assert_eq!(cfg.client_key_der, key_der(TEST_CLIENT_KEY_PEM));
         assert!(EapTlsClient::new(cfg).is_ok());
     }
 
@@ -1583,7 +1598,7 @@ faUa5/97UXdp+Q369a+DnlvFGBpNFdwq3aKUEjdMUF5JFQw+Z1EPC6+6yA9q0V2l
     fn e2e_validation_fails_against_untrusted_server() {
         let mut cfg = client_cfg(true, false);
         // Trust the client cert instead of the CA -> chain validation must fail.
-        cfg.server_ca_pem = Some(TEST_CLIENT_CERT_PEM.to_string());
+        cfg.server_ca_der = vec![cert_der(TEST_CLIENT_CERT_PEM)];
         match first_server_flight_result(cfg, tmobile_server()) {
             Err(Error::Tls(e)) => assert!(e.contains("certificate verify failed"), "{e}"),
             other => panic!("expected a TLS certificate error, got {other:?}"),

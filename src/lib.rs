@@ -19,6 +19,7 @@
 //! - [`ipstack`] — inner IP stack: smoltcp `Medium::Ip` device over ESP + stack thread (UDP, DNS)
 //! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`
 //! - [`netstack`] — `NetStack`: one UDP/TCP/DNS abstraction over the OS stack (`StdNetStack`) and the tunnel
+//! - [`pem`]     — PEM → DER at the boundary (test fixtures, provisioning responses); the config itself is DER-only
 
 pub mod config;
 pub mod crypto;
@@ -28,6 +29,7 @@ pub mod esp;
 pub mod ike;
 pub mod ipstack;
 pub mod netstack;
+pub mod pem;
 pub mod tunnel;
 
 pub use config::Config;

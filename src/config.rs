@@ -96,14 +96,17 @@ impl IdSpec {
     }
 }
 
+/// EAP-TLS material, DER only. PEM never enters the configuration: convert it once with
+/// [`crate::pem`] where it arrives (test fixtures, a provisioning server's response).
 #[derive(Clone)]
 pub struct EapTlsCredentials {
-    /// PEM; may contain a chain (leaf first).
-    pub client_cert_pem: String,
-    /// PEM; PKCS#8 or PKCS#1/SEC1.
-    pub client_key_pem: String,
-    /// Bundle `ePdgCACert`, if any.
-    pub server_ca_pem: Option<String>,
+    /// Client (leaf) certificate: one DER `Certificate`. Only this certificate is sent.
+    pub client_cert_der: Vec<u8>,
+    /// Private key matching `client_cert_der`: unencrypted PKCS#8 `PrivateKeyInfo`, DER.
+    pub client_key_der: Vec<u8>,
+    /// Trust anchors for the server certificate, one DER `Certificate` each (bundle
+    /// `ePdgCACert`); empty = none. Used only when `validate_server_cert`.
+    pub server_ca_der: Vec<Vec<u8>>,
     /// `IKE.ValidateRemoteCertificate`.
     pub validate_server_cert: bool,
     /// SNI; `None` = use gateway IP (no SNI sent).
@@ -117,9 +120,9 @@ pub struct EapTlsCredentials {
 impl std::fmt::Debug for EapTlsCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EapTlsCredentials")
-            .field("client_cert_pem", &format_args!("<{} bytes>", self.client_cert_pem.len()))
-            .field("client_key_pem", &"<redacted>")
-            .field("server_ca_pem", &self.server_ca_pem.as_ref().map(|s| format!("<{} bytes>", s.len())))
+            .field("client_cert_der", &format_args!("<{} bytes>", self.client_cert_der.len()))
+            .field("client_key_der", &"<redacted>")
+            .field("server_ca_der", &format_args!("<{} certificate(s)>", self.server_ca_der.len()))
             .field("validate_server_cert", &self.validate_server_cert)
             .field("tls_server_name", &self.tls_server_name)
             .field("max_fragment_len", &self.max_fragment_len)
@@ -266,7 +269,6 @@ pub struct ImsConfig {
     pub username: String,
     pub password: String,
     pub imsi: String,
-    pub token: Option<String>,
 }
 
 impl std::fmt::Debug for ImsConfig {
@@ -279,7 +281,6 @@ impl std::fmt::Debug for ImsConfig {
             .field("username", &self.username)
             .field("password", &"<redacted>")
             .field("imsi", &self.imsi)
-            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
@@ -429,12 +430,14 @@ fn dict_array<'a>(d: &'a Dictionary, key: &str) -> Result<&'a [Value]> {
 
 impl Config {
     /// Build from the decoded carrier bundle (root dict with `imsCommonCredentials`/`CBRoot`),
-    /// the individual-credentials dict (`imsIndividualCredentials`/`subscriberId`/...), and PEMs.
+    /// the individual-credentials dict (`imsIndividualCredentials`/`subscriberId`/...), the
+    /// client certificate (one DER `Certificate`) and its private key (PKCS#8 DER). PEM
+    /// material goes through [`crate::pem`] first.
     pub fn from_plist_bundle(
         bundle: &Value,
         creds: &Value,
-        client_cert_pem: &str,
-        client_key_pem: &str,
+        client_cert_der: &[u8],
+        client_key_der: &[u8],
     ) -> Result<Config> {
         let common = req_dict(bundle, &["imsCommonCredentials"])?;
         let tech = req_dict(bundle, &["CBRoot", "TechSettings"])?;
@@ -480,7 +483,10 @@ impl Config {
         };
 
         // --- EAP-TLS ---
-        let server_ca_pem = [
+        // `ePdgCACert` is `<data>`: one DER certificate, or empty for none (both real bundles,
+        // T-Mobile and Verizon, carry it empty at the root). Anything but data is an error —
+        // PEM is not accepted here.
+        let server_ca_der: Vec<Vec<u8>> = match [
             ike_dict.get("ePdgCACert"),
             tech.get("ePdgCACert"),
             common.get("ePdgCACert"),
@@ -488,11 +494,17 @@ impl Config {
         ]
         .into_iter()
         .flatten()
-        .find_map(|v| v.as_string().map(str::to_string));
+        .next()
+        {
+            None => Vec::new(),
+            Some(Value::Data(der)) if der.is_empty() => Vec::new(),
+            Some(Value::Data(der)) => vec![der.clone()],
+            Some(_) => return Err(cfg_err("ePdgCACert: expected <data> holding one DER certificate (PEM is not accepted)")),
+        };
         let eap_tls = EapTlsCredentials {
-            client_cert_pem: client_cert_pem.to_string(),
-            client_key_pem: client_key_pem.to_string(),
-            server_ca_pem,
+            client_cert_der: client_cert_der.to_vec(),
+            client_key_der: client_key_der.to_vec(),
+            server_ca_der,
             validate_server_cert: dict_bool(ike_dict, "ValidateRemoteCertificate", false)?,
             tls_server_name: None,
             max_fragment_len: 1024,
@@ -607,7 +619,6 @@ impl Config {
             username: dict_string(indiv, "username")?.unwrap_or_default(),
             password: dict_string(indiv, "password")?.unwrap_or_default(),
             imsi: dict_string(indiv, "imsi")?.unwrap_or_default(),
-            token: dict_string(creds_root, "token")?,
         };
 
         let cfg = Config { gateway, identity, eap_tls, ike, child, ims };
@@ -622,15 +633,19 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Read the four files and call [`Config::from_plist_bundle`].
-    pub fn from_plist_files(bundle: &Path, creds: &Path, cert: &Path, key: &Path) -> Result<Config> {
+    /// Read the two plists and the PEM certificate/key files — the fixture format
+    /// (`tests/fixtures/client.{crt,key}`), converted to DER here via [`crate::pem`] — and
+    /// call [`Config::from_plist_bundle`].
+    pub fn from_plist_files(bundle: &Path, creds: &Path, client_cert_pem: &Path, client_key_pem: &Path) -> Result<Config> {
         let bundle_v = read_plist(bundle)?;
         let creds_v = read_plist(creds)?;
-        let cert_pem = std::fs::read_to_string(cert)
-            .map_err(|e| cfg_err(format!("read {}: {e}", cert.display())))?;
-        let key_pem = std::fs::read_to_string(key)
-            .map_err(|e| cfg_err(format!("read {}: {e}", key.display())))?;
-        Config::from_plist_bundle(&bundle_v, &creds_v, &cert_pem, &key_pem)
+        let cert_pem = std::fs::read_to_string(client_cert_pem)
+            .map_err(|e| cfg_err(format!("read {}: {e}", client_cert_pem.display())))?;
+        let key_pem = std::fs::read_to_string(client_key_pem)
+            .map_err(|e| cfg_err(format!("read {}: {e}", client_key_pem.display())))?;
+        let cert_der = crate::pem::certificate_pem_to_der(&cert_pem)?;
+        let key_der = crate::pem::private_key_pem_to_pkcs8_der(&key_pem)?;
+        Config::from_plist_bundle(&bundle_v, &creds_v, &cert_der, &key_der)
     }
 
     /// Resolve the gateway: DNS `hostname` (all A/AAAA, IPv4 first), then `fallback_addr`
@@ -725,15 +740,24 @@ mod tests {
 
     const BUNDLE: &str = include_str!("../tests/fixtures/tmobile_prod_bundle.plist");
     const CREDS: &str = include_str!("../tests/fixtures/tmobile_creds.plist");
-    const CERT: &str = include_str!("../tests/fixtures/client.crt");
-    const KEY: &str = include_str!("../tests/fixtures/client.key");
+    const CERT_PEM: &str = include_str!("../tests/fixtures/client.crt");
+    const KEY_PEM: &str = include_str!("../tests/fixtures/client.key");
+
+    /// The fixture credentials as the configuration wants them: DER.
+    fn cert_der() -> Vec<u8> {
+        crate::pem::certificate_pem_to_der(CERT_PEM).expect("fixture certificate PEM")
+    }
+
+    fn key_der() -> Vec<u8> {
+        crate::pem::private_key_pem_to_pkcs8_der(KEY_PEM).expect("fixture key PEM")
+    }
 
     fn parse(xml: &str) -> Value {
         Value::from_reader(Cursor::new(xml.as_bytes())).expect("fixture plist parses")
     }
 
     fn fixture_config() -> Config {
-        Config::from_plist_bundle(&parse(BUNDLE), &parse(CREDS), CERT, KEY).expect("fixture config")
+        Config::from_plist_bundle(&parse(BUNDLE), &parse(CREDS), &cert_der(), &key_der()).expect("fixture config")
     }
 
     fn fixtures_dir() -> PathBuf {
@@ -766,18 +790,40 @@ mod tests {
     #[test]
     fn eap_tls_fields() {
         let c = fixture_config();
-        assert_eq!(c.eap_tls.client_cert_pem, CERT);
-        assert_eq!(c.eap_tls.client_key_pem, KEY);
-        assert!(c.eap_tls.client_cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
-        assert!(c.eap_tls.client_key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
-        assert_eq!(c.eap_tls.server_ca_pem, None);
+        assert_eq!(c.eap_tls.client_cert_der, cert_der());
+        assert_eq!(c.eap_tls.client_key_der, key_der());
+        // DER, not PEM: a SEQUENCE tag up front and no PEM boundary anywhere.
+        assert_eq!(c.eap_tls.client_cert_der[0], 0x30);
+        assert_eq!(c.eap_tls.client_key_der[0], 0x30);
+        assert!(!c.eap_tls.client_cert_der.starts_with(b"-----BEGIN"));
+        assert!(c.eap_tls.server_ca_der.is_empty());
         assert!(!c.eap_tls.validate_server_cert);
         assert_eq!(c.eap_tls.tls_server_name, None);
         assert_eq!(c.eap_tls.max_fragment_len, 1024);
         assert!(!c.eap_tls.allow_tls13);
         // Debug must not leak the private key.
         let dbg = format!("{:?}", c.eap_tls);
-        assert!(!dbg.contains("BEGIN PRIVATE KEY"));
+        assert!(dbg.contains("client_key_der: \"<redacted>\""), "{dbg}");
+        assert!(!dbg.contains(&format!("{:?}", c.eap_tls.client_key_der)));
+    }
+
+    #[test]
+    fn epdg_ca_cert_data_is_a_der_trust_anchor() {
+        // Real bundles carry `ePdgCACert` as <data> at the root (empty for T-Mobile/Verizon).
+        let root_key = "<key>imsCommonCredentials</key>";
+        assert_eq!(BUNDLE.matches(root_key).count(), 1);
+        let with_ca = BUNDLE.replace(root_key, &format!("<key>ePdgCACert</key><data>MAMCAQA=</data>{root_key}"));
+        let c = Config::from_plist_bundle(&parse(&with_ca), &parse(CREDS), &cert_der(), &key_der()).unwrap();
+        assert_eq!(c.eap_tls.server_ca_der, vec![vec![0x30, 0x03, 0x02, 0x01, 0x00]]);
+
+        let empty = BUNDLE.replace(root_key, &format!("<key>ePdgCACert</key><data></data>{root_key}"));
+        let c = Config::from_plist_bundle(&parse(&empty), &parse(CREDS), &cert_der(), &key_der()).unwrap();
+        assert!(c.eap_tls.server_ca_der.is_empty());
+
+        // PEM (or any string) where DER data is expected is a config error, not a fallback.
+        let pem = BUNDLE.replace(root_key, &format!("<key>ePdgCACert</key><string>-----BEGIN CERTIFICATE-----</string>{root_key}"));
+        let r = Config::from_plist_bundle(&parse(&pem), &parse(CREDS), &cert_der(), &key_der());
+        assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
     }
 
     #[test]
@@ -856,10 +902,6 @@ mod tests {
         assert_eq!(c.ims.username, "999990302421609@prodepdg.t-mobile.com");
         assert_eq!(c.ims.password, "i7kBuKxGLIQRcHV");
         assert_eq!(c.ims.imsi, "999990302421609@prodepdg.t-mobile.com");
-        assert_eq!(
-            c.ims.token.as_deref(),
-            Some("QjVBQjI3RDZDQzkxRkZDNTNDNDIyQjhDMUJDQTUzRUMxNzEzQzQ3Mg==")
-        );
         let dbg = format!("{:?}", c.ims);
         assert!(!dbg.contains("i7kBuKxGLIQRcHV"));
     }
@@ -877,8 +919,8 @@ mod tests {
         assert_eq!(c.gateway.hostname, "ns.sipgeo.t-mobile.com");
         assert_eq!(c.identity.local_id.data, LOCAL_ID.as_bytes());
         assert_eq!(c.child.cfg_requests, vec![1, 8, 3, 10, 2, 20, 21, 7]);
-        assert_eq!(c.eap_tls.client_cert_pem, CERT);
-        assert_eq!(c.eap_tls.client_key_pem, KEY);
+        assert_eq!(c.eap_tls.client_cert_der, cert_der());
+        assert_eq!(c.eap_tls.client_key_der, key_der());
     }
 
     #[test]
@@ -920,7 +962,7 @@ mod tests {
     #[test]
     fn eap_method_other_than_tls_is_rejected() {
         let xml = BUNDLE.replace("<string>EAP-TLS</string>", "<string>EAP-AKA</string>");
-        let r = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY);
+        let r = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der());
         match r {
             Err(Error::Config(msg)) => assert!(msg.contains("EAP-AKA"), "{msg}"),
             other => panic!("expected Config error, got {other:?}"),
@@ -934,7 +976,7 @@ mod tests {
             "<key>AuthenticationMethod</key>\n\t\t\t\t\t\t<string>Certificate</string>",
         );
         assert_ne!(xml, BUNDLE, "replacement must hit");
-        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY).unwrap();
+        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der()).unwrap();
         assert!(!c.ike.eap_only);
     }
 
@@ -953,7 +995,7 @@ mod tests {
             .replace("<key>DHGroup</key>\n\t\t\t\t\t\t<integer>14</integer>",
                      "<key>DHGroup</key>\n\t\t\t\t\t\t<array><integer>14</integer><integer>19</integer></array>");
         assert_ne!(xml, BUNDLE);
-        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY).unwrap();
+        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der()).unwrap();
         assert_eq!(c.ike.proposals[0].encryption, vec!["AES-256", "AES-128"]);
         assert_eq!(c.ike.proposals[0].integrity, vec!["SHA2-256"]);
         assert_eq!(c.ike.proposals[0].dh_groups, vec![14, 19]);
@@ -966,7 +1008,7 @@ mod tests {
             "<key>PRFAlgorithm</key>\n\t\t\t\t\t\t<integer>5</integer>",
         );
         assert_ne!(xml, BUNDLE);
-        let r = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY);
+        let r = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der());
         assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
     }
 
@@ -974,7 +1016,7 @@ mod tests {
     fn missing_subscriber_id_is_error_when_placeholder_used() {
         let creds = CREDS.replace("<key>subscriberId</key>", "<key>subscriberIdX</key>");
         assert_ne!(creds, CREDS);
-        let r = Config::from_plist_bundle(&parse(BUNDLE), &parse(&creds), CERT, KEY);
+        let r = Config::from_plist_bundle(&parse(BUNDLE), &parse(&creds), &cert_der(), &key_der());
         assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
     }
 
@@ -982,7 +1024,7 @@ mod tests {
     fn literal_local_identifier_without_placeholder() {
         let xml = BUNDLE.replace("<string>900$subscriber-id</string>", "<string>alice@example.org</string>");
         assert_ne!(xml, BUNDLE);
-        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY).unwrap();
+        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der()).unwrap();
         assert_eq!(c.identity.local_id, IdSpec::from_string("alice@example.org"));
         assert_eq!(c.identity.eap_identity, b"alice@example.org");
     }
@@ -992,7 +1034,7 @@ mod tests {
         let xml = BUNDLE
             .replace("ExtraConfigurationAttributeRequestv4", "UnusedV4")
             .replace("ExtraConfigurationAttributeRequestv6", "UnusedV6");
-        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY).unwrap();
+        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der()).unwrap();
         assert_eq!(c.child.cfg_requests, vec![1, 8, 3, 10, 2, 7]);
     }
 
@@ -1000,7 +1042,7 @@ mod tests {
     fn cfg_requests_unknown_identifier_ignored() {
         let xml = BUNDLE.replace("<integer>16384</integer>", "<integer>16999</integer>");
         assert_ne!(xml, BUNDLE);
-        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY).unwrap();
+        let c = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der()).unwrap();
         assert_eq!(c.child.cfg_requests, vec![1, 8, 3, 10, 2, 21, 7]);
     }
 
@@ -1008,7 +1050,7 @@ mod tests {
     fn bad_remote_address_is_config_error() {
         let xml = BUNDLE.replace("<string>208.54.40.79</string>", "<string>not-an-ip</string>");
         assert_ne!(xml, BUNDLE);
-        let r = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), CERT, KEY);
+        let r = Config::from_plist_bundle(&parse(&xml), &parse(CREDS), &cert_der(), &key_der());
         assert!(matches!(r, Err(Error::Config(_))), "{r:?}");
     }
 
@@ -1016,27 +1058,19 @@ mod tests {
     fn missing_bundle_sections_are_config_errors() {
         let no_common = BUNDLE.replace("<key>imsCommonCredentials</key>", "<key>nope</key>");
         assert!(matches!(
-            Config::from_plist_bundle(&parse(&no_common), &parse(CREDS), CERT, KEY),
+            Config::from_plist_bundle(&parse(&no_common), &parse(CREDS), &cert_der(), &key_der()),
             Err(Error::Config(_))
         ));
         let no_ike = BUNDLE.replace("<key>IKE</key>", "<key>IKEX</key>");
         assert!(matches!(
-            Config::from_plist_bundle(&parse(&no_ike), &parse(CREDS), CERT, KEY),
+            Config::from_plist_bundle(&parse(&no_ike), &parse(CREDS), &cert_der(), &key_der()),
             Err(Error::Config(_))
         ));
         let not_dict = Value::String("x".into());
         assert!(matches!(
-            Config::from_plist_bundle(&not_dict, &parse(CREDS), CERT, KEY),
+            Config::from_plist_bundle(&not_dict, &parse(CREDS), &cert_der(), &key_der()),
             Err(Error::Config(_))
         ));
-    }
-
-    #[test]
-    fn missing_token_is_none() {
-        let creds = CREDS.replace("<key>token</key>", "<key>tokenX</key>");
-        assert_ne!(creds, CREDS);
-        let c = Config::from_plist_bundle(&parse(BUNDLE), &parse(&creds), CERT, KEY).unwrap();
-        assert_eq!(c.ims.token, None);
     }
 
     #[test]

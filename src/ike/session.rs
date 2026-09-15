@@ -1837,9 +1837,9 @@ mod tests {
                 eap_identity: LOCAL_ID.as_bytes().to_vec(),
             },
             eap_tls: EapTlsCredentials {
-                client_cert_pem: String::new(),
-                client_key_pem: String::new(),
-                server_ca_pem: None,
+                client_cert_der: Vec::new(),
+                client_key_der: Vec::new(),
+                server_ca_der: Vec::new(),
                 validate_server_cert: false,
                 tls_server_name: None,
                 max_fragment_len: 1024,
@@ -1887,7 +1887,6 @@ mod tests {
                 username: String::new(),
                 password: String::new(),
                 imsi: String::new(),
-                token: None,
             },
         }
     }

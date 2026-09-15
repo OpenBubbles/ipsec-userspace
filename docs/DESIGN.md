@@ -82,10 +82,10 @@ pub struct IdentityConfig {
 }
 pub struct IdSpec { pub id_type: u8 /* ID_* */, pub data: Vec<u8> }
 impl IdSpec { pub fn from_string(s: &str) -> IdSpec; /* '@' -> ID_RFC822_ADDR; parses as IP -> ID_IPV4/6_ADDR; else ID_FQDN */ }
-pub struct EapTlsCredentials {
-    pub client_cert_pem: String,       // may contain a chain (leaf first)
-    pub client_key_pem: String,        // PKCS#8 or PKCS#1/SEC1
-    pub server_ca_pem: Option<String>, // bundle ePdgCACert, if any
+pub struct EapTlsCredentials {          // DER only — PEM is converted once, at the edge, by the `pem` module
+    pub client_cert_der: Vec<u8>,      // the leaf, one DER Certificate (the only certificate sent)
+    pub client_key_der: Vec<u8>,       // unencrypted PKCS#8 PrivateKeyInfo, DER
+    pub server_ca_der: Vec<Vec<u8>>,   // bundle ePdgCACert (<data>, one DER cert; empty = none)
     pub validate_server_cert: bool,    // IKE.ValidateRemoteCertificate
     pub tls_server_name: Option<String>, // SNI; None = use gateway IP (no SNI sent)
     pub max_fragment_len: usize,       // outbound EAP-TLS fragment TLS-data bytes; default 1024 (AOSP)
@@ -128,13 +128,15 @@ pub struct NattConfig {
     pub keepalive_offload: bool,           // carried
 }
 pub struct RetransmitConfig { pub initial_timeout_ms: u64 /* 500 */, pub backoff_multiplier: f64 /* 2.0 */, pub max_attempts: u32 /* 5 transmissions total (AOSP {500,1000,2000,4000,8000}): send at t=0, +0.5, +1.5, +3.5, +7.5 s cumulative; after the 5th send wait 8 s then Error::Timeout (15.5 s) */ }
-pub struct ImsConfig { pub pcscf_address: String, pub apn: String, pub impu: String, pub sip_realm: String, pub username: String, pub password: String, pub imsi: String, pub token: Option<String> }
+pub struct ImsConfig { pub pcscf_address: String, pub apn: String, pub impu: String, pub sip_realm: String, pub username: String, pub password: String, pub imsi: String }
 
 impl Config {
     /// Build from the decoded carrier bundle (root dict with imsCommonCredentials/CBRoot),
-    /// the individual-credentials dict (imsIndividualCredentials/subscriberId/...), and PEMs.
-    pub fn from_plist_bundle(bundle: &plist::Value, creds: &plist::Value, client_cert_pem: &str, client_key_pem: &str) -> Result<Config>;
-    pub fn from_plist_files(bundle: &Path, creds: &Path, cert: &Path, key: &Path) -> Result<Config>;
+    /// the individual-credentials dict (imsIndividualCredentials/subscriberId/...), and the client
+    /// certificate (DER) + private key (PKCS#8 DER).
+    pub fn from_plist_bundle(bundle: &plist::Value, creds: &plist::Value, client_cert_der: &[u8], client_key_der: &[u8]) -> Result<Config>;
+    /// Files: the plists plus PEM certificate/key files (the fixture format), converted via `pem`.
+    pub fn from_plist_files(bundle: &Path, creds: &Path, client_cert_pem: &Path, client_key_pem: &Path) -> Result<Config>;
     /// Resolve the gateway: DNS `hostname` (all A/AAAA), then `fallback_addr`. Prefers IPv4.
     pub fn gateway_candidates(&self) -> Result<Vec<IpAddr>>;
 }
@@ -155,7 +157,7 @@ Mapping rules:
 - Defaults not in the bundle come from §14 (AOSP `IkeSessionParams` defaults): nonce 32 B, retransmit {500 ms ×2, 5 sends, fail at 15.5 s},
   NAT-T keepalive 10 s, fragment threshold 1280, EAP-TLS fragment 1024, TLS 1.2 only, MOBIKE on, SIGNATURE_HASH_ALGORITHMS on,
   rekey at soft lifetime = `lifetime_secs * (1 - rekey_margin_fraction)` with NO jitter (AOSP has none).
-- `ims.*` from `imsIndividualCredentials` + top-level `token`; carried for the SIP layer, unused here.
+- `ims.*` from `imsIndividualCredentials`; carried for the SIP layer, unused here (the creds plist's provisioning `token` is not parsed).
 
 ## 3. Crypto (`crypto/*`)
 
@@ -508,8 +510,9 @@ impl EapPacket {
 ```
 ### 9.2 EAP-TLS (RFC 5216 §3.1): Type 13; type_data = `Flags(1) | [TLS Message Length(4) if L] | TLS data`.
 ```rust
-pub struct EapTlsConfig { pub identity: Vec<u8>, pub client_cert_pem: String, pub client_key_pem: String, pub validate_server: bool,
-                          pub server_ca_pem: Option<String>, pub server_name: Option<String> /* SNI; None = none */, pub max_fragment_len: usize, pub allow_tls13: bool }
+pub struct EapTlsConfig { pub identity: Vec<u8>, pub client_cert_der: Vec<u8> /* leaf, DER */, pub client_key_der: Vec<u8> /* PKCS#8 DER */,
+                          pub validate_server: bool, pub server_ca_der: Vec<Vec<u8>> /* DER anchors */, pub server_name: Option<String> /* SNI; None = none */,
+                          pub max_fragment_len: usize, pub allow_tls13: bool }
 pub enum EapAction { Send(EapPacket), Success { msk: Vec<u8>, emsk: Vec<u8> }, Failure(String) }
 pub struct EapTlsClient { /* rustls ClientConnection, rx buffer(+expected len), tx queue, state, msk */ }
 impl EapTlsClient {
@@ -567,7 +570,7 @@ crate.** The `EapTlsClient` / `EapTlsConfig` / `EapAction` API in `eap/tls.rs` (
 - `protocol_version()` returns `Option<&str>` (OpenSSL name, e.g. `"TLSv1.2"`) and the new `cipher_name()` returns the
   negotiated suite (e.g. `"AES128-SHA"`); both are known once the ServerHello has been processed.
 Engine rules: `SslMethod::tls_client()`, min/max proto TLS 1.2 (max 1.3 only when `allow_tls13`), `SslVerifyMode::NONE`
-unless `validate_server` (then the PEM CA bundle), client leaf cert + key (PKCS#8/PKCS#1/SEC1 PEM), cipher list
+unless `validate_server` (then the DER trust anchors in `server_ca_der`), client leaf cert (DER) + key (PKCS#8 DER), cipher list
 `"DEFAULT:@SECLEVEL=1"` so `AES128-SHA` (0x002F) is offered alongside modern suites, no SNI unless configured,
 no session tickets required. Driving: an in-memory duplex (`Read` returns `WouldBlock` when empty, `Write` appends)
 under `SslStream`; call `connect()` and treat `ErrorCode::WANT_READ` as "need more peer bytes"; after every step drain

@@ -479,10 +479,10 @@ fn eap_tls_config(cfg: &Config) -> EapTlsConfig {
     let server_name = cfg.eap_tls.tls_server_name.clone().filter(|n| !n.is_empty());
     EapTlsConfig {
         identity: cfg.identity.eap_identity.clone(),
-        client_cert_pem: cfg.eap_tls.client_cert_pem.clone(),
-        client_key_pem: cfg.eap_tls.client_key_pem.clone(),
+        client_cert_der: cfg.eap_tls.client_cert_der.clone(),
+        client_key_der: cfg.eap_tls.client_key_der.clone(),
         validate_server: cfg.eap_tls.validate_server_cert,
-        server_ca_pem: cfg.eap_tls.server_ca_pem.clone(),
+        server_ca_der: cfg.eap_tls.server_ca_der.clone(),
         server_name,
         max_fragment_len: cfg.eap_tls.max_fragment_len,
         allow_tls13: cfg.eap_tls.allow_tls13,

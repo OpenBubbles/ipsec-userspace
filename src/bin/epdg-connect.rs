@@ -4,7 +4,7 @@
 //! etc.) can be granted once: `cargo test` binaries get a new hash-suffixed path on
 //! every build, `target/debug/epdg-connect` does not.
 //!
-//! Usage: epdg-connect [--bundle P] [--creds P] [--cert P] [--key P] [--hold SECS] [--no-dns]
+//! Usage: epdg-connect [--bundle P] [--creds P] [--cert PEM] [--key PEM] [--hold SECS] [--no-dns]
 //! Defaults point at tests/fixtures/. Set RUST_LOG=debug for hex dumps.
 
 use std::net::IpAddr;
@@ -44,7 +44,7 @@ fn main() {
             "--hold" => hold = Duration::from_secs(val().parse().expect("--hold seconds")),
             "--no-dns" => do_dns = false,
             "-h" | "--help" => {
-                println!("epdg-connect [--bundle P] [--creds P] [--cert P] [--key P] [--hold SECS] [--no-dns]");
+                println!("epdg-connect [--bundle P] [--creds P] [--cert PEM] [--key PEM] [--hold SECS] [--no-dns]");
                 return;
             }
             other => panic!("unknown argument {other}"),

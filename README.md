@@ -26,7 +26,8 @@ carrier-bundle style configuration. Verified live against T-Mobile's production 
 
 `Config::from_plist_bundle` / `from_plist_files` takes the decoded carrier bundle (`imsCommonCredentials`, `CBRoot.TechSettings`
 with the IKE / ChildSAs / ExtraConfigurationAttributeRequest blocks), the individual-credentials dictionary
-(`imsIndividualCredentials`, `subscriberId`, `token`), and the client certificate + private key PEMs. See
+(`imsIndividualCredentials`, `subscriberId`), and the client certificate + private key as DER (`from_plist_files`
+reads PEM files and converts them once via `epdg::pem`; nothing downstream sees PEM). See
 `tests/fixtures/` for the exact shape and `docs/DESIGN.md` §2 for the field mapping (`$subscriber-id` substitution,
 transform names, CFG attribute order, defaults taken from the AOSP reference client).
 

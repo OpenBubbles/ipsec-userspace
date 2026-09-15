@@ -11,10 +11,11 @@ fn main() {
     let server_name = std::env::args().skip_while(|a| a != "--sni").nth(1);
     let cfg = EapTlsConfig {
         identity: b"900999990302421609@prodepdg.t-mobile.com".to_vec(),
-        client_cert_pem: std::fs::read_to_string(format!("{dir}client.crt")).unwrap(),
-        client_key_pem: std::fs::read_to_string(format!("{dir}client.key")).unwrap(),
+        // The fixtures are PEM; the engine takes DER, so convert at this edge.
+        client_cert_der: epdg::pem::certificate_pem_to_der(&std::fs::read_to_string(format!("{dir}client.crt")).unwrap()).unwrap(),
+        client_key_der: epdg::pem::private_key_pem_to_pkcs8_der(&std::fs::read_to_string(format!("{dir}client.key")).unwrap()).unwrap(),
         validate_server: false,
-        server_ca_pem: None,
+        server_ca_der: Vec::new(),
         server_name,
         max_fragment_len: 1024,
         allow_tls13,
