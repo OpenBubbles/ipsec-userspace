@@ -15,9 +15,11 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use log::{debug, trace, warn};
+use log::{debug, info, trace, warn};
 
 use crate::config::RetransmitConfig;
 use crate::ike::constants::*;
@@ -36,6 +38,27 @@ const SKF_FRAG_TOTAL_OFFSET: usize = SKF_FRAG_NUM_OFFSET + 2;
 /// Minimum datagram length that can carry the SKF fragment header.
 const SKF_MIN_LEN: usize = SKF_FRAG_TOTAL_OFFSET + 2;
 
+/// Longest a single `recv_from` may block before [`IkeTransport::recv`] re-reads the
+/// current socket. A [`IkeTransport::rebind`] swaps the socket under a blocked receive;
+/// slicing the wait bounds how long the rx thread keeps listening on the old one.
+const RECV_SLICE: Duration = Duration::from_millis(200);
+
+/// Longest a single outer send may block before it is abandoned and the datagram counted
+/// as lost.
+///
+/// 250 ms, well inside the 500 ms first retransmit interval. A UDP `send_to` only blocks
+/// when the socket buffer is full or, in this crate's usual environment, when a host
+/// firewall holds the flow pending a verdict — and the ESP TX sink runs that send
+/// SYNCHRONOUSLY under the inner stack's `state` mutex, which everything else on the
+/// stack (including the thread that delivers IKE responses) needs, so the timeout is the
+/// ceiling on how long one held datagram can stall the tunnel (DESIGN §17.6).
+pub const OUTER_SEND_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Minimum spacing between "datagram from an unexpected peer" warnings. A gateway that
+/// moves (or any host that can guess our ephemeral port) must not be able to turn the
+/// receive loop into a log flood; the datagrams are counted either way.
+const STRAY_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A datagram received from the gateway, classified per RFC 3948.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Incoming {
@@ -47,21 +70,36 @@ pub enum Incoming {
     Keepalive,
 }
 
-/// The UDP socket shared by IKE and ESP for the life of the tunnel.
-pub struct IkeTransport {
-    socket: UdpSocket,
+/// The socket and the address it is bound to, swapped as a unit by
+/// [`IkeTransport::rebind`] so no operation can ever see one without the other.
+struct Bound {
+    socket: Arc<UdpSocket>,
     /// Real egress address (never 0.0.0.0 / ::) and the bound ephemeral port.
     local: SocketAddr,
+}
+
+/// The UDP socket shared by IKE and ESP for the life of the tunnel.
+///
+/// The socket is behind an `RwLock` because the path monitor (DESIGN §17) replaces it
+/// when the host's egress address changes, while the rx thread, the keepalive thread,
+/// the ESP TX sink and any outstanding IKE request keep using "the current socket".
+/// Every operation clones the `Arc` out of the lock and releases the guard before the
+/// syscall, so a lock is never held across a blocking send or receive.
+pub struct IkeTransport {
+    bound: RwLock<Bound>,
     remote_ip: IpAddr,
     remote_port: u16,
     /// `true` after `switch_to_natt`: prepend/strip the non-ESP marker, allow ESP.
     use_marker: bool,
+    /// Datagrams dropped because they came from something other than the gateway.
+    stray_sources: AtomicU64,
+    last_stray_log: Mutex<Option<Instant>>,
 }
 
 impl std::fmt::Debug for IkeTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IkeTransport")
-            .field("local", &self.local)
+            .field("local", &self.local_addr())
             .field("remote", &self.remote_addr())
             .field("use_marker", &self.use_marker)
             .finish()
@@ -84,7 +122,7 @@ impl IkeTransport {
         }
         let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))?;
         // Bound every send: a paused/held flow must surface as an error, not block forever.
-        socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+        socket.set_write_timeout(Some(OUTER_SEND_TIMEOUT))?;
         let bound = socket.local_addr()?;
         // If the kernel still reports an unspecified address (shouldn't happen once we
         // bound to a concrete IP) substitute the discovered egress so callers never see 0.0.0.0.
@@ -94,12 +132,78 @@ impl IkeTransport {
             bound
         };
         debug!("ike transport bound {} -> {}:{}", local, remote, ike_port);
-        Ok(IkeTransport { socket, local, remote_ip: remote, remote_port: ike_port, use_marker: false })
+        Ok(IkeTransport {
+            bound: RwLock::new(Bound { socket: Arc::new(socket), local }),
+            remote_ip: remote,
+            remote_port: ike_port,
+            use_marker: false,
+            stray_sources: AtomicU64::new(0),
+            last_stray_log: Mutex::new(None),
+        })
     }
 
-    /// Real egress `addr:port` of the socket (never an unspecified address).
+    /// The socket to use right now and the address it is bound to. The guard is dropped
+    /// before returning: callers hold only an `Arc`, so a concurrent `rebind` can swap
+    /// the socket while an in-flight syscall keeps the old one alive.
+    fn current(&self) -> (Arc<UdpSocket>, SocketAddr) {
+        let b = self.bound.read().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(&b.socket), b.local)
+    }
+
+    /// Real egress `addr:port` of the socket (never an unspecified address). This moves
+    /// when the path monitor rebinds; [`crate::EpdgTunnel::local_addr`] exposes it.
     pub fn local_addr(&self) -> SocketAddr {
-        self.local
+        self.current().1
+    }
+
+    /// The address the OS would use to reach the gateway right now: a bind + connect
+    /// route probe on a throwaway socket, no packets sent. The path monitor's authority
+    /// for "did our egress address change / is there a route at all" (DESIGN §17); a
+    /// failure whose [`is_path_error`] holds means "no route", anything else means the
+    /// probe itself could not run and says nothing about the path.
+    pub fn probe_egress(&self) -> Result<IpAddr> {
+        discover_egress(self.remote_ip, self.remote_port)
+    }
+
+    /// Bind a fresh ephemeral port on `local_ip` and make it the transport's socket.
+    ///
+    /// The destination, the non-ESP marker and every SA (IKE and ESP SPIs, keys, replay
+    /// state) are untouched: only our side of the 5-tuple moves, which is exactly what
+    /// MOBIKE `UPDATE_SA_ADDRESSES` (RFC 4555 §3.5) / the RFC 7296 §2.23 dynamic address
+    /// update announce afterwards. On any error nothing is swapped and the old socket
+    /// stays in use.
+    ///
+    /// Returns the new local address and the replaced socket; the caller keeps that `Arc`
+    /// alive across the announce that follows, so the kernel cannot hand the old ephemeral
+    /// port to another socket in this process while the gateway's NAT binding may still
+    /// point at it. (The old socket is not read from; see DESIGN §17.8.)
+    pub fn rebind(&self, local_ip: IpAddr) -> Result<(SocketAddr, Arc<UdpSocket>)> {
+        // Defensive: an explicit `gateway.local_addr` of the wrong family would otherwise
+        // produce a socket that can never reach the gateway. Losing the last route of the
+        // gateway's family is reported as "no route" instead and ends in the grace period.
+        if local_ip.is_ipv4() != self.remote_ip.is_ipv4() {
+            return Err(Error::Config(format!(
+                "cannot rebind to {} for gateway {}: different IP families",
+                local_ip, self.remote_ip
+            )));
+        }
+        let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0))?;
+        socket.set_write_timeout(Some(OUTER_SEND_TIMEOUT))?;
+        let bound = socket.local_addr()?;
+        let local = if bound.ip().is_unspecified() { SocketAddr::new(local_ip, bound.port()) } else { bound };
+        let (old_socket, old_local) = {
+            let mut b = self.bound.write().unwrap_or_else(|e| e.into_inner());
+            let old = std::mem::replace(&mut *b, Bound { socket: Arc::new(socket), local });
+            (old.socket, old.local)
+        };
+        info!("ike transport rebound {} -> {} (dst {})", old_local, local, self.remote_addr());
+        Ok((local, old_socket))
+    }
+
+    /// Datagrams dropped because their source was not the gateway (counted, not fatal:
+    /// anything that can reach our port could otherwise tear the tunnel down).
+    pub fn stray_sources(&self) -> u64 {
+        self.stray_sources.load(Ordering::Relaxed)
     }
 
     /// Current destination: `gateway:500` before NAT-T, `gateway:4500` after.
@@ -156,7 +260,8 @@ impl IkeTransport {
     }
 
     fn send_raw(&self, bytes: &[u8], dst: SocketAddr) -> Result<()> {
-        let n = match self.socket.send_to(bytes, dst) {
+        let (socket, _) = self.current();
+        let n = match socket.send_to(bytes, dst) {
             Ok(n) => n,
             Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                 // A send that is held/blocked (e.g. a host firewall pausing the flow pending a
@@ -177,8 +282,12 @@ impl IkeTransport {
     }
 
     /// Wait up to `timeout` for a datagram from the gateway and classify it.
-    /// `Ok(None)` on timeout. Datagrams from any other source address are logged
+    /// `Ok(None)` on timeout. Datagrams from any other source address are counted
     /// and dropped without consuming the whole timeout.
+    ///
+    /// The wait is sliced (`RECV_SLICE`) and the socket is re-read on every slice, so a
+    /// [`IkeTransport::rebind`] performed while this call is blocked starts delivering
+    /// from the new socket within one slice instead of at the caller's own deadline.
     pub fn recv(&self, timeout: Duration) -> Result<Option<Incoming>> {
         let deadline = Instant::now() + timeout;
         let mut buf = vec![0u8; RECV_BUF_LEN];
@@ -187,11 +296,14 @@ impl IkeTransport {
             if remaining.is_zero() {
                 return Ok(None);
             }
+            let (socket, _) = self.current();
             // set_read_timeout(Some(0)) would mean "block forever"; clamp to >= 1 ms.
-            self.socket.set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
-            let (n, src) = match self.socket.recv_from(&mut buf) {
+            let slice = remaining.min(RECV_SLICE).max(Duration::from_millis(1));
+            socket.set_read_timeout(Some(slice))?;
+            let (n, src) = match socket.recv_from(&mut buf) {
                 Ok(v) => v,
-                Err(e) if is_timeout(&e) => return Ok(None),
+                // Slice expired: re-check the deadline and pick up a swapped socket.
+                Err(e) if is_timeout(&e) => continue,
                 Err(e) if is_transient(&e) => {
                     // ICMP-derived errors on an unconnected UDP socket (Windows, Linux with
                     // IP_RECVERR): the datagram is lost; the retransmit schedule covers it.
@@ -202,7 +314,15 @@ impl IkeTransport {
             };
             let expected = self.remote_addr();
             if src != expected {
-                warn!("dropping {} byte datagram from unexpected peer {} (expected {})", n, src, expected);
+                let total = self.stray_sources.fetch_add(1, Ordering::Relaxed) + 1;
+                let mut last = self.last_stray_log.lock().unwrap_or_else(|e| e.into_inner());
+                if last.is_none_or(|t| t.elapsed() >= STRAY_LOG_INTERVAL) {
+                    warn!(
+                        "dropping {} byte datagram from unexpected peer {} (expected {}; {} so far)",
+                        n, src, expected, total
+                    );
+                    *last = Some(Instant::now());
+                }
                 continue;
             }
             let data = &buf[..n];
@@ -226,11 +346,6 @@ impl IkeTransport {
         }
         trace!("esp rx {} bytes", data.len());
         Incoming::Esp(data.to_vec())
-    }
-
-    /// The underlying socket (for `try_clone` in a receive thread).
-    pub fn socket(&self) -> &UdpSocket {
-        &self.socket
     }
 
     /// Send a request (one datagram, or its SKF fragments) and collect the response
@@ -368,6 +483,36 @@ fn is_transient(e: &io::Error) -> bool {
     )
 }
 
+/// Does this error mean "the address or the route this socket depends on is gone"?
+///
+/// Used by the path monitor (DESIGN §17) to tell a broken local path (re-probe the
+/// egress, rebind, announce) from an unrelated failure (leave the tunnel alone). The
+/// `ErrorKind` variants are the portable answer; the errno fallback covers platforms
+/// and libc paths where std still reports `Uncategorized`.
+pub fn is_path_error(e: &io::Error) -> bool {
+    use io::ErrorKind::*;
+    matches!(e.kind(), AddrNotAvailable | NetworkUnreachable | HostUnreachable | NetworkDown)
+        || e.raw_os_error().is_some_and(path_errno)
+}
+
+/// EADDRNOTAVAIL(49) ENETDOWN(50) ENETUNREACH(51) EHOSTUNREACH(65)
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn path_errno(n: i32) -> bool {
+    matches!(n, 49 | 50 | 51 | 65)
+}
+
+/// EADDRNOTAVAIL(99) ENETDOWN(100) ENETUNREACH(101) EHOSTUNREACH(113)
+#[cfg(target_os = "linux")]
+fn path_errno(n: i32) -> bool {
+    matches!(n, 99 | 100 | 101 | 113)
+}
+
+/// Elsewhere the `ErrorKind` check above is the only classification.
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+fn path_errno(_n: i32) -> bool {
+    false
+}
+
 /// Read (Fragment Number, Total Fragments) from an SKF datagram (RFC 7383 §2.5).
 fn skf_numbers(data: &[u8]) -> Result<(u16, u16)> {
     if data.len() < SKF_MIN_LEN {
@@ -436,9 +581,14 @@ fn discover_egress(remote: IpAddr, port: u16) -> Result<IpAddr> {
         Ipv6Addr::UNSPECIFIED.into()
     };
     let probe = UdpSocket::bind(SocketAddr::new(any, 0))?;
-    probe.connect(SocketAddr::new(remote, port)).map_err(|e| {
-        Error::Io(io::Error::new(e.kind(), format!("no route to gateway {}:{}: {}", remote, port, e)))
-    })?;
+    // Re-wrapped so the message names the gateway (this is what a caller sees when
+    // `EpdgTunnel::connect` runs with the interface down). `io::Error::new` keeps
+    // `kind()`, which is what `is_path_error` looks at first, so the classification the
+    // path monitor depends on is unaffected; only `raw_os_error()` is dropped, and that
+    // is a fallback for platforms where std leaves the kind `Uncategorized`.
+    probe
+        .connect(SocketAddr::new(remote, port))
+        .map_err(|e| Error::Io(io::Error::new(e.kind(), format!("no route to gateway {}:{}: {}", remote, port, e))))?;
     let ip = probe.local_addr()?.ip();
     if ip.is_unspecified() {
         return Err(Error::Config(format!("could not determine egress address for {}", remote)));
@@ -821,6 +971,140 @@ mod tests {
         assert!(matches!(skf_numbers(&skf_dgram(1, 0, 5, &[])), Err(Error::Decode(_))));
         assert!(matches!(skf_numbers(&skf_dgram(1, 6, 5, &[])), Err(Error::Decode(_))));
         assert!(matches!(skf_numbers(&skf_dgram(1, 1, 0, &[])), Err(Error::Decode(_))));
+    }
+
+    /// Every outer socket — the original binding and every rebind — bounds its sends by
+    /// [`OUTER_SEND_TIMEOUT`]. The ESP TX sink runs `send_raw` synchronously under the
+    /// inner stack's `state` mutex, so this timeout is the ceiling on how long one
+    /// datagram held by a host firewall can stall everything else on the stack
+    /// (DESIGN §17.6).
+    #[test]
+    fn every_outer_socket_bounds_its_sends() {
+        let p = peer();
+        let t = transport(&p);
+        let (sock, _) = t.current();
+        assert_eq!(sock.write_timeout().unwrap(), Some(OUTER_SEND_TIMEOUT));
+        let (_, _old) = t.rebind(LOOP).unwrap();
+        let (sock, _) = t.current();
+        assert_eq!(sock.write_timeout().unwrap(), Some(OUTER_SEND_TIMEOUT), "a rebind keeps the bound");
+        // Well inside the first retransmit interval, so a held datagram is retransmitted
+        // rather than sat on.
+        assert!(OUTER_SEND_TIMEOUT < Duration::from_millis(crate::config::RetransmitConfig::default().initial_timeout_ms));
+    }
+
+    #[test]
+    fn rebind_moves_the_source_port_and_keeps_the_destination() {
+        let p = peer();
+        let t = transport(&p);
+        let before = t.local_addr();
+        t.send_ike(&request_dgram(1)).unwrap();
+        let (_, src) = peer_recv(&p);
+        assert_eq!(src, before);
+
+        // The old socket is held for the whole test so the kernel cannot recycle its
+        // port into the new binding and make the inequality below flaky.
+        let (new, _old) = t.rebind(LOOP).unwrap();
+        assert_ne!(new.port(), before.port());
+        assert_eq!(new.ip(), LOOP);
+        assert_eq!(t.local_addr(), new);
+        assert_eq!(t.remote_addr(), p.local_addr().unwrap(), "destination unchanged");
+
+        // Sends leave the new port ...
+        t.send_ike(&request_dgram(2)).unwrap();
+        let (got, src) = peer_recv(&p);
+        assert_eq!(got, request_dgram(2));
+        assert_eq!(src, new);
+        // ... and receives arrive on it.
+        p.send_to(&response_dgram(2, OUR_SPI, 0x22), new).unwrap();
+        assert_eq!(t.recv(Duration::from_secs(2)).unwrap(), Some(Incoming::Ike(response_dgram(2, OUR_SPI, 0x22))));
+    }
+
+    #[test]
+    fn rebind_while_a_receive_is_blocked_is_picked_up_quickly() {
+        let p = peer();
+        let t = Arc::new(transport(&p));
+        let rx = {
+            let t = Arc::clone(&t);
+            thread::spawn(move || {
+                let started = Instant::now();
+                let got = t.recv(Duration::from_secs(5)).unwrap();
+                (got, started.elapsed())
+            })
+        };
+        // Give the receiver time to park on the old socket, then move underneath it.
+        thread::sleep(Duration::from_millis(50));
+        let (new, _old) = t.rebind(LOOP).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        p.send_to(&response_dgram(3, OUR_SPI, 0x33), new).unwrap();
+
+        let (got, elapsed) = rx.join().unwrap();
+        assert_eq!(got, Some(Incoming::Ike(response_dgram(3, OUR_SPI, 0x33))));
+        assert!(elapsed < Duration::from_secs(3), "picked up the new socket in {elapsed:?}");
+    }
+
+    #[test]
+    fn probe_egress_reports_the_route_address() {
+        let p = peer();
+        let t = transport(&p);
+        assert_eq!(t.probe_egress().unwrap(), LOOP);
+    }
+
+    #[test]
+    fn path_errors_are_classified() {
+        use io::ErrorKind::*;
+        for kind in [AddrNotAvailable, NetworkUnreachable, HostUnreachable, NetworkDown] {
+            assert!(is_path_error(&io::Error::new(kind, "x")), "{kind:?}");
+        }
+        for kind in [TimedOut, WouldBlock, PermissionDenied, ConnectionRefused] {
+            assert!(!is_path_error(&io::Error::new(kind, "x")), "{kind:?}");
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        assert!(is_path_error(&io::Error::from_raw_os_error(50)), "ENETDOWN");
+        #[cfg(target_os = "linux")]
+        assert!(is_path_error(&io::Error::from_raw_os_error(100)), "ENETDOWN");
+        assert!(!is_path_error(&io::Error::from_raw_os_error(2)), "ENOENT is not a path error");
+    }
+
+    /// `discover_egress` names the gateway in its error. Re-wrapping must not cost the
+    /// path classification the monitor needs — `io::Error::new` keeps `kind()`, which
+    /// `is_path_error` checks before the errno fallback.
+    #[test]
+    fn a_connect_error_keeps_its_gateway_context_and_its_classification() {
+        for kind in [io::ErrorKind::NetworkUnreachable, io::ErrorKind::HostUnreachable] {
+            let raw = io::Error::new(kind, "Network is unreachable");
+            let wrapped = io::Error::new(raw.kind(), format!("no route to gateway 203.0.113.9:500: {raw}"));
+            assert!(is_path_error(&wrapped), "{kind:?}");
+            assert!(wrapped.to_string().contains("no route to gateway 203.0.113.9:500"), "{wrapped}");
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux"))]
+        {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            let raw = io::Error::from_raw_os_error(51);
+            #[cfg(target_os = "linux")]
+            let raw = io::Error::from_raw_os_error(101);
+            // The errno is dropped by the re-wrap; the kind std derived from it is not.
+            let wrapped = io::Error::new(raw.kind(), format!("no route to gateway 203.0.113.9:500: {raw}"));
+            assert!(is_path_error(&wrapped), "ENETUNREACH survives the re-wrap as a kind");
+        }
+    }
+
+    #[test]
+    fn stray_source_datagrams_are_counted_not_fatal() {
+        let p = peer();
+        let stranger = peer();
+        let t = transport(&p);
+        stranger.send_to(&request_dgram(9), t.local_addr()).unwrap();
+        assert_eq!(t.recv(Duration::from_millis(150)).unwrap(), None);
+        assert_eq!(t.stray_sources(), 1);
+    }
+
+    #[test]
+    fn rebind_rejects_a_different_family() {
+        let p = peer();
+        let t = transport(&p);
+        let r = t.rebind(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        assert!(matches!(r, Err(Error::Config(_))), "got {r:?}");
+        assert_eq!(t.local_addr().ip(), LOOP, "nothing was swapped");
     }
 
     #[test]

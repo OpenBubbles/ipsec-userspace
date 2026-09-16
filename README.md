@@ -13,6 +13,14 @@ carrier-bundle style configuration. Verified live against T-Mobile's production 
   packet): IPv4/IPv6, inner UDP sockets (`EpdgTunnel::bind_udp`), a DNS resolver over the assigned servers
   (`EpdgTunnel::resolve`), IPv4 fragmentation/reassembly, ICMP echo replies; a small shim (`ipstack::frag`) fragments and
   reassembles IPv6 for the wire MTU, which smoltcp 0.14 cannot do on `Medium::Ip`; TCP sockets are one method away in the same `SocketSet`.
+- **Mobility and liveness** (`docs/DESIGN.md` §17): the egress route is watched (or reported by the caller through
+  `EpdgTunnel::network_changed()`); an address change rebinds the outer socket — same SAs, same keys, new 5-tuple — and
+  announces it with MOBIKE `UPDATE_SA_ADDRESSES` (RFC 4555) or, against a gateway without MOBIKE, with the RFC 7296
+  §2.23 dynamic address update, tolerating a 30 s outage — retransmission exhaustion included — before giving up. A
+  DPD-independent one-way-traffic probe notices a gateway that stopped answering, even when nothing was ever received,
+  a slower idle probe covers a registration that never transmits at all, and an unrecoverable tunnel fails every inner
+  socket with `NotConnected` at once, so the SIP transport above closes its connection instead of hanging. (Acting on that close — rebuilding the tunnel — is the embedder's job; see
+  `docs/DESIGN.md` §17.6 for where the chain currently ends.)
 - Crypto for IKE/ESP via RustCrypto (`aes`/`cbc`/`hmac`/`sha2`) and `num-bigint` MODP DH, behind a transform registry
   (`crypto::registry`) so more algorithms can be added without touching protocol code.
 

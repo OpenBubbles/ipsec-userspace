@@ -176,8 +176,26 @@ struct StackShared {
     state: Mutex<State>,
     cv: Condvar,
     stop: AtomicBool,
+    /// `Some(reason)` once the stack has been closed.
+    ///
+    /// Deliberately NOT inside `State`: the stack thread holds that mutex across a whole
+    /// `poll`, which drives the device's TX sink and therefore a BLOCKING outer ESP send
+    /// (up to the socket's write timeout, per packet). A close that had to wait for it
+    /// could not publish the death, let alone wake the parked receivers, for seconds —
+    /// while `mark_dead` promises the opposite (DESIGN §17.6).
+    closed: Mutex<Option<String>>,
+    /// Everything a close must fail immediately, for the same reason: the senders whose
+    /// drop wakes a blocked [`InnerUdpSocket::recv_timeout`], and the completion slots of
+    /// in-flight DNS queries.
+    wakers: Mutex<Wakers>,
     /// Monotonic origin of smoltcp's clock.
     epoch: Instant,
+}
+
+#[derive(Default)]
+struct Wakers {
+    udp: HashMap<u16, SyncSender<UdpDatagram>>,
+    dns: Vec<Arc<DnsSlot>>,
 }
 
 impl StackShared {
@@ -188,11 +206,14 @@ impl StackShared {
     fn notify(&self) {
         self.cv.notify_all();
     }
+
+    fn closed_error(&self) -> Option<Error> {
+        lock(&self.closed).as_ref().map(|r| Error::Closed(r.clone()))
+    }
 }
 
 struct UdpBinding {
     handle: SocketHandle,
-    tx: SyncSender<UdpDatagram>,
 }
 
 /// Completion slot of one DNS query, waited on by `resolve` (own lock, not the stack's).
@@ -228,6 +249,19 @@ impl DnsSlot {
     }
 }
 
+/// Removes this call's DNS slots from [`StackShared::wakers`] however `resolve` returns.
+struct DnsRegistration<'a> {
+    shared: &'a StackShared,
+    slots: &'a [Arc<DnsSlot>],
+}
+
+impl Drop for DnsRegistration<'_> {
+    fn drop(&mut self) {
+        let mut w = lock(&self.shared.wakers);
+        w.dns.retain(|s| !self.slots.iter().any(|mine| Arc::ptr_eq(mine, s)));
+    }
+}
+
 struct DnsWaiter {
     handle: dns::QueryHandle,
     slot: Arc<DnsSlot>,
@@ -247,8 +281,6 @@ struct State {
     has_v4: bool,
     has_v6: bool,
     dns_servers: usize,
-    /// `Some(reason)` once the stack has been closed.
-    closed: Option<String>,
     udp_delivered: u64,
     udp_queue_drops: u64,
     udp_send_full: u64,
@@ -257,33 +289,35 @@ struct State {
 }
 
 impl State {
-    fn closed_error(&self) -> Option<Error> {
-        self.closed.as_ref().map(|r| Error::Closed(r.clone()))
-    }
-
     /// One stack-thread iteration: ingest the queued packets one at a time, moving what
     /// each one produced out to the waiting callers before the next (a smoltcp UDP
     /// socket only buffers `UDP_SOCKET_PACKETS` datagrams), then transmit.
-    fn poll(&mut self, now: smoltcp::time::Instant) {
+    fn poll(&mut self, now: smoltcp::time::Instant, wakers: &Mutex<Wakers>) {
         self.iface.poll_maintenance(now);
         loop {
             match self.iface.poll_ingress_single(now, &mut self.device, &mut self.sockets) {
                 PollIngressSingleResult::None => break,
                 PollIngressSingleResult::PacketProcessed => {}
-                PollIngressSingleResult::SocketStateChanged => self.drain(now),
+                PollIngressSingleResult::SocketStateChanged => self.drain(now, wakers),
             }
         }
         while self.iface.poll_egress(now, &mut self.device, &mut self.sockets) == PollResult::SocketStateChanged {}
-        self.drain(now);
+        self.drain(now, wakers);
     }
 
-    /// Move everything smoltcp's sockets hold out to the callers.
-    fn drain(&mut self, now: smoltcp::time::Instant) {
+    /// Move everything smoltcp's sockets hold out to the callers. `wakers` holds the
+    /// per-port senders (see [`StackShared::wakers`]).
+    fn drain(&mut self, now: smoltcp::time::Instant, wakers: &Mutex<Wakers>) {
         let State { sockets, dns, udp, dns_waiters, dns_servers, udp_delivered, udp_queue_drops, .. } = self;
 
         // UDP: smoltcp socket rx buffers -> per-binding channels.
         let mut disconnected = Vec::new();
+        let senders = lock(wakers);
         for (port, binding) in udp.iter() {
+            let Some(tx) = senders.udp.get(port) else {
+                disconnected.push(*port);
+                continue;
+            };
             let sock = sockets.get_mut::<udp::Socket>(binding.handle);
             while let Ok((payload, meta)) = sock.recv() {
                 let src = SocketAddr::from(meta.endpoint);
@@ -293,7 +327,7 @@ impl State {
                 });
                 let dg = UdpDatagram { src, dst: SocketAddr::new(dst_ip, *port), payload: payload.to_vec() };
                 trace!("inner UDP rx {} -> {} ({} bytes)", dg.src, dg.dst, dg.payload.len());
-                match binding.tx.try_send(dg) {
+                match tx.try_send(dg) {
                     Ok(()) => *udp_delivered += 1,
                     Err(TrySendError::Full(_)) => {
                         *udp_queue_drops += 1;
@@ -306,6 +340,7 @@ impl State {
                 }
             }
         }
+        drop(senders);
         for port in disconnected {
             if let Some(b) = udp.remove(&port) {
                 sockets.remove(b.handle);
@@ -335,12 +370,11 @@ impl State {
         });
     }
 
-    /// Fail every waiter, unbind every port (their receivers see `Closed`). Idempotent.
+    /// Cancel every query and remove every smoltcp socket. The waiters and receivers have
+    /// already been failed by [`InnerStack::close`], which does not need this mutex.
+    /// Idempotent.
     fn shutdown(&mut self, reason: &str) {
-        let State { sockets, dns, udp, dns_waiters, closed, .. } = self;
-        if closed.is_none() {
-            *closed = Some(reason.to_string());
-        }
+        let State { sockets, dns, udp, dns_waiters, .. } = self;
         let dns_sock = sockets.get_mut::<dns::Socket>(*dns);
         for w in dns_waiters.drain(..) {
             dns_sock.cancel_query(w.handle);
@@ -505,6 +539,8 @@ impl InnerStack {
 
         Ok(InnerStack {
             shared: Arc::new(StackShared {
+                closed: Mutex::new(None),
+                wakers: Mutex::new(Wakers::default()),
                 state: Mutex::new(State {
                     iface,
                     sockets,
@@ -516,7 +552,6 @@ impl InnerStack {
                     has_v4,
                     has_v6,
                     dns_servers: servers.len(),
-                    closed: None,
                     udp_delivered: 0,
                     udp_queue_drops: 0,
                     udp_send_full: 0,
@@ -559,12 +594,26 @@ impl InnerStack {
         let mut immediate = 0u32;
         while !sh.stop.load(Ordering::SeqCst) {
             let now = sh.now();
-            st.poll(now);
-            let s = &mut *st;
-            let wait = match s.iface.poll_delay(now, &s.sockets) {
+            st.poll(now, &sh.wakers);
+            let delay = {
+                let s = &mut *st;
+                s.iface.poll_delay(now, &s.sockets)
+            };
+            let wait = match delay {
                 Some(d) if d.total_micros() == 0 => {
                     immediate += 1;
                     if immediate < MAX_IMMEDIATE_POLLS {
+                        // Release `state` between re-polls. Every packet a poll emits
+                        // runs the outer ESP send synchronously under this mutex, and a
+                        // send that a host firewall holds pending a verdict blocks for
+                        // [`crate::ike::transport::OUTER_SEND_TIMEOUT`]. Carrying the
+                        // guard across up to MAX_IMMEDIATE_POLLS polls would stack those
+                        // holds while `push_rx` (the thread that also delivers IKE
+                        // responses), `bind_udp`, `send_to` and `close`'s smoltcp
+                        // cleanup all wait on it (DESIGN §17.6).
+                        drop(st);
+                        std::thread::yield_now();
+                        st = lock(&sh.state);
                         continue;
                     }
                     debug!("stack: {immediate} immediate re-polls in a row; yielding");
@@ -576,7 +625,9 @@ impl InnerStack {
             immediate = 0;
             st = sh.cv.wait_timeout(st, wait).unwrap_or_else(|e| e.into_inner()).0;
         }
-        st.shutdown("inner stack stopped");
+        drop(st);
+        // Whatever ended the loop, everything that could be waiting must fail.
+        self.close("inner stack stopped");
         debug!("stack thread stopped");
     }
 
@@ -586,15 +637,41 @@ impl InnerStack {
     }
 
     /// Like [`InnerStack::stop`] with a reason that later callers see in `Error::Closed`.
+    ///
+    /// Nothing here waits for the stack thread's `state` mutex first: that mutex is held
+    /// across a whole poll, which can block in an outer ESP send for the socket's write
+    /// timeout, and the promise `mark_dead` makes is that a blocked receiver fails
+    /// IMMEDIATELY (DESIGN §17.6). So the reason is published, the UDP senders are dropped
+    /// (which is what wakes a parked `recv_timeout`) and the DNS waiters are completed —
+    /// all under their own short-lived locks — and only then does the smoltcp-side cleanup
+    /// take `state` and wait for the poll in progress.
+    ///
+    /// The reason is published BEFORE `stop`: setting `stop` first is a race in which the
+    /// stack thread leaves its loop and closes with its own generic reason, losing the
+    /// tunnel's dead reason that every inner socket and the SIP transport's exit log
+    /// report. Idempotent, and the first reason wins.
     pub fn close(&self, reason: impl Into<String>) {
         let reason = reason.into();
+        let reason = {
+            let mut slot = lock(&self.shared.closed);
+            slot.get_or_insert(reason).clone()
+        };
+        {
+            let mut w = lock(&self.shared.wakers);
+            // Dropping the senders disconnects every receive channel: a thread parked in
+            // `InnerUdpSocket::recv_timeout` returns at once with `Error::Closed`.
+            w.udp.clear();
+            for slot in w.dns.drain(..) {
+                slot.complete(Err(Error::Closed(reason.clone())));
+            }
+        }
         self.shared.stop.store(true, Ordering::SeqCst);
-        lock(&self.shared.state).shutdown(&reason);
         self.shared.notify();
+        lock(&self.shared.state).shutdown(&reason);
     }
 
     pub fn is_closed(&self) -> bool {
-        self.shared.stop.load(Ordering::SeqCst) || lock(&self.shared.state).closed.is_some()
+        self.shared.stop.load(Ordering::SeqCst) || lock(&self.shared.closed).is_some()
     }
 
     /// Queue one decapsulated inner IP packet (from the ESP rx thread) and wake the
@@ -602,10 +679,10 @@ impl InnerStack {
     /// complete (§11.1). Never blocks for long: the device queue is bounded (drop-oldest).
     pub fn push_rx(&self, packet: Vec<u8>) {
         {
-            let mut st = lock(&self.shared.state);
-            if st.closed.is_some() {
+            if self.shared.closed_error().is_some() {
                 return;
             }
+            let mut st = lock(&self.shared.state);
             let Some(packet) = st.reassembler.push(packet, Instant::now()) else {
                 return;
             };
@@ -617,8 +694,12 @@ impl InnerStack {
     /// Bind an inner UDP port on every inner address. `port == 0` picks a free port
     /// in `49152..=65535`.
     pub fn bind_udp(&self, port: u16) -> Result<InnerUdpSocket> {
+        if let Some(e) = self.shared.closed_error() {
+            return Err(e);
+        }
         let mut st = lock(&self.shared.state);
-        if let Some(e) = st.closed_error() {
+        // Re-check under the lock: a close may have landed while we waited for it.
+        if let Some(e) = self.shared.closed_error() {
             return Err(e);
         }
         let port = if port == 0 {
@@ -635,9 +716,20 @@ impl InnerStack {
         let mut sock = udp::Socket::new(udp_buffer(), udp_buffer());
         sock.bind(IpListenEndpoint { addr: None, port })
             .map_err(|e| Error::Config(format!("inner UDP bind to port {port}: {e}")))?;
-        let handle = st.sockets.add(sock);
         let (tx, rx) = mpsc::sync_channel(UDP_QUEUE_DEPTH);
-        st.udp.insert(port, UdpBinding { handle, tx });
+        {
+            // Publishing the sender and the last "is it closed?" check happen under the
+            // SAME lock that `close` clears, so a close landing here either wakes this
+            // receiver or is seen right now — never neither. Nothing has been mutated yet
+            // on the error path.
+            let mut w = lock(&self.shared.wakers);
+            if let Some(e) = self.shared.closed_error() {
+                return Err(e);
+            }
+            w.udp.insert(port, tx);
+        }
+        let handle = st.sockets.add(sock);
+        st.udp.insert(port, UdpBinding { handle });
         drop(st);
         self.shared.notify();
         debug!("inner UDP port {port} bound");
@@ -653,11 +745,15 @@ impl InnerStack {
         // the wait anyway, so a far-future deadline is "until the resolver gives up".
         let deadline = Instant::now().checked_add(timeout).unwrap_or_else(|| Instant::now() + Duration::from_secs(1 << 30));
         let waiters = self.start_queries(name)?;
+        // Registered outside `state` so a close can complete them at once; removed again
+        // on every exit path below.
+        lock(&self.shared.wakers).dns.extend(waiters.iter().cloned());
         self.shared.notify();
 
         let mut answers: Vec<IpAddr> = Vec::new();
         let mut failure: Option<Error> = None;
         let mut timed_out = false;
+        let _unregister = DnsRegistration { shared: &self.shared, slots: &waiters };
         for slot in &waiters {
             let outcome = match slot.wait_until(deadline) {
                 Some(r) => Some(r),
@@ -682,7 +778,7 @@ impl InnerStack {
     /// Start one query per usable family; returns the completion slots (AAAA first).
     fn start_queries(&self, name: &str) -> Result<Vec<Arc<DnsSlot>>> {
         let mut st = lock(&self.shared.state);
-        if let Some(e) = st.closed_error() {
+        if let Some(e) = self.shared.closed_error() {
             return Err(e);
         }
         if st.dns_servers == 0 {
@@ -808,8 +904,11 @@ impl InnerUdpSocket {
     /// Queue `payload` for `dst` on this socket and wake the stack thread. The source
     /// address is chosen by smoltcp among the inner addresses of `dst`'s family.
     pub fn send_to(&self, dst: SocketAddr, payload: &[u8]) -> Result<()> {
+        if let Some(e) = self.stack.shared.closed_error() {
+            return Err(e);
+        }
         let mut st = lock(&self.stack.shared.state);
-        if let Some(e) = st.closed_error() {
+        if let Some(e) = self.stack.shared.closed_error() {
             return Err(e);
         }
         let (has_family, family) = match dst {
@@ -855,8 +954,9 @@ impl InnerUdpSocket {
             Ok(dg) => Ok(Some(dg)),
             Err(RecvTimeoutError::Timeout) => Ok(None),
             Err(RecvTimeoutError::Disconnected) => {
-                let st = lock(&self.stack.shared.state);
-                Err(st.closed_error().unwrap_or_else(|| Error::Closed("inner stack stopped".into())))
+                // `StackShared::closed` deliberately, not `State`: the stack thread may be
+                // holding `state` inside a blocking outer send, and this must not wait.
+                Err(self.stack.shared.closed_error().unwrap_or_else(|| Error::Closed("inner stack stopped".into())))
             }
         }
     }
@@ -898,6 +998,10 @@ impl Drop for InnerUdpSocket {
                 st.sockets.remove(b.handle);
                 debug!("inner UDP port {} unbound", self.port);
             }
+            // After the binding, so a concurrent `drain` never sees a bound port whose
+            // sender has already gone (it would unbind it before the queued egress above
+            // could be flushed).
+            lock(&self.stack.shared.wakers).udp.remove(&self.port);
         }
         self.stack.shared.notify();
     }
@@ -1051,13 +1155,7 @@ pub(crate) mod tests {
     // ---- pure helpers -------------------------------------------------------
 
     fn bindings(ports: &[u16]) -> HashMap<u16, UdpBinding> {
-        ports
-            .iter()
-            .map(|p| {
-                let (tx, _rx) = mpsc::sync_channel(1);
-                (*p, UdpBinding { handle: SocketHandle::default(), tx })
-            })
-            .collect()
+        ports.iter().map(|p| (*p, UdpBinding { handle: SocketHandle::default() })).collect()
     }
 
     #[test]
@@ -1748,13 +1846,26 @@ pub(crate) mod tests {
         // A resolve that would time out in 10 s is cut short by the stop.
         let resolver = {
             let a = p.a.clone();
-            thread::spawn(move || a.resolve(HOST, Duration::from_secs(10)))
+            thread::spawn(move || (a.resolve(HOST, Duration::from_secs(10)), Instant::now()))
+        };
+        // A receiver parked on its own long timeout must wake from the close itself,
+        // not from that timeout: the SIP transport above closes on this error, and the
+        // registration must not hang on for another ten seconds (DESIGN §17.6).
+        let receiver = {
+            let sa = p.a.bind_udp(0).unwrap();
+            thread::spawn(move || (sa.recv_timeout(Duration::from_secs(10)), Instant::now()))
         };
         thread::sleep(Duration::from_millis(50));
+        let closed_at = Instant::now();
         p.a.close("tunnel torn down");
         assert!(p.a.is_closed());
-        let e = resolver.join().unwrap().unwrap_err();
+        let (r, woke_at) = resolver.join().unwrap();
+        let e = r.unwrap_err();
         assert!(matches!(e, Error::Closed(ref r) if r == "tunnel torn down"), "{e}");
+        assert!(woke_at.duration_since(closed_at) < Duration::from_secs(2), "resolver woke at its own timeout");
+        let (r, woke_at) = receiver.join().unwrap();
+        assert!(matches!(r, Err(Error::Closed(ref r)) if r == "tunnel torn down"), "{r:?}");
+        assert!(woke_at.duration_since(closed_at) < Duration::from_secs(2), "receiver woke at its own timeout");
         let e = sa.send_to(SocketAddr::new(B_V6.into(), 1), b"x").unwrap_err();
         assert!(matches!(e, Error::Closed(_)), "{e}");
         let e = sa.recv_timeout(Duration::from_millis(10)).unwrap_err();
@@ -1764,6 +1875,60 @@ pub(crate) mod tests {
         assert_eq!(p.a.stats().udp_bindings, 0);
         p.a.push_rx(vec![0x60; 40]); // ignored after close, no panic
         drop(sa);
+    }
+
+    /// Regression (finding: the close blocked behind the poll mutex): the stack thread
+    /// holds `State` across its whole poll, and the poll drives the TX sink — a BLOCKING
+    /// outer ESP send bounded only by the socket write timeout, several packets per poll. A close
+    /// used to take that same mutex before it could drop the receive channels, so a
+    /// blocked `recv_timeout` woke seconds late (or at its own timeout) although
+    /// `mark_dead` promises "immediately" (DESIGN §17.6).
+    #[test]
+    fn close_wakes_a_blocked_receiver_while_the_stack_thread_is_in_a_slow_send() {
+        let in_sink = Arc::new(AtomicBool::new(false));
+        let sink: TxSink = {
+            let in_sink = Arc::clone(&in_sink);
+            Arc::new(move |_: &[u8]| {
+                in_sink.store(true, Ordering::SeqCst);
+                // Stands in for a congested outer socket blocking until its write timeout.
+                thread::sleep(Duration::from_millis(1500));
+                Ok(())
+            })
+        };
+        let s = InnerStack::new(&assigned(Some(A_V6), None, Some(B_V6), None), sink, MTU, STACK_MTU).unwrap();
+        let t = s.spawn().unwrap();
+        let sock = s.bind_udp(0).unwrap();
+        let receiver = {
+            let sock = s.bind_udp(0).unwrap();
+            thread::spawn(move || (sock.recv_timeout(Duration::from_secs(10)), Instant::now()))
+        };
+        // Get the stack thread into the sink, holding `State`.
+        sock.send_to(SocketAddr::new(B_V6.into(), 5060), b"hello").unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !in_sink.load(Ordering::SeqCst) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(in_sink.load(Ordering::SeqCst), "the stack thread never reached the sink");
+        let closed_at = Instant::now();
+        let closer = {
+            let s = s.clone();
+            thread::spawn(move || {
+                s.close("gateway stopped answering");
+                Instant::now()
+            })
+        };
+        let (r, woke_at) = receiver.join().unwrap();
+        assert!(matches!(r, Err(Error::Closed(ref why)) if why == "gateway stopped answering"), "{r:?}");
+        assert!(
+            woke_at.duration_since(closed_at) < Duration::from_secs(1),
+            "the receiver waited {:?} for the poll to finish",
+            woke_at.duration_since(closed_at)
+        );
+        // The reason is readable at once too, without the poll mutex.
+        assert!(s.is_closed());
+        closer.join().unwrap();
+        drop(sock);
+        t.join().unwrap();
     }
 
     #[test]

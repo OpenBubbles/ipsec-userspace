@@ -25,11 +25,18 @@ Implemented (exactly what the T-Mobile PROD ePDG profile negotiates):
   All behind traits + a registry so more can be added.
 - ESP tunnel mode over UDP/4500, anti-replay, NAT-T keepalive, inner IPv4/IPv6+UDP stack,
   a tiny DNS client for the live test.
-- Config: carrier-bundle plist model (`Config::from_plist_bundle`).
+- Config: carrier-bundle plist model (`Config::from_plist_bundle`, or one `Config::from_activation_plist` file).
 
-Not implemented: responder role, PSK/cert auth, EAP-AKA, MOBIKE address updates (we only
-announce `MOBIKE_SUPPORTED` if configured), IPComp, transport mode, ESN, 3GPP notifies
-(constants present), inner TCP.
+- Mobility and liveness (§17): a path monitor that rebinds the outer socket when the host's
+  egress address changes and announces it with MOBIKE `UPDATE_SA_ADDRESSES` (RFC 4555) or the
+  RFC 7296 §2.23 fallback; a one-way-traffic probe independent of the bundle's DPD flag.
+
+Not implemented: responder role, PSK/cert auth, EAP-AKA, IPComp, transport mode, ESN,
+3GPP notifies (constants present), inner TCP; on the mobility side, responder-initiated
+address changes and peer address lists (`ADDITIONAL_IP4/IP6_ADDRESS` are logged and
+ignored), and AOSP's `migrateAllChildSAs` child rekey on a non-MOBIKE move, which is done
+only as an escalation when ESP demonstrably stalls after the move — we transmitted from the new address and nothing
+came back (§17.3).
 
 ## 1. Module ownership
 
@@ -40,12 +47,12 @@ announce `MOBIKE_SUPPORTED` if configured), IPComp, transport mode, ESN, 3GPP no
 | `src/ike/{header,payload}.rs` | agent:codec | §4.1–4.2 |
 | `src/ike/{message,fragment}.rs` | agent:message | §4.3–4.4 |
 | `src/ike/{keys,auth,nat}.rs` | agent:keys | §5, §6 |
-| `src/ike/transport.rs` | agent:transport | §7 |
-| `src/ike/session.rs` | agent:session | §8 |
+| `src/ike/transport.rs` | agent:transport | §7, §17.1 |
+| `src/ike/session.rs` | agent:session | §8, §17.2 |
 | `src/eap/{packet,tls}.rs` | agent:eap | §9 |
 | `src/esp/{codec,replay}.rs` | agent:esp | §10 |
 | `src/ipstack/{device,frag,stack}.rs` | agent:ipstack | §11, §11.1 |
-| `src/tunnel.rs` + `tests/live_tmobile.rs` | agent:tunnel | §12, §13 |
+| `src/tunnel.rs` + `tests/live_tmobile.rs` | agent:tunnel | §12, §13, §17 |
 
 Fixed already (do not change signatures): `src/lib.rs`, `src/error.rs`, `src/crypto/mod.rs`
 (traits), `src/ike/constants.rs`. Use `crate::{Error, Result}` and `crate::ike::constants::*`.
@@ -137,6 +144,10 @@ impl Config {
     pub fn from_plist_bundle(bundle: &plist::Value, creds: &plist::Value, client_cert_der: &[u8], client_key_der: &[u8]) -> Result<Config>;
     /// Files: the plists plus PEM certificate/key files (the fixture format), converted via `pem`.
     pub fn from_plist_files(bundle: &Path, creds: &Path, client_cert_pem: &Path, client_key_pem: &Path) -> Result<Config>;
+    /// One "activation config" plist carrying `cred` + `bundle` + `tunnel { certificate_der, key_der,
+    /// subscriber_id }` — the same inputs with no PEM anywhere. `from_activation_file` reads it from disk.
+    pub fn from_activation_plist(root: &plist::Value) -> Result<Config>;
+    pub fn from_activation_file(path: &Path) -> Result<Config>;
     /// Resolve the gateway: DNS `hostname` (all A/AAAA), then `fallback_addr`. Prefers IPv4.
     pub fn gateway_candidates(&self) -> Result<Vec<IpAddr>>;
 }
@@ -375,8 +386,10 @@ Local address for the hash: the socket's bound address; if bound to 0.0.0.0, dis
 `UdpSocket::connect(remote)` on a throwaway socket and `local_addr()`. If the responder omits NAT notifies → `detected=false`.
 
 ## 7. Transport (`ike/transport.rs`)
-One `UdpSocket` for the whole tunnel life (IKE and ESP multiplexed, RFC 3948). Bound to an ephemeral port on
-`gateway.local_addr` or the discovered egress. Destination port starts at 500; `switch_to_natt()` moves it to 4500
+One UDP socket at a time for the whole tunnel (IKE and ESP multiplexed, RFC 3948), held as
+`RwLock<Bound { Arc<UdpSocket>, SocketAddr }>` so the path monitor can swap it without stopping the rx, keepalive or
+ESP-TX paths (§17.1): every operation clones the `Arc` and drops the guard, so no lock is held across a syscall.
+Bound to an ephemeral port on `gateway.local_addr` or the discovered egress. Destination port starts at 500; `switch_to_natt()` moves it to 4500
 and turns on the 4-byte non-ESP marker for IKE. Inbound classification on 4500 (RFC 3948 §2.2/§4):
 first 4 bytes zero → IKE (strip marker); length 1 and byte 0xFF → keepalive; else → ESP (first 4 bytes = SPI ≠ 0).
 ```rust
@@ -391,8 +404,15 @@ impl IkeTransport {
     pub fn send_ike(&self, datagram: &[u8]) -> Result<()>;  // adds marker if using_natt
     pub fn send_esp(&self, esp: &[u8]) -> Result<()>;       // raw, must be using_natt
     pub fn send_keepalive(&self) -> Result<()>;
-    pub fn recv(&self, timeout: Duration) -> Result<Option<Incoming>>;   // None on timeout; ignores datagrams from other peers (warn)
-    pub fn socket(&self) -> &UdpSocket;                     // for try_clone in the rx thread
+    pub fn recv(&self, timeout: Duration) -> Result<Option<Incoming>>;   // None on timeout; re-samples the current socket each
+                                                            // iteration (200 ms slices) so a rebind is picked up promptly;
+                                                            // datagrams from other peers are dropped, counted (`stray_sources`)
+                                                            // and logged at most once per 5 s
+    pub fn probe_egress(&self) -> Result<IpAddr>;           // §17.1: discover_egress at the current destination, no packets
+    pub fn rebind(&self, local_ip: IpAddr) -> Result<(SocketAddr, Arc<UdpSocket>)>;  // §17.1: fresh ephemeral port on
+                                                            // `local_ip`, same destination/marker/SAs; returns the new local
+                                                            // address and the replaced socket (kept alive by the caller)
+    pub fn stray_sources(&self) -> u64;
     /// Send a request (one datagram, or its SKF fragments) and collect the response datagrams for `message_id`:
     /// retransmit ALL datagrams on each timeout per `policy` (same bytes each time). Returns all datagrams that make up
     /// the response (1 if unfragmented; else all SKF fragments, collected until `total` seen or a per-fragment timeout).
@@ -404,6 +424,13 @@ impl IkeTransport {
 ```
 Response matching: header.is_response() && header.message_id == message_id && header.spi_i == ours. Retransmit
 schedule: `initial_timeout_ms * backoff^n`, `max_attempts` sends total; then `Error::Timeout`.
+`is_path_error(&io::Error)` (free function) classifies "this socket's address or route is gone" —
+`AddrNotAvailable` / `NetworkUnreachable` / `HostUnreachable` / `NetworkDown` plus a cfg'd errno fallback for
+macOS/iOS and Linux, for platforms and libc paths where std still reports `Uncategorized`. `discover_egress` names
+the gateway in its error (`no route to gateway 203.0.113.9:500: …`), which is what a caller sees for the commonest
+connect failure; re-wrapping with `io::Error::new(e.kind(), …)` keeps `kind()`, which `is_path_error` checks first,
+so the classification the path monitor depends on is unaffected. Note `send_raw` still swallows `WouldBlock`/`TimedOut` as a lost datagram: send errors
+only *accelerate* the path monitor, they are never its authority (§17.1).
 
 ## 8. Initiator state machine (`ike/session.rs`) — sans-I/O
 Owns all IKE state; never touches sockets. The tunnel (§12) drives it: build → (encode) → send/recv → decode → handle.
@@ -696,7 +723,8 @@ wraps the device:
 
 ## 12. Tunnel facade (`tunnel.rs`)
 ```rust
-pub struct TunnelInfo { pub local_addr: SocketAddr, pub remote_addr: SocketAddr, pub nat: NatStatus, pub assigned: AssignedConfig,
+pub struct TunnelInfo { pub local_addr: SocketAddr, /* at establishment; see local_addr() */ pub remote_addr: SocketAddr,
+    pub peer_mobike: bool, pub nat: NatStatus, pub assigned: AssignedConfig,
     pub ike_spi_i: u64, pub ike_spi_r: u64, pub child_spi_in: u32, pub child_spi_out: u32, pub ike_suite: String, pub child_suite: String,
     pub tls_version: String, pub handshake_duration: Duration }
 pub struct EpdgTunnel { /* Arc<Shared>, rx thread, timer thread */ }
@@ -706,8 +734,13 @@ impl EpdgTunnel {
     pub fn bind_udp(&self, local_port: u16) -> Result<InnerUdpSocket>;   // 0 = pick free (49152..65535); smoltcp picks the source address by route
     pub fn resolve(&self, name: &str, timeout: Duration) -> Result<Vec<IpAddr>>; // smoltcp DNS socket over the assigned servers
     pub fn is_alive(&self) -> bool;
+    pub fn local_addr(&self) -> SocketAddr;                             // the outer socket's CURRENT address (moves with §17.1)
+    pub fn peer_mobike(&self) -> bool;                                  // the responder announced MOBIKE_SUPPORTED (RFC 4555 §3.1)
+    pub fn network_changed(&self);                                      // §17.1: an OS network-change callback; returns immediately
     pub fn dpd(&self) -> Result<Duration>;                              // on-demand liveness check (empty INFORMATIONAL), returns RTT
-    pub fn stats(&self) -> TunnelStats;                                 // esp tx/rx packets+bytes, replay drops, icv fails, keepalives sent, last rx Instant
+    pub fn stats(&self) -> TunnelStats;                                 // esp tx/rx packets+bytes, replay drops, icv fails, keepalives sent, last rx Instant,
+                                                                        // address_updates, stray_sources (the current local address and
+                                                                        // peer_mobike are read from local_addr() / info(), not duplicated here)
     pub fn close(self) -> Result<()>;                                   // INFORMATIONAL Delete(IKE) (best effort, short timeout), stop threads
 }
 pub struct InnerUdpSocket { /* port, Receiver<UdpDatagram>, Arc<Shared> */ }
@@ -729,7 +762,18 @@ DPD if enabled and no IKE/ESP rx for `interval_secs` → `dpd()` with `max_retri
 failure (torn down WITHOUT sending DELETE, like AOSP); rekey child at the soft lifetime `lifetime*(1-margin)` (no jitter) via `build_rekey_child`, then `build_delete_child(old)`;
 rekey IKE at its lifetime similarly (`build_rekey_ike`, then delete old IKE SA). All post-establishment IKE requests go
 through one `request()` helper that serialises on a mutex (one outstanding request), uses the transport's retransmit
-policy, and routes the response via the rx thread's pending slot. Fragmented responses are collected there too.
+policy, and routes the response via the rx thread's pending slot. Fragmented responses are collected there too; that
+helper also takes an optional **abort** predicate so an in-flight request abandons within one 200 ms slice when the
+path moved under it or `close()` started (§17.4).
+Threads, spawned in this order and joined rx → keepalive → timer → path → stack: `epdg-stack`, `epdg-rx`,
+`epdg-keepalive`, `epdg-timer`, `epdg-path` (§17.1). The timer thread also runs the one-way-traffic probe (§17.5).
+Lock order, never taken in any other: `request_lock` → the transport's socket lock (brief) → `ike` → `pending`;
+`path.inner` is a leaf. `stats()` takes `last_rx` and the inner stack's `state`, and never `ike` — it may be called
+from a thread that already holds it. Inside the inner stack the order is `state` → `wakers`; `InnerStack::close` takes
+`closed`, then `wakers`, then `state`, never two of them at once across the boundary (§17.6).
+Teardown: `close()` sets `closing` (not `stop`) and wakes the path thread *before* its DELETE(IKE), so closing never
+waits out a retransmit schedule while the rx thread stays alive to deliver the DELETE's response; then `stop`, then
+the stack is closed with the reason `"tunnel closed by request"` — see §17.6 for the whole death chain.
 
 ## 13. Tests
 Unit (per module, `cargo test` offline): header/payload/message round-trips incl. every payload type; SK
@@ -745,7 +789,27 @@ delivered in full, send_to-then-drop still transmitted, send-buffer-full counted
 thread and senders (Send + Sync), bind_udp(0) allocation/duplicates/unbind-on-drop, queue bounds, resolve AAAA+A / family skip /
 NXDOMAIN / caller timeout / silent server beyond smoltcp's 10 s give-up (Timeout, not Protocol) / non-unicast servers skipped /
 input errors, stop semantics, stack-thread panic closes the stack;
-config parsing of `tests/fixtures/tmobile_prod_bundle.plist` + `tmobile_creds.plist` (assert every mapped field).
+config parsing of `tests/fixtures/tmobile_prod_bundle.plist` + `tmobile_creds.plist` (assert every mapped field);
+mobility and liveness (§17, all offline): the MOBIKE notify constants and their status-vs-error range (including that
+16403/16404 are *not* MOBIKE), NAT-D hashed with the real SPIr, `build_address_update` payload order and hashes (with
+and without MOBIKE, with and without NAT-D), the response arm (commit, every rejection shape, malformed NAT-D
+tolerated, `ADDITIONAL_*` tolerated), the replay guard — a reused message id refused even when the replay carries a
+full NAT-D pair, because the request cached under it may have been an earlier address update — and that an UNSENT
+abort does not mark its id abandoned; COOKIE2 echoed in every peer INFORMATIONAL response; `IkeTransport::rebind` over
+loopback (new source port, destination kept, a blocked `recv` picks the new socket up) and `is_path_error` /
+stray-source counting; the whole `PathMonitor::tick` table — including that an already-running grace still expires
+while the route probe itself cannot run — the one-way-probe predicate, the idle-probe predicate, the ESP-stall
+predicate (that inbound IKE does not disarm it, and that its silence is measured from the transmission) and the
+address-update failure classification as pure functions with an injected clock, with a local `ENOBUFS`/`EPERM` send
+failure classified transient; that ESP which fails ICV or names an unknown SPI, and IKE that does not decode, never
+touch the liveness clocks; `mark_dead` waking a parked receiver and resolver at once with the right reason and keeping
+the first one, including while the stack thread is inside a slow outer send; the path thread exiting on `closing`
+alone; and, over a loopback socket with a forced-established session, that `closing` abandons an in-flight DPD instead
+of waiting out its schedule, that an announce is abandoned at the grace deadline, that an aborted-before-send request
+leaves the next message id clean, and that an announce on an abandoned id sends the empty DPD first (observed on a
+real loopback peer socket: the first datagram is materially shorter than the `UPDATE_SA_ADDRESSES` one). In `rsipstack`, `transport::custom_udp` tests a scripted fake socket: the
+serve loop exits on `NotConnected`, survives other errors, reports a dead send to its caller while the receive path
+ends the loop, and the connection stays unreliable UDP.
 Live (`tests/live_tmobile.rs`): loads the fixtures, `EpdgTunnel::connect`, asserts an inner IPv6 (or v4) address and ≥1 DNS
 server were assigned (P-CSCF attributes are optional — the PROD ePDG sends none; the P-CSCF is found via `resolve()`), prints
 `TunnelInfo`; then resolves `ueb2bprod.pc.t-mobile.com` over the tunnel via the
@@ -929,7 +993,479 @@ a write under a write timeout never loses or duplicates bytes (delivered == repo
 DNS round trip through `&dyn NetStack` and asserts `name() == "epdg-tunnel"`, `local_addrs()` == the assigned inner addresses and
 `bind_udp` (incl. `AddrInUse` on a taken port) so the live run covers the `EpdgTunnel` implementation.
 
+## 17. Mobility and liveness (`tunnel.rs`, `ike/transport.rs`, `ike/session.rs`)
+
+The outer socket is bound once to the egress address the OS picked at connect time (§7), but the host under it
+does not hold still: Wi-Fi comes and goes, a handover changes the egress interface, an IPv6 privacy address rotates.
+And because operator bundles routinely clear `dpd.enabled` (the T-Mobile one does), nothing used to notice a gateway
+that had stopped answering. §17 is the three answers: a **path monitor** that moves the socket and tells the gateway,
+a **one-way traffic probe** that runs whatever the bundle says about DPD, and a **death signal** that reaches the SIP
+transport at once instead of at its own timeout.
+
+### 17.1 The path monitor (`epdg-path` thread)
+
+The authority is `IkeTransport::probe_egress()` — `discover_egress` at the transport's current destination: bind a
+throwaway socket, `connect()` it (no packets leave), read back `local_addr().ip()`. That is the address the OS *would*
+source from right now; comparing it with the address the transport is bound to is the whole detection.
+
+It runs on its own thread (not on the 1 s timer tick, whose body can block for tens of seconds inside DPD retries or a
+rekey) every `PATH_PROBE_INTERVAL`, and out of band when:
+- an outer send fails with a path-kind error — `AddrNotAvailable` / `NetworkUnreachable` / `HostUnreachable` /
+  `NetworkDown`, or the platform errno behind them (`is_path_error`, with a cfg'd errno table for macOS/iOS and Linux
+  because `io::ErrorKind` does not cover every libc case). The ESP sink, the keepalive thread, `ike_request`'s sends
+  and the rx thread's receive errors all report through `PathState::note_path_error`; or
+- the caller calls `EpdgTunnel::network_changed()` from an OS network-change callback (`NWPathMonitor`,
+  `ConnectivityManager`).
+An out-of-band request is floored at `PATH_PROBE_MIN_SPACING`: a downed interface fails thousands of ESP sends per
+second, and each one asks for a probe. `network_changed()` bypasses the floor, being caller-driven and rare.
+
+The decision itself is a pure function — `PathMonitor::tick(PathInput) -> PathAction`, no clock reads, no I/O — so
+every branch below is a unit test:
+
+| probe | state | action |
+|---|---|---|
+| any | impaired for ≥ `NO_ROUTE_GRACE` | `Dead(reason)` |
+| `Unknown` (the probe itself failed: EMFILE, sandbox EPERM…) | not yet impaired | `Idle`, **no clock started or advanced** — a denied probe socket must never tear down a working registration |
+| `NoRoute` (a path-kind `Io` from the probe) | — | start/keep the impairment clock ("no route to the gateway") → `Idle` |
+| `Egress(ip)` | rebound but not acknowledged | `Announce`, or `Rebind(ip)` if the route moved again meanwhile |
+| `Egress(ip)`, `ip != bound` | — | `Rebind(ip)`, unless the previous move was < `MIN_ADDRESS_UPDATE_INTERVAL` ago (flap damping), in which case `Idle`. A first move after a quiet period is never delayed — that is the handover this feature exists for |
+| `Egress(ip)`, `ip == bound` | impairment clock running | `Rebind(ip)` — the interface came back, possibly on the same address; the stale binding and its fresh ephemeral port are themselves the change the gateway must learn. Damped by `MIN_ADDRESS_UPDATE_INTERVAL` exactly like the row above, or a link flapping between `NoRoute` and the same address would alternate the two rows and spend one address update per blip — as often as `PATH_PROBE_MIN_SPACING`, since a failing send asks for an out-of-band probe. The impairment clock keeps running while it waits, so `NO_ROUTE_GRACE` still bounds the outage |
+| `Egress(ip)`, `ip == bound` | every send failing **and** nothing received, both for ≥ `NO_ROUTE_GRACE` | one `Rebind(ip)`, then `Dead("the outer socket has been unusable for …")` |
+| otherwise | — | `Idle` |
+
+Row order is load-bearing: the grace is checked **before** the `Unknown` shortcut. A probe that cannot run is usually
+persistent (an fd limit, a sandbox policy), and letting it short-circuit an already-running clock froze that clock
+forever — `path_loop` re-latches `suspended` from the unchanged monitor state, which stands down the bundle DPD, both
+liveness probes of §17.5 and every rekey, so nothing was left that could declare the tunnel dead while it carried
+nothing. `Unknown` now only refuses to *start or advance* a clock, which is all its rationale ever justified.
+
+One clock covers every kind of impairment (no route, a rebind that keeps failing, an address the gateway will not
+acknowledge, a wedged socket); `impaired_reason` only relabels it, so the grace covers the whole outage rather than
+restarting per phase. A configured `gateway.local_addr` is a promise: the monitor may rebind *on* it (a fresh port
+after an outage) but never moves off it.
+
+`IkeTransport` holds its socket as `RwLock<Bound { Arc<UdpSocket>, SocketAddr }>`; every operation clones the `Arc`
+and drops the guard, so no lock is ever held across a syscall, and `recv` re-samples it each iteration with the read
+timeout capped at 200 ms — a rebind under a blocked receive is picked up within a slice. `rebind(ip)` binds a fresh
+ephemeral port, swaps under the write lock and hands the old socket back to the caller, which keeps it alive until the
+announce that follows has finished — so the kernel cannot hand that port to another socket in this process while the
+gateway's binding may still point at it. It is held across that FIRST announce attempt and released when the attempt
+finishes, whatever its outcome (an announce that timed out is retried on the next tick from the socket already rebound,
+with no old handle held); it is never read from, so late inbound ESP in that window is lost either way (§17.8).
+Destination, non-ESP marker and both ESP SAs are untouched: same SPIs, same keys, same replay state. Only the 5-tuple
+moved, which is exactly what the announce says.
+
+### 17.2 The MOBIKE address update (RFC 4555)
+
+`MOBIKE_SUPPORTED` (16396) is sent in IKE_AUTH #1 when `ike.mobike` (AOSP parity, unchanged); the responder's answer
+is now *latched*: `IkeInitiator::peer_mobike()` is true if either IKE_AUTH response carried it (AOSP's
+`maybeEnableMobility` accepts both), and `mobike_enabled() = peer_mobike && cfg.ike.mobike` is the single authority
+both the builder and the tunnel's labelling read, so they cannot disagree.
+
+After a rebind, `announce()` sends, serialised on `request_lock` like every other post-establishment request:
+
+```
+INFORMATIONAL  N(UPDATE_SA_ADDRESSES 16400), N(NAT_DETECTION_SOURCE_IP), N(NAT_DETECTION_DESTINATION_IP)
+```
+
+in that payload order (AOSP). The NAT-D hashes are `SHA-1(SPIi | SPIr | IP | port)` (RFC 7296 §2.23) with **both real
+SPIs** — `nat::request_notifies` therefore takes `spi_r` now; hashing with the SA_INIT-time zero would produce a
+DESTINATION the gateway cannot match. The destination hash uses the *transport's* current remote address
+(gateway:4500), never `IkeInitiator::remote`, which still says `:500` because `switch_to_natt` never told the session.
+The source hash keeps the crate's deliberate fake `192.0.2.0` with the real new port (§6): that is what keeps the ePDG
+convinced we are behind a NAT and keeps it UDP-encapsulating ESP, the only kind a userspace client can carry. NAT-D is
+included only when `mobike && remote.is_ipv4() && nat.supported` — AOSP's `needNatDetection()`, which asks whether the
+NAT-T status is *not UNSUPPORTED* (`docs/AOSP_FACTS_CRITIC.md`), i.e. whether the responder answered our NAT-D at
+IKE_SA_INIT at all. That is `NatStatus::supported`, a flag `nat::evaluate` now reports, and deliberately **not**
+`detected`: an honest un-NATted IPv4 path detects no NAT while NAT-T is perfectly well supported, and RFC 4555 §3.8
+wants the pair re-sent precisely so the responder can re-run detection for the new path.
+
+Handling the response (`Pending::AddressUpdate`, its own arm — the `Dpd` arm deliberately checks nothing and the
+catch-all arm would have reported a bogus CREATE_CHILD_SA error):
+1. a real error notify (< 16384) → `Error::PeerNotify`. RFC 4555 §12 puts two of the three MOBIKE rejections here:
+   `UNACCEPTABLE_ADDRESSES` (**40**) and `UNEXPECTED_NAT_DETECTION` (**41**). They need no special case at all —
+   `IkeMessage::error_notify()` finds them like any other error type. (16403/16404 are *not* MOBIKE: they are
+   `AUTH_LIFETIME` (RFC 4478) and `MULTIPLE_AUTH_SUPPORTED` (RFC 4739), which a responder may legitimately send and
+   which must never be read as a rejection.)
+2. `NO_NATS_ALLOWED` (16402) → the same error. It is the one MOBIKE rejection IANA registers in the **status** range,
+   so `NotifyPayload::is_error()` / `IkeMessage::error_notify()` do not catch it and it is checked for by hand; it is
+   also the one our fake source hash can provoke;
+3. a response to a request that **reused an abandoned message id** → `Error::Protocol`, **not** an acceptance,
+   unconditionally and **before checks 1 and 2**. Nothing in such a response may be attributed to our request, not
+   even an error notify: the message the gateway replays belongs to the request we gave up on (a rekey answered
+   `TEMPORARY_FAILURE`, an older update answered `UNACCEPTABLE_ADDRESSES` for an address we are no longer moving to),
+   and reading it as a rejection of *this* move would return `Error::PeerNotify`, which §17.4 treats as fatal — a
+   stale replay would kill the tunnel. `abort_request` leaves `our_msgid` alone (RFC 7296 §2.1), so the next request reuses the id of the
+   request it gave up on — and if the gateway had already processed that one it replays its cached response for the id
+   instead of processing ours, which would leave us believing we moved while the gateway still points at the dead
+   5-tuple. There is **no shape that tells a replay from an acknowledgement**, not even a fresh-looking NAT-D pair: if
+   the request cached under that id was itself an `UPDATE_SA_ADDRESSES` (route A→B→C, the announce for B abandoned),
+   its cached response carries exactly that pair, hashed over B, and `nat::evaluate` cannot object — a destination
+   hash that does not match only sets `local_behind_nat`, which `natt.force_udp_encap` forces on anyway.
+   `IkeInitiator::abandoned_msgid` records which id is at risk (cleared as soon as any response advances `our_msgid`),
+   and `next_msgid_is_abandoned()` exposes it.
+
+   The tunnel tries not to need the refusal: `announce` (§17.1) checks `next_msgid_is_abandoned()` and, when it is
+   set, **spends that id on a plain `build_dpd()` first**. A replay is harmless there (an empty INFORMATIONAL and an
+   old address-update response are both just "the peer answered" to a DPD) and receiving anything for the id advances
+   the window, so a spend that is ANSWERED puts the `UPDATE_SA_ADDRESSES` on a provably fresh id. This is not *burning* an id: the id is used, not
+   skipped, so the window stays in step — skipping an id the gateway never received would put us outside its window
+   with no way back.
+
+   The spend is **bounded by `SPEND_MSGID_ATTEMPTS` (2, ≈1.5 s) and never aborts the announce.** It used to run the
+   full retransmit schedule and propagate its failure with `?`, which inverted the whole point on the dominant
+   failure mode: a silent gateway cannot answer the spend either, `abort_request` re-records the same id, and
+   `PathMonitor::announce_failed` keeps `needs_announce` — so every retry inside `NO_ROUTE_GRACE` re-entered the same
+   block and the only thing the tunnel ever transmitted during an outage was empty INFORMATIONALs, which RFC 4555
+   §3.8 does **not** let the responder move the child SAs from. The `UPDATE_SA_ADDRESSES` was never sent once. Now an
+   unanswered spend falls through and the update goes out on the reused id: the worst case is one wasted exchange
+   (the response is refused as a possible replay, `accept_response` advances the id, and the retry commits on a
+   provably fresh one), and a gateway that never saw the abandoned request gets a real address update on **every**
+   retry inside the grace.
+
+   Symmetrically, an id is only ever recorded as abandoned when a datagram actually reached the socket:
+   `ike_request_locked` counts the datagrams `send_ike` accepted and calls `abort_unsent_request()` when that count is
+   zero — the abort predicate fired before the first send (a `dpd()` that lost the race with the path monitor, a
+   rekey's second exchange aborted mid-flight), **or** the one send of a single-datagram request failed outright
+   (`send_raw` swallows `WouldBlock`/`TimedOut` as `Ok`, so an `Err` proves nothing left the host — the
+   EHOSTUNREACH/EPERM of the first datagram out of a brand-new interface). A send that fails *after* an earlier
+   fragment of the same message went out still counts as sent. The gateway cannot have cached a response for an id it
+   never saw.
+
+   `accept_response` releases the request slot on the one error path that consumes the id (a response on the right id
+   but the wrong exchange type), so the tunnel's `settle` — which calls `abort_request` on any handler error — cannot
+   flag the id it has just advanced *to*, an id no datagram has ever carried.
+
+   **The rule is not the announce's: it applies to every exchange whose response carries key material.**
+   `build_rekey_child` and `build_rekey_ike` record `reused_msgid` the same way `build_address_update` does, and
+   `handle_rekey_child_response` / `handle_rekey_ike_response` refuse such a response with `Error::Protocol` before any
+   state is committed (after `accept_response` has advanced the id, so the retry is on a provably fresh one, and
+   `rekey_failure_is_fatal` treats `Protocol` as transient). A cached CREATE_CHILD_SA response is *worse* than a cached
+   address-update one: it carries the nonce — and for an IKE rekey the KE public value — of the attempt we gave up on,
+   so `derive_child_keys` would mix it with the retry's nonce and install a child SA whose keys the gateway does not
+   hold, while `rekey_child` swaps `outbound` to it and DELETEs the child SA that still worked. Outbound ESP then fails
+   the gateway's ICV and inbound ESP arrives under an SPI we do not have: a silent, bidirectional black hole behind an
+   IKE SA that answers every DPD, which no liveness check of §17.5 and no `mark_dead` path can see. (The IKE-rekey twin
+   is noisier — the new SA's keys are garbage, so every later message fails integrity until a liveness probe kills the
+   tunnel — but it has the same cause.) A retried rekey is reachable because a rekey that times out while the path is
+   suspended is *not* fatal (§17.4) and is retried after `REKEY_RETRY_DELAY`, by which time `ike_request_locked` has
+   already marked the id abandoned. Unlike the announce, the rekeys do not spend the id on a DPD first: refusing one
+   replay costs a single exchange and the next attempt is clean, whereas a rekey has no deadline to race.
+4. otherwise the move is committed first (`self.local`, and `self.remote`, which repairs the stale `:500`), and only
+   then is the NAT-D block evaluated. A malformed **or missing** block is a `warn!` that keeps the previous
+   `NatStatus`: RFC 4555 does not require the responder to re-run NAT detection, AOSP's `handleNatDetection` treats
+   the same bare response as a successful move, and refusing it would kill a tunnel whose handover the gateway had
+   already accepted.
+
+`ADDITIONAL_IP4_ADDRESS` / `ADDITIONAL_IP6_ADDRESS` / `NO_ADDITIONAL_ADDRESSES` are logged and ignored wherever they
+appear (RFC 4555 §3.4 tolerance; we never use a peer address list). We do not *send* `COOKIE2` (AOSP parity) but we
+echo the peer's verbatim — the whole notify, protocol id and SPI included — in every peer INFORMATIONAL response,
+including the DELETE ones (RFC 4555 §3.7 return-routability). A peer-initiated `UPDATE_SA_ADDRESSES` is logged and
+answered generically: RFC 4555 only lets the initiator move.
+
+On success: `address_updates` is bumped, one NAT-T keepalive is sent straight away to re-open the gateway's binding
+for the new port, and the move is logged at info with old → new.
+
+### 17.3 Without MOBIKE (RFC 7296 §2.23)
+
+If the responder did not announce MOBIKE the socket still moves, and the announce is an **empty INFORMATIONAL** from
+the new address: because the gateway believes we are behind a NAT, §2.23 has it update its stored peer address from
+the datagram it just received. On the wire that is byte-identical to a DPD; only the tunnel's log label
+(`INFORMATIONAL (address update)` vs `INFORMATIONAL (UPDATE_SA_ADDRESSES)`) tells them apart.
+
+This is a deliberate divergence from AOSP, which instead rekeys every child SA (`migrateAllChildSAs`) after a move on
+a non-MOBIKE SA. The empty INFORMATIONAL is far cheaper and moves the IKE SA; what it cannot guarantee is that the
+gateway also moved the child SA's encapsulation port. So the fallback carries a safety net: if the move was
+acknowledged, we have **sent ESP** from the new address since, and **no ESP** has arrived for `ONE_WAY_PROBE_SILENCE`
+(`esp_migration_stalled`), a child rekey runs — up to `ESP_MIGRATION_REKEY_ATTEMPTS` (2) per move. The outbound-evidence condition is what keeps an idle
+tunnel out of it: a registered but silent IMS tunnel receives nothing by definition (keepalives are excluded and the
+gateway sends nothing unsolicited), so without it every single move on a non-MOBIKE peer would be followed 20 s later
+by a pointless CREATE_CHILD_SA + DELETE(ESP).
+
+Both clocks are **ESP-only** (`last_esp_tx` / `last_esp_rx`, stamped by the ESP sink and by rx_loop's `Incoming::Esp`
+arm), not the IKE-inclusive `first_tx_since_rx` / `last_rx_data`. The hypothesis being tested is "IKE moved, ESP did not", so
+inbound IKE is what the failure case *produces* — a peer DPD, or the response to our own one-way probe, which becomes
+due at the very same threshold — and counting it as evidence of health disarmed the check precisely when it was needed.
+Symmetrically an IKE request of ours is not evidence that ESP was sent, or an idle tunnel with the bundle DPD enabled
+would be rekeyed after every move.
+
+The **decision** is made on the path thread; the rekey itself is handed to the timer thread through
+`PathState::request_esp_rekey()` / `take_esp_rekey_request()`, and its **outcome** comes back the same way
+(`note_esp_rekey_failed()` / `take_esp_rekey_failure()`, `note_esp_rekey_done()` / `take_esp_rekey_done()`). `rekey_child` holds `request_lock` across two exchanges
+(up to ~31 s with the default schedule), and the path thread is the only one that enforces `NO_ROUTE_GRACE`, probes the
+route and follows a second address change — it must never block for that long (§17.1 gives it its own thread for
+exactly this reason). The timer thread already accepts multi-second blocking, and an escalation rekey that exhausts its
+retransmissions on a path that is *not* being repaired is classified by `rekey_failure_is_fatal` like any other rekey,
+so a gateway that has genuinely gone is not merely warned about. Both threads skip the escalation once `closing` is
+set, so it can never hold `request_lock` against `close()`.
+
+The escalation is armed and disarmed by the **outcome**, not by the request. The path thread's "rekeyed" flag means
+"a repair is in flight", and it is set when the *request* is made, so only an outcome may clear it. Leaving it set
+disarms `esp_migration_stalled` for the rest of the tunnel's life and leaves a child SA pinned to the pre-move
+encapsulation port that **nothing** could see: the IKE SA did move, so it answers every DPD, which refreshes
+`last_rx_data` and clears `first_tx_since_rx` and therefore satisfies both liveness probes of §17.5 forever.
+`escalation_outcome(error, installed, suspended)` classifies what came back into four cases:
+
+- **Fatal** — `rekey_failure_is_fatal`: retransmissions exhausted on a path that is *not* being repaired. `mark_dead`,
+  as for any other rekey.
+- **Done** — the exchange completed, *or* it failed after `rekey_child` had already committed the new SAs (`installed`
+  — only the DELETE of the old child SA failed, so the migration itself happened and blaming the gateway for it would
+  be wrong). **A completed rekey is not proof that ESP came back.** The gateway this escalation exists for answers the
+  CREATE_CHILD_SA on the IKE SA, which did move, and may still derive the new child SA's encapsulation from the same
+  stale state. So the path thread restarts `moved_at` at the completion instant and re-arms the check: if ESP is still
+  one-way `ONE_WAY_PROBE_SILENCE` after the next ESP transmission, the escalation runs again. Treating `Ok(())` as a
+  repair — the original behaviour — disarmed the check permanently for that move, which is the same invisible black
+  hole as forgetting a failure.
+- **Failed** — the gateway was reached and refused or could not complete it: `N(TEMPORARY_FAILURE)` while it rekeys on
+  its own (RFC 7296 §2.25), `NO_ADDITIONAL_SAS`, a protocol or builder-state error. Re-arm and spend an attempt.
+- **Abandoned** — a path-kind `Io` from the abort predicate, `Closed` during a teardown, or a `Timeout` while the path
+  is suspended: the request was abandoned before it reached the gateway, or its retransmissions left an address the
+  gateway has never been told about. It is evidence of **nothing**, so the request is simply re-made and **no attempt
+  is spent** (§17.4). The timer thread also declines to *take* a request while `suspended` is set, so the pointless
+  round trip is normally not started at all; the request stays pending until the path has settled. Charging those used
+  to kill a recoverable tunnel about 4 s into an outage whose advertised tolerance is `NO_ROUTE_GRACE`, with a reason
+  blaming the gateway for a CREATE_CHILD_SA that never left the host.
+
+Both **Done** and **Failed** spend one of this move's `ESP_MIGRATION_REKEY_ATTEMPTS` attempts. The decision to give up
+is taken where the stall is re-evaluated, not where the outcome is taken: when `esp_migration_stalled` fires again and
+the budget is gone, the path thread calls `mark_dead("the child SA did not survive the address update (N rekeys did
+not restore ESP)")`. Deciding it at the moment the budget runs out instead would kill a tunnel whose ESP had come back
+in the meantime, and — after a completed rekey — before the repair had any chance to show.
+
+### 17.4 The grace period
+
+Nothing transient goes through `mark_dead`: it closes the inner stack irreversibly, and there is no reopen path, so a
+30-second Wi-Fi blip must not cost the SIP registration. Every impairment instead runs the one clock of §17.1 and the
+tunnel is declared dead only after `NO_ROUTE_GRACE`, with a reason that says which impairment it was:
+
+- `"no route to the gateway for 30s"`
+- `"cannot bind a socket on the new egress address for 30s"`
+- `"the gateway has not acknowledged our new address for 30s"`
+- `"the outer socket has been unusable for 30s"`
+- `"address update rejected: …"` (the gateway's own answer — a rejection notify, or a response that does not decode
+  or does not authenticate; a gateway that refuses the move will refuse the retry)
+
+`address_update_failure` therefore lists its fatal cases **explicitly** (`Error::PeerNotify`, `Error::Decode`,
+`Error::Integrity`) and treats everything else as transient. Two shapes matter:
+
+- Retransmission exhaustion is **not** fatal: a gateway that stays silent for one 15.5 s schedule (a new AP whose
+  uplink is not usable yet) is the dominant announce failure and exactly what the retry machinery is for, so the
+  announce is retried from the socket already rebound until the grace expires with `"the gateway has not acknowledged
+  our new address for 30s"`. Otherwise the effective handover tolerance would be the retransmit schedule, not the
+  advertised `NO_ROUTE_GRACE`.
+- A **local send failure** is not fatal either, whatever its errno. A catch-all used to make every non-path
+  `Error::Io` a rejection, so one `ENOBUFS` (errno 55, an `Uncategorized` kind `is_path_error` does not know) or one
+  `EPERM` from a host firewall on the first datagram out of a brand-new interface killed the tunnel during exactly the
+  handover this section exists for. `PathState::note_send_error` already treats such an error as saying nothing about
+  the socket; the classifier now agrees.
+
+The grace is evaluated at the top of a tick, and a tick cannot run while the path thread is inside a blocking
+exchange — so `announce()` is given the grace deadline (`impaired_since + NO_ROUTE_GRACE`) in its abort predicate and
+abandons there instead of running its schedule to the end. The abandon classifies as transient, so the next tick
+declares death with the right reason. Death therefore lands within one `PATH_PROBE_INTERVAL` of the grace rather than
+up to a whole retransmit schedule late.
+
+While the monitor is repairing the path, `PathState::suspended` is set, and the liveness checks of §17.5 stand down —
+silence during a handover is ours, not the gateway's. For the same reason `ike_request` takes an **abort** predicate:
+`path_abort` fires while the path is suspended, which the monitor raises before every rebind and clears only once the
+gateway has acknowledged the new address — so a request that went out from an address that no longer exists abandons
+within one 200 ms slice with a path `Io` error instead of timing out 15.5 s later and being read as a dead peer. (There
+is no second condition: every post-establishment request holds `request_lock` for its whole life, so one cannot be
+outstanding across a completed move without having seen `suspended` set. A separate generation counter only ever
+misfired, on a stale sample taken before the request had the lock.) `do_dpd`, `rekey_child` and `rekey_ike` — each of
+the rekeys on both of its exchanges — combine it with `closing_abort`, so `close()` can never end up waiting out a
+retransmit schedule behind any of them; the timer's DPD retry sleep gives way to `closing` too, and neither the timer
+nor `EpdgTunnel::dpd()` marks a tunnel dead over a probe that a close abandoned. `rekey_child` / `rekey_ike` hold
+`request_lock` across *both* of their exchanges so a move cannot interleave between them.
+
+The timer thread classifies a failed rekey with `rekey_failure_is_fatal`: only exhausted retransmissions on a path that
+is *not* being repaired prove a dead peer. An aborted rekey (a path `Io`, or `Closed` while shutting down) and any
+timeout while `suspended` is set are retried after `REKEY_RETRY_DELAY` instead — a rekey that happens to fall inside a
+handover must not cost the tunnel. The §17.3 escalation obeys the same rule all the way through: such a rekey never
+reached the gateway, so it re-arms the request without spending one of the move's attempts (the `Abandoned` case
+above). Note the abort predicate fires at the **top of attempt 0**, before any send, so a rekey issued while the path
+is suspended returns in microseconds with `Io(NetworkDown)` and nothing on the wire — which is why counting it was
+able to exhaust the budget within two path ticks.
+
+### 17.5 The one-way traffic probe
+
+`last_rx`/`idle_for()` are touched by inbound NAT-T keepalives, so they never grow while the gateway is echoing. The
+path state therefore keeps its own clocks, with keepalives excluded from the traffic ones at both ends:
+`first_tx_since_rx` (the **first** IKE/ESP transmission since the last inbound IKE/ESP datagram, cleared by
+`note_rx_data`), `last_rx_data`, `sends_failing_since`, and the ESP-only pair `last_esp_tx` / `last_esp_rx` that
+§17.3 reads.
+
+All three inbound clocks count only datagrams that **authenticated**: they are stamped inside `handle_esp` after
+`EspInbound::decapsulate` has verified the ICV and passed the replay window, and inside `handle_ike_datagram` after
+`IkeInitiator::decode` has opened the SK payload — never in `rx_loop` before the check. A gateway emitting ESP under an
+SPI we no longer hold (a gateway-side restart on the same 5-tuple, a child rekey we did not apply) would otherwise
+clear `first_tx_since_rx` and refresh `last_rx_data` / `last_esp_rx` on every such datagram: the one-way probe could
+never arm, the idle probe would never fire, and the ESP-migration escalation would stay disarmed, so a tunnel carrying
+nothing but garbage would report itself alive forever. (`last_rx`/`idle_for()` are deliberately left where they are:
+that clock is the NAT-T-inclusive "anything at all arrived" one.)
+
+The silence window is measured from `first_tx_since_rx`, and that is load-bearing: a client retransmitting into a black
+hole moves its latest transmission forward every few hundred milliseconds, so anchoring the window there would hold it at zero and
+the probe would never become due — which is precisely the case this check exists for (a child SA that is one-way from
+the start, where `last_rx_data` is `None` forever). Once `ONE_WAY_PROBE_SILENCE` has passed since that first
+transmission, the timer thread runs **one** DPD with the normal retransmit policy, regardless of `cfg.ike.dpd.enabled`.
+Exhaustion is `mark_dead("gateway stopped answering")` — unless the path monitor is suspended, in which case the
+silence is ours. It does not re-fire without new one-way evidence: any inbound IKE/ESP (a successful probe's response
+included) clears `first_tx_since_rx`, and the previous probe must in any case be `ONE_WAY_PROBE_SILENCE` old.
+
+`sends_failing_since` — the wedge rule's only input — is started **only** by a send that failed with a path-kind error
+(`is_path_failure`), and by any such send: the ESP sink, an IKE request *and* the NAT-T keepalive, which on an idle
+registered tunnel is the only outbound traffic there is and therefore the only thing that can notice a socket that can
+no longer send at all. An unrelated failure (ENOBUFS, a short write) must not start it: it would have an otherwise
+healthy idle tunnel rebind and re-announce 30 s later for nothing. A successful send of any kind clears it, and a
+keepalive clears it *without* touching `first_tx_since_rx`, so it never counts as one-way evidence.
+
+The one-way probe needs evidence that we transmitted, which a **registered but idle** tunnel never produces — and with
+the bundle's DPD disabled that left such a tunnel with no liveness check at all: the gateway could drop the SA and
+nothing would notice until the next outgoing request, minutes or hours later. So the same block runs a second trigger,
+`idle_probe_due`: nothing received from the gateway (IKE/ESP, keepalives excluded) for `IDLE_PROBE_SILENCE`, anchored
+at establishment for a tunnel that has never received anything, and re-armed by our own probe so an unanswered but
+non-fatal probe does not re-fire every tick. It is the same DPD with the same consequences. The bundle-driven idle DPD
+is unchanged, except that it too stands down while the path is suspended, treats a path-kind `Io` from its own send as
+transient rather than as a dead peer, and no longer reads a probe that `close()` abandoned as a dead peer.
+
+### 17.6 Death propagation to the SIP transport
+
+One chain, and it must be prompt end to end:
+
+```
+mark_dead(reason)
+  → dead_reason = reason        (stored FIRST: a thread woken by the next line asks for it immediately)
+  → InnerStack::close(reason)   (none of the first three steps takes the stack's poll mutex)
+       → StackShared::closed = reason
+       → every registered DNS slot completed with Error::Closed(reason)  (its condvar wakes at once)
+       → every UDP sender dropped
+          → a blocked InnerUdpSocket::recv_timeout returns RecvTimeoutError::Disconnected AT ONCE
+            (not at its own timeout) → Error::Closed(reason)
+       → State::shutdown  (cancels the smoltcp queries / sockets; may wait for the poll in progress)
+  → netstack::to_io → io::ErrorKind::NotConnected, the reason still in the error's Display
+  → CustomUdpConnection::serve_loop logs it and returns Ok(())
+  → TransportLayer::serve_connection emits TransportEvent::Closed
+```
+
+Afterwards `InnerUdpSocket::send_to`, `InnerStack::bind_udp` / `resolve` and `EpdgTunnel::bind_udp` / `resolve` all
+fail with the same `Error::Closed(reason)`; `push_rx` is a no-op. The sender-drop wake-up is load-bearing: any
+refactor that keeps a clone of a binding's `SyncSender` alive (stashing it for stats, say) silently turns an immediate
+close into one that waits out the caller's timeout.
+
+The reason and the wake-ups live **outside** the stack's `State` mutex (`StackShared::closed` and
+`StackShared::wakers`) for a second load-bearing reason: the stack thread holds `State` across a whole `poll`, and a
+poll drives the TX sink — a blocking outer ESP send, up to the socket's write timeout *per packet*. A close that had to
+take that mutex first could not publish the death, let alone wake a parked receiver, for seconds. `recv_timeout` reads
+the reason from the same place, so it never blocks behind the poll either.
+
+That hold is bounded at both ends, because everything else on the stack — `push_rx` (the thread that also delivers IKE
+responses, so a long hold eats into the 15.5 s retransmit budget of an outstanding DPD or address update), `bind_udp`,
+`send_to`, and `close`'s own smoltcp cleanup — waits on it:
+
+- the write timeout is `OUTER_SEND_TIMEOUT` (250 ms, not the socket default and not a multi-second value), so one
+  datagram held by a host firewall pending a verdict costs a quarter of a second, well inside the first retransmit
+  interval; `send_raw` counts such a datagram as lost and the schedule covers it;
+- the stack thread **releases `State` between immediate re-polls**. `poll_delay == 0` makes it re-poll at once, up to
+  `MAX_IMMEDIATE_POLLS` (64) times, and it used to `continue` while still holding the guard — so the per-poll holds
+  could stack into one uninterrupted multi-second hold. It now drops the guard, yields and re-acquires.
+
+`InnerStack::close` publishes the reason *before* it sets `stop`. The other order is a race: the stack thread wakes on
+`stop`, leaves its loop and closes with its own generic reason, which would replace the tunnel's real dead reason in
+the error every inner socket returns and in the SIP transport's exit log. It is idempotent and the first reason wins.
+
+`mark_dead` is idempotent (an atomic swap guards it) and the **first** reason wins, so a tunnel that died of a real
+failure keeps that reason when `close()` / `Drop` runs afterwards. A deliberate close goes through the same path with
+the reason `"tunnel closed by request"` — that string is the only thing distinguishing it downstack, since the SIP
+layer reconnects on any `Closed`. `close()` also sets `Shared::closing` (not `stop`) *before* its DELETE(IKE), which
+releases the path thread and any in-flight address update at once; `stop` cannot be used there because the rx thread
+must stay alive to deliver the DELETE's response.
+
+On the SIP side (`rsipstack` `transport/custom_udp.rs`): `NotConnected` from `recv_timeout` ends `serve_loop` and logs
+the tunnel's dead reason; every other receive error is transient — logged, backed off 50 ms, retried, so a
+persistently failing socket cannot spin the loop. `send_to` cannot report liveness (its `io::ErrorKind` is flattened
+into `TransportLayerError`'s string), so a `NotConnected` there is logged and returned to the caller and nothing else:
+the same tunnel death has already failed the concurrent `recv_timeout` — immediately, per the chain above — so the loop
+is already ending, and `TransportEvent::Closed` keeps coming from exactly one place, the loop's exit. (A private
+cancellation token for the send path would only pre-empt a poll the receive side is about to fail anyway, and could
+truncate the buffered-datagram drain noted in §17.8.) The connection keeps
+reporting `Transport::Udp` and `is_reliable() == false`, so retransmission stays the transaction layer's job.
+
+**The chain currently ends there.** In the embedder (`rustpush/src/ims.rs`, out of scope for this crate) the event
+reaches `take_down_closed_connection`, whose first statement returns early for `Transport::Udp` — which is what a
+tunnelled connection reports. So `TransportEvent::Closed` is emitted and dropped: no `del_connection`, no transaction
+termination, no reconnect. Even with that filter lifted, the reconnect path re-binds on the *same* `Arc<EpdgTunnel>`,
+which is dead and answers `Closed` forever; a dead tunnel needs a fresh `EpdgTunnel::connect`, which no code path
+performs today. Until both are addressed on that side, everything above is correct but inert end to end.
+
+### 17.7 Tunables
+
+All `pub const` in `epdg::tunnel`, not config fields: the config structs are built with exhaustive struct literals by
+embedders, so a new field there is a breaking change.
+
+| const | default | why |
+|---|---|---|
+| `PATH_PROBE_INTERVAL` | 2 s | a handover is announced long before the SIP registration expires; a bind+connect probe is cheap enough to run for the tunnel's life |
+| `PATH_PROBE_MIN_SPACING` | 250 ms | floor for out-of-band probe requests; a downed interface fails thousands of sends per second. `network_changed()` bypasses it |
+| `NO_ROUTE_GRACE` | 30 s | survives a screen-off Wi-Fi blip without tearing down the registration; an announce in flight is abandoned at the deadline, so death lands within one `PATH_PROBE_INTERVAL` of it |
+| `ONE_WAY_PROBE_SILENCE` | 20 s | one-way-traffic threshold, and the ESP-stall threshold of §17.3 |
+| `IDLE_PROBE_SILENCE` | 120 s | the same probe for a tunnel that never transmits, which is the only liveness check an idle registration has when the bundle disables DPD |
+| `MIN_ADDRESS_UPDATE_INTERVAL` | 5 s | flap damping: a move within this window of the previous one waits it out — a move to a new address *and* the rebind that recovers from an impairment on the address we are already bound to (§17.1), which is the other half of a flap. The first move after a quiet period passes immediately, so a handover is never delayed |
+| `ESP_SEND_ERROR_LOG_INTERVAL` | 5 s | the ESP sink logs per datagram; the keepalive and IKE-request error sites are rare enough to log unconditionally |
+| `PROBE_ERROR_LOG_INTERVAL` | 60 s | a probe that cannot *run* (EMFILE, a sandbox/MDM EPERM on the throwaway socket) is usually permanent and deliberately never impairs the tunnel, so the warning would otherwise repeat every `PATH_PROBE_INTERVAL` for the life of the registration |
+| `SPEND_MSGID_ATTEMPTS` | 2 (≈1.5 s) | transmissions for the DPD that spends an abandoned message id (§17.2). The spend is a courtesy; the silent gateway that makes it necessary is also the one that cannot answer it, so it must not own the grace |
+| `ESP_MIGRATION_REKEY_ATTEMPTS` | 2 | child rekeys per move for the non-MOBIKE ESP escalation (§17.3) before `mark_dead`. `N(TEMPORARY_FAILURE)` is worth one retry; a child SA still black-holed after that is invisible to every liveness check, so it must end in death. Only a rekey that reached the gateway spends an attempt — a completed one included, since completing is not the same as repairing |
+| `OUTER_SEND_TIMEOUT` (`epdg::ike::transport`) | 250 ms | write timeout on every outer socket. The ESP sink runs the send synchronously under the inner stack's `state` mutex (§17.6), so it caps how long one held datagram stalls the stack; it is well inside the 500 ms first retransmit interval |
+
+### 17.8 Known limits
+
+- The old socket is kept alive across the announce but **not read from**: ESP the gateway sends to the old port during
+  the move is lost. IKE retransmission covers the only traffic that must not be — the announce itself.
+- An abandoned message id costs one extra exchange before the SA can move: `announce` spends it on an empty
+  INFORMATIONAL (a DPD) and only then sends the `UPDATE_SA_ADDRESSES`, because a response on a reused id cannot be
+  told from the gateway's cached replay (§17.2 item 3). Against a responsive gateway that is one RTT — it either
+  replays immediately or answers the DPD. Against a silent one the spend cannot be answered at all, so it is capped at
+  `SPEND_MSGID_ATTEMPTS` (≈1.5 s of the grace) and the address update goes out on the reused id anyway; its response
+  is then refused as a possible replay, and the retry commits on the next id. So the worst case for a handover whose
+  first update is lost is ≈1.5 s plus one wasted exchange, not a silent outage. The impairment clock runs throughout,
+  so the grace still bounds it.
+- Death lands within one `PATH_PROBE_INTERVAL` of `NO_ROUTE_GRACE`, not exactly at it: the grace is evaluated at the
+  top of a tick.
+- Every liveness signal runs over the IKE SA, so a black-holed child SA under a working IKE SA is invisible to all of
+  them. The §17.3 escalation is the only thing that sees it, and only on a non-MOBIKE peer after a move it observed:
+  it ends in `mark_dead` once `ESP_MIGRATION_REKEY_ATTEMPTS` rekeys have failed, but a child SA that stops carrying
+  traffic for any other reason still leaves the SIP layer with a transport that carries no media.
+- `IkeTransport::recv` still drops datagrams whose source is not the gateway. They are counted
+  (`TunnelStats::stray_sources`) and logged at most once per 5 s: a gateway that moves itself must not flood the log,
+  and a host that can spoof a datagram to our port must not be able to kill the tunnel.
+- A responder-initiated address change is not implemented (RFC 4555 lets only the initiator move); peer address lists
+  are logged and ignored.
+- A family change (the only IPv4 route disappears, leaving IPv6) is not a MOBIKE move: it ends as `NoRoute` → grace →
+  dead, and the caller reconnects.
+- An IPv6 privacy address that rotates looks exactly like a move and is announced as one; the flap damping bounds how
+  often that can happen.
+- `NetStack::local_addrs()` still answers on a dead tunnel (the inner addresses it was assigned).
+- Up to `UDP_QUEUE_DEPTH` (256) datagrams already buffered in a binding's channel are drained before the receiver
+  observes the close, so the very next `recv_timeout` after `mark_dead` is not necessarily the one that reports it.
+
 ## 15. Amendment log
+- 2026-09-15: §17 added — mobility and liveness: the `epdg-path` monitor (route probe, rebind, no-route grace),
+  MOBIKE `UPDATE_SA_ADDRESSES` with the RFC 7296 §2.23 fallback, the one-way-traffic probe, and the death chain down
+  to `TransportEvent::Closed`. §0/§7/§12 amended accordingly. Signature changes it required:
+  `nat::request_notifies(spi_i, spi_r, local, remote, force_udp_encap)` and
+  `nat::evaluate(what, spi_i, spi_r, local, remote, notifies, force_local_nat)` (the NAT-D hashes of a post-SA_INIT
+  exchange must use the real SPIr); `NatStatus` gained `supported` ("the responder answered our NAT-D"), which is what
+  gates the NAT-D pair in an address update (§17.2); `IkeTransport::socket()` was removed (it had no caller, and the
+  `RwLock<Bound>` refactor left its signature meaningless — `rebind()` is what hands out a socket handle now).
+  `InnerStack::close` publishes the reason before setting `stop` (§17.6), which also fixes a pre-existing race in
+  which a caller's close reason could be replaced by `"inner stack stopped"`. `Error::PeerNotify` is now
+  documented to carry RFC 4555's status-range rejection `NO_NATS_ALLOWED` (16402) as well as true error notifies —
+  its other two rejections, `UNACCEPTABLE_ADDRESSES` (40) and `UNEXPECTED_NAT_DETECTION` (41), are ordinary error
+  types and need no special case. Ten
+  `pub const` tunables were added to `tunnel` (and one, `OUTER_SEND_TIMEOUT`, to `ike::transport`) rather than to the
+  config structs (§17.7), which embedders build with exhaustive literals. `EpdgTunnel::nat()` was added: `TunnelInfo`
+  is an establishment-time snapshot and a MOBIKE address update re-runs NAT detection, so `info().nat` goes stale
+  exactly when the verdict matters most.
 - 2026-09-11: §16 added — `NetStack` (UDP + TCP + DNS) with std (libc resolver, real TCP) and tunnel (UDP/DNS; TCP unsupported for now) implementations.
 - 2026-09-11 (§11.1 implemented + §11 verifier fixes): (a) §11.1 lives in `ipstack/frag.rs`, applied inside `EspDevice` (TX) and
   `InnerStack::push_rx` (RX); `child.inner_mtu_stack` (default 16384) added to `ChildConfig`; DF is not honoured on TX (smoltcp

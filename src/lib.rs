@@ -17,7 +17,8 @@
 //! - [`eap`]     — EAP framing and the EAP-TLS method (OpenSSL-backed)
 //! - [`esp`]     — ESP codec, anti-replay, UDP encapsulation
 //! - [`ipstack`] — inner IP stack: smoltcp `Medium::Ip` device over ESP + stack thread (UDP, DNS)
-//! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`
+//! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`, MOBIKE / RFC 7296 §2.23
+//!   address updates, path monitoring and liveness (DESIGN §17)
 //! - [`netstack`] — `NetStack`: one UDP/TCP/DNS abstraction over the OS stack (`StdNetStack`) and the tunnel
 //! - [`pem`]     — PEM → DER at the boundary (test fixtures, provisioning responses); the config itself is DER-only
 

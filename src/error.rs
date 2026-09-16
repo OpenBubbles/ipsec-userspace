@@ -29,7 +29,10 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
-    /// The peer sent an error Notify (type < 16384). `data` is the raw notify data.
+    /// The peer sent an error Notify (type < 16384) — RFC 4555's `UNACCEPTABLE_ADDRESSES`
+    /// (40) and `UNEXPECTED_NAT_DETECTION` (41) among them — or the one MOBIKE rejection
+    /// IANA registers in the status range, 16402 `NO_NATS_ALLOWED`, which rejects the
+    /// exchange although it is not an error type. `data` is the raw notify data.
     #[error("peer notify error {notify_type} ({name}) in {exchange}")]
     PeerNotify { notify_type: u16, name: &'static str, exchange: &'static str, data: Vec<u8> },
 

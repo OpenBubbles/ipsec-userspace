@@ -115,6 +115,13 @@ pub const N_INTERNAL_ADDRESS_FAILURE: u16 = 36;
 pub const N_FAILED_CP_REQUIRED: u16 = 37;
 pub const N_TS_UNACCEPTABLE: u16 = 38;
 pub const N_INVALID_SELECTORS: u16 = 39;
+/// RFC 4555 §12 (MOBIKE). An ERROR-range type: the responder refuses the address set of
+/// an `UPDATE_SA_ADDRESSES` / `ADDITIONAL_*_ADDRESS`. `IkeMessage::error_notify` finds it
+/// like any other error notify; no status-range special case is needed.
+pub const N_UNACCEPTABLE_ADDRESSES: u16 = 40;
+/// RFC 4555 §12 (MOBIKE), also an ERROR-range type: the responder's own NAT detection
+/// disagrees with the NAT_DETECTION payloads of an `UPDATE_SA_ADDRESSES`.
+pub const N_UNEXPECTED_NAT_DETECTION: u16 = 41;
 pub const N_TEMPORARY_FAILURE: u16 = 43;
 pub const N_CHILD_SA_NOT_FOUND: u16 = 44;
 // Notify message types — status (>= 16384)
@@ -136,6 +143,13 @@ pub const N_ADDITIONAL_IP6_ADDRESS: u16 = 16398;
 pub const N_NO_ADDITIONAL_ADDRESSES: u16 = 16399;
 pub const N_UPDATE_SA_ADDRESSES: u16 = 16400;
 pub const N_COOKIE2: u16 = 16401;
+/// RFC 4555 §12. The ONE MOBIKE rejection IANA registers in the STATUS range
+/// (>= 16384): it does NOT trip [`NotifyPayload::is_error`] / `IkeMessage::error_notify`,
+/// so an address-update response has to look for it by type. The other two rejections
+/// ([`N_UNACCEPTABLE_ADDRESSES`] 40, [`N_UNEXPECTED_NAT_DETECTION`] 41) are ordinary
+/// error types and need no special case.
+///
+/// [`NotifyPayload::is_error`]: crate::ike::payload::NotifyPayload::is_error
 pub const N_NO_NATS_ALLOWED: u16 = 16402;
 /// RFC 5998.
 pub const N_EAP_ONLY_AUTHENTICATION: u16 = 16417;
@@ -167,6 +181,8 @@ pub fn notify_name(t: u16) -> &'static str {
         N_FAILED_CP_REQUIRED => "FAILED_CP_REQUIRED",
         N_TS_UNACCEPTABLE => "TS_UNACCEPTABLE",
         N_INVALID_SELECTORS => "INVALID_SELECTORS",
+        N_UNACCEPTABLE_ADDRESSES => "UNACCEPTABLE_ADDRESSES",
+        N_UNEXPECTED_NAT_DETECTION => "UNEXPECTED_NAT_DETECTION",
         N_TEMPORARY_FAILURE => "TEMPORARY_FAILURE",
         N_CHILD_SA_NOT_FOUND => "CHILD_SA_NOT_FOUND",
         N_INITIAL_CONTACT => "INITIAL_CONTACT",
@@ -258,3 +274,53 @@ pub const EAP_TLS_FLAG_S: u8 = 0x20;
 // ESP next-header values for tunnel mode (RFC 4303 §2.6)
 pub const NEXT_HEADER_IPV4: u8 = 4;
 pub const NEXT_HEADER_IPV6: u8 = 41;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ike::payload::NotifyPayload;
+
+    /// RFC 4555 §12 assigns MOBIKE one contiguous STATUS block (16396..=16402); a wrong
+    /// value here would silently turn an address update into an unknown notify the
+    /// gateway ignores. 16403/16404 are NOT MOBIKE: they are AUTH_LIFETIME (RFC 4478)
+    /// and MULTIPLE_AUTH_SUPPORTED (RFC 4739), which a responder may legitimately send.
+    #[test]
+    fn mobike_notify_constants_match_rfc4555() {
+        assert_eq!(
+            [
+                N_MOBIKE_SUPPORTED,
+                N_ADDITIONAL_IP4_ADDRESS,
+                N_ADDITIONAL_IP6_ADDRESS,
+                N_NO_ADDITIONAL_ADDRESSES,
+                N_UPDATE_SA_ADDRESSES,
+                N_COOKIE2,
+                N_NO_NATS_ALLOWED,
+            ],
+            [16396, 16397, 16398, 16399, 16400, 16401, 16402]
+        );
+        // RFC 4555 §12 puts the other two rejections in the ERROR range.
+        assert_eq!([N_UNACCEPTABLE_ADDRESSES, N_UNEXPECTED_NAT_DETECTION], [40, 41]);
+        for t in 16396..=16402u16 {
+            assert_ne!(notify_name(t), "UNKNOWN", "notify {t} has no name");
+        }
+        assert_eq!(notify_name(N_UPDATE_SA_ADDRESSES), "UPDATE_SA_ADDRESSES");
+        assert_eq!(notify_name(N_UNACCEPTABLE_ADDRESSES), "UNACCEPTABLE_ADDRESSES");
+        assert_eq!(notify_name(N_UNEXPECTED_NAT_DETECTION), "UNEXPECTED_NAT_DETECTION");
+        // 16403/16404 belong to other RFCs and must not be named as MOBIKE rejections.
+        assert_eq!(notify_name(16403), "UNKNOWN");
+        assert_eq!(notify_name(16404), "UNKNOWN");
+    }
+
+    /// Only `NO_NATS_ALLOWED` lives in the STATUS range, so `is_error()` (and with it
+    /// `IkeMessage::error_notify`) is blind to it and the address-update response
+    /// handler has to test for it by type. The other two rejections are ordinary error
+    /// types and are caught by `error_notify` like any other.
+    #[test]
+    fn only_no_nats_allowed_is_a_status_range_rejection() {
+        assert!(!NotifyPayload::status(N_NO_NATS_ALLOWED, Vec::new()).is_error());
+        for t in [N_UNACCEPTABLE_ADDRESSES, N_UNEXPECTED_NAT_DETECTION] {
+            assert!(NotifyPayload::status(t, Vec::new()).is_error(), "notify {t} must look like an error");
+        }
+        assert!(NotifyPayload::status(N_INVALID_SYNTAX, Vec::new()).is_error());
+    }
+}
