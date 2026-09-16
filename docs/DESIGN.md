@@ -763,8 +763,9 @@ failure (torn down WITHOUT sending DELETE, like AOSP); rekey child at the soft l
 rekey IKE at its lifetime similarly (`build_rekey_ike`, then delete old IKE SA). All post-establishment IKE requests go
 through one `request()` helper that serialises on a mutex (one outstanding request), uses the transport's retransmit
 policy, and routes the response via the rx thread's pending slot. Fragmented responses are collected there too; that
-helper also takes an optional **abort** predicate so an in-flight request abandons within one 200 ms slice when the
-path moved under it or `close()` started (§17.4).
+helper re-reads the transport's *current* socket for every send, so a rebind moves the remaining retransmissions to the
+new source address without disturbing the request; the only thing that abandons one in flight is `close()`, within one
+200 ms slice (§17.4).
 Threads, spawned in this order and joined rx → keepalive → timer → path → stack: `epdg-stack`, `epdg-rx`,
 `epdg-keepalive`, `epdg-timer`, `epdg-path` (§17.1). The timer thread also runs the one-way-traffic probe (§17.5).
 Lock order, never taken in any other: `request_lock` → the transport's socket lock (brief) → `ike` → `pending`;
@@ -793,9 +794,8 @@ config parsing of `tests/fixtures/tmobile_prod_bundle.plist` + `tmobile_creds.pl
 mobility and liveness (§17, all offline): the MOBIKE notify constants and their status-vs-error range (including that
 16403/16404 are *not* MOBIKE), NAT-D hashed with the real SPIr, `build_address_update` payload order and hashes (with
 and without MOBIKE, with and without NAT-D), the response arm (commit, every rejection shape, malformed NAT-D
-tolerated, `ADDITIONAL_*` tolerated), the replay guard — a reused message id refused even when the replay carries a
-full NAT-D pair, because the request cached under it may have been an earlier address update — and that an UNSENT
-abort does not mark its id abandoned; COOKIE2 echoed in every peer INFORMATIONAL response; `IkeTransport::rebind` over
+tolerated, `ADDITIONAL_*` tolerated), that an unanswered request's id is simply reused by the next one (RFC 7296 §2.1);
+COOKIE2 echoed in every peer INFORMATIONAL response; `IkeTransport::rebind` over
 loopback (new source port, destination kept, a blocked `recv` picks the new socket up) and `is_path_error` /
 stray-source counting; the whole `PathMonitor::tick` table — including that an already-running grace still expires
 while the route probe itself cannot run — the one-way-probe predicate, the idle-probe predicate, the ESP-stall
@@ -804,10 +804,12 @@ address-update failure classification as pure functions with an injected clock, 
 failure classified transient; that ESP which fails ICV or names an unknown SPI, and IKE that does not decode, never
 touch the liveness clocks; `mark_dead` waking a parked receiver and resolver at once with the right reason and keeping
 the first one, including while the stack thread is inside a slow outer send; the path thread exiting on `closing`
-alone; and, over a loopback socket with a forced-established session, that `closing` abandons an in-flight DPD instead
-of waiting out its schedule, that an announce is abandoned at the grace deadline, that an aborted-before-send request
-leaves the next message id clean, and that an announce on an abandoned id sends the empty DPD first (observed on a
-real loopback peer socket: the first datagram is materially shorter than the `UPDATE_SA_ADDRESSES` one). In `rsipstack`, `transport::custom_udp` tests a scripted fake socket: the
+alone; and, over a real loopback peer socket with a forced-established session, that `closing` abandons an in-flight
+DPD instead of waiting out its schedule while `close()`'s own DELETE(IKE) still goes out, that a request outstanding
+across a rebind retransmits from the NEW source port with the SAME message id and completes there — with the announce
+following on the next id — that a request whose schedule ran out across a rebind is classified transient and kills
+nothing while the grace still expires on time, and that a send the host refuses leaves nothing on the wire and spends
+no escalation attempt. In `rsipstack`, `transport::custom_udp` tests a scripted fake socket: the
 serve loop exits on `NotConnected`, survives other errors, reports a dead send to its caller while the receive path
 ends the loop, and the connection stays unreliable UDP.
 Live (`tests/live_tmobile.rs`): loads the fixtures, `EpdgTunnel::connect`, asserts an inner IPv6 (or v4) address and ≥1 DNS
@@ -1035,9 +1037,8 @@ every branch below is a unit test:
 
 Row order is load-bearing: the grace is checked **before** the `Unknown` shortcut. A probe that cannot run is usually
 persistent (an fd limit, a sandbox policy), and letting it short-circuit an already-running clock froze that clock
-forever — `path_loop` re-latches `suspended` from the unchanged monitor state, which stands down the bundle DPD, both
-liveness probes of §17.5 and every rekey, so nothing was left that could declare the tunnel dead while it carried
-nothing. `Unknown` now only refuses to *start or advance* a clock, which is all its rationale ever justified.
+forever, so nothing was left that could declare the tunnel dead while it carried nothing. `Unknown` now only refuses to
+*start or advance* a clock, which is all its rationale ever justified.
 
 One clock covers every kind of impairment (no route, a rebind that keeps failing, an address the gateway will not
 acknowledge, a wedged socket); `impaired_reason` only relabels it, so the grace covers the whole outage rather than
@@ -1090,72 +1091,50 @@ catch-all arm would have reported a bogus CREATE_CHILD_SA error):
 2. `NO_NATS_ALLOWED` (16402) → the same error. It is the one MOBIKE rejection IANA registers in the **status** range,
    so `NotifyPayload::is_error()` / `IkeMessage::error_notify()` do not catch it and it is checked for by hand; it is
    also the one our fake source hash can provoke;
-3. a response to a request that **reused an abandoned message id** → `Error::Protocol`, **not** an acceptance,
-   unconditionally and **before checks 1 and 2**. Nothing in such a response may be attributed to our request, not
-   even an error notify: the message the gateway replays belongs to the request we gave up on (a rekey answered
-   `TEMPORARY_FAILURE`, an older update answered `UNACCEPTABLE_ADDRESSES` for an address we are no longer moving to),
-   and reading it as a rejection of *this* move would return `Error::PeerNotify`, which §17.4 treats as fatal — a
-   stale replay would kill the tunnel. `abort_request` leaves `our_msgid` alone (RFC 7296 §2.1), so the next request reuses the id of the
-   request it gave up on — and if the gateway had already processed that one it replays its cached response for the id
-   instead of processing ours, which would leave us believing we moved while the gateway still points at the dead
-   5-tuple. There is **no shape that tells a replay from an acknowledgement**, not even a fresh-looking NAT-D pair: if
-   the request cached under that id was itself an `UPDATE_SA_ADDRESSES` (route A→B→C, the announce for B abandoned),
-   its cached response carries exactly that pair, hashed over B, and `nat::evaluate` cannot object — a destination
-   hash that does not match only sets `local_behind_nat`, which `natt.force_udp_encap` forces on anyway.
-   `IkeInitiator::abandoned_msgid` records which id is at risk (cleared as soon as any response advances `our_msgid`),
-   and `next_msgid_is_abandoned()` exposes it.
-
-   The tunnel tries not to need the refusal: `announce` (§17.1) checks `next_msgid_is_abandoned()` and, when it is
-   set, **spends that id on a plain `build_dpd()` first**. A replay is harmless there (an empty INFORMATIONAL and an
-   old address-update response are both just "the peer answered" to a DPD) and receiving anything for the id advances
-   the window, so a spend that is ANSWERED puts the `UPDATE_SA_ADDRESSES` on a provably fresh id. This is not *burning* an id: the id is used, not
-   skipped, so the window stays in step — skipping an id the gateway never received would put us outside its window
-   with no way back.
-
-   The spend is **bounded by `SPEND_MSGID_ATTEMPTS` (2, ≈1.5 s) and never aborts the announce.** It used to run the
-   full retransmit schedule and propagate its failure with `?`, which inverted the whole point on the dominant
-   failure mode: a silent gateway cannot answer the spend either, `abort_request` re-records the same id, and
-   `PathMonitor::announce_failed` keeps `needs_announce` — so every retry inside `NO_ROUTE_GRACE` re-entered the same
-   block and the only thing the tunnel ever transmitted during an outage was empty INFORMATIONALs, which RFC 4555
-   §3.8 does **not** let the responder move the child SAs from. The `UPDATE_SA_ADDRESSES` was never sent once. Now an
-   unanswered spend falls through and the update goes out on the reused id: the worst case is one wasted exchange
-   (the response is refused as a possible replay, `accept_response` advances the id, and the retry commits on a
-   provably fresh one), and a gateway that never saw the abandoned request gets a real address update on **every**
-   retry inside the grace.
-
-   Symmetrically, an id is only ever recorded as abandoned when a datagram actually reached the socket:
-   `ike_request_locked` counts the datagrams `send_ike` accepted and calls `abort_unsent_request()` when that count is
-   zero — the abort predicate fired before the first send (a `dpd()` that lost the race with the path monitor, a
-   rekey's second exchange aborted mid-flight), **or** the one send of a single-datagram request failed outright
-   (`send_raw` swallows `WouldBlock`/`TimedOut` as `Ok`, so an `Err` proves nothing left the host — the
-   EHOSTUNREACH/EPERM of the first datagram out of a brand-new interface). A send that fails *after* an earlier
-   fragment of the same message went out still counts as sent. The gateway cannot have cached a response for an id it
-   never saw.
-
-   `accept_response` releases the request slot on the one error path that consumes the id (a response on the right id
-   but the wrong exchange type), so the tunnel's `settle` — which calls `abort_request` on any handler error — cannot
-   flag the id it has just advanced *to*, an id no datagram has ever carried.
-
-   **The rule is not the announce's: it applies to every exchange whose response carries key material.**
-   `build_rekey_child` and `build_rekey_ike` record `reused_msgid` the same way `build_address_update` does, and
-   `handle_rekey_child_response` / `handle_rekey_ike_response` refuse such a response with `Error::Protocol` before any
-   state is committed (after `accept_response` has advanced the id, so the retry is on a provably fresh one, and
-   `rekey_failure_is_fatal` treats `Protocol` as transient). A cached CREATE_CHILD_SA response is *worse* than a cached
-   address-update one: it carries the nonce — and for an IKE rekey the KE public value — of the attempt we gave up on,
-   so `derive_child_keys` would mix it with the retry's nonce and install a child SA whose keys the gateway does not
-   hold, while `rekey_child` swaps `outbound` to it and DELETEs the child SA that still worked. Outbound ESP then fails
-   the gateway's ICV and inbound ESP arrives under an SPI we do not have: a silent, bidirectional black hole behind an
-   IKE SA that answers every DPD, which no liveness check of §17.5 and no `mark_dead` path can see. (The IKE-rekey twin
-   is noisier — the new SA's keys are garbage, so every later message fails integrity until a liveness probe kills the
-   tunnel — but it has the same cause.) A retried rekey is reachable because a rekey that times out while the path is
-   suspended is *not* fatal (§17.4) and is retried after `REKEY_RETRY_DELAY`, by which time `ike_request_locked` has
-   already marked the id abandoned. Unlike the announce, the rekeys do not spend the id on a DPD first: refusing one
-   replay costs a single exchange and the next attempt is clean, whereas a rekey has no deadline to race.
-4. otherwise the move is committed first (`self.local`, and `self.remote`, which repairs the stale `:500`), and only
+3. otherwise the move is committed first (`self.local`, and `self.remote`, which repairs the stale `:500`), and only
    then is the NAT-D block evaluated. A malformed **or missing** block is a `warn!` that keeps the previous
    `NatStatus`: RFC 4555 does not require the responder to re-run NAT detection, AOSP's `handleNatDetection` treats
    the same bare response as a successful move, and refusing it would kill a tunnel whose handover the gateway had
    already accepted.
+
+**A move never interrupts an outstanding request.** This is the ordering rule the whole section rests on, and it is
+two sentences of mechanism:
+
+- `IkeTransport` re-reads its socket for **every** send (`RwLock<Bound>`, the guard dropped before the syscall), so a
+  rebind in the middle of a request simply moves that request's remaining retransmissions — *same message id, same
+  bytes* — to the new source address. The gateway answers whatever source it heard from, cached response or freshly
+  processed (RFC 7296 §2.1 entitles a retransmission to the cached one), and the window stays in step by construction.
+  Nothing is cancelled, so nothing has to be re-sent, re-built or re-numbered.
+- `announce()` therefore does not race that request: it takes `request_lock` like every other post-establishment
+  exchange and goes out once the outstanding one has **settled**. There is no reservation, no yield, no deadline and
+  no message id to spend. Waiting is always affordable — the full retransmit schedule is 15.5 s, `NO_ROUTE_GRACE` is
+  30 s — and if the grace expires anyway, §17.4's grace death applies unchanged.
+
+**What a move does not fix: an id whose schedule ran out.** A move never abandons a request, but two things still do —
+teardown, and a retransmit schedule that is exhausted (§17.4 makes the latter *survivable*, which is precisely what
+keeps it reachable on a live tunnel). `abort_request()` frees the session's single request slot and leaves `our_msgid`
+alone, because the window is one message wide and skipping an id would stall the responder. So the **next** request,
+possibly a different exchange, is built on that id, and RFC 7296 §2.1 then obliges a responder that *did* process the
+abandoned one to replay its cached response for it **without processing the new request**. Nothing in the header tells
+the replay from a genuine answer: same SPIs, same id, and — for an announce landing on a DPD's id, or a second
+CREATE_CHILD_SA landing on the first's — the same exchange type.
+
+§2.1's protection is therefore free only for the **same** request. The guard is one field and one check:
+
+- `IkeInitiator::abandoned_msgid` remembers the id `abort_request()` gave up on, and `consume_message_id()` clears it
+  (an accepted response spends the id, so nothing can be replayed onto a later one);
+- `accept_response()` refuses a response on such an id **for the exchanges that commit state on a bare
+  acknowledgement** — `UPDATE_SA_ADDRESSES` / the §2.23 announce, and both rekeys. Committing a replayed acknowledgement
+  would move the SA the gateway never moved (and RFC 4555 §3.8 forbids it to re-learn our address from ESP, so ESP
+  would be black-holed while every IKE liveness signal stayed green), or derive child keys against the cached
+  response's nonce and then DELETE the SA that still works. A DPD or a DELETE needs no guard: a replay is still the
+  gateway answering *this* datagram, which is all they ask.
+
+The id is consumed either way, so one refusal unpoisons the session and the retry runs on a fresh id — the announce
+costs one extra round trip in the worst case, which the path monitor is already retrying for.
+
+`accept_response` releases the request slot on both error paths that consume the id (this one, and a response on the
+right id but the wrong exchange type), or `require_idle` would refuse every later request.
 
 `ADDITIONAL_IP4_ADDRESS` / `ADDITIONAL_IP6_ADDRESS` / `NO_ADDITIONAL_ADDRESSES` are logged and ignored wherever they
 appear (RFC 4555 §3.4 tolerance; we never use a peer address list). We do not *send* `COOKIE2` (AOSP parity) but we
@@ -1195,19 +1174,20 @@ The **decision** is made on the path thread; the rekey itself is handed to the t
 (up to ~31 s with the default schedule), and the path thread is the only one that enforces `NO_ROUTE_GRACE`, probes the
 route and follows a second address change — it must never block for that long (§17.1 gives it its own thread for
 exactly this reason). The timer thread already accepts multi-second blocking, and an escalation rekey that exhausts its
-retransmissions on a path that is *not* being repaired is classified by `rekey_failure_is_fatal` like any other rekey,
-so a gateway that has genuinely gone is not merely warned about. Both threads skip the escalation once `closing` is
-set, so it can never hold `request_lock` against `close()`.
+retransmissions with the socket holding still is classified by `request_verdict` like any other rekey, so a gateway
+that has genuinely gone is not merely warned about. The path thread skips the escalation once `closing` is set, so it
+can never hold `request_lock` against `close()`.
 
 The escalation is armed and disarmed by the **outcome**, not by the request. The path thread's "rekeyed" flag means
 "a repair is in flight", and it is set when the *request* is made, so only an outcome may clear it. Leaving it set
 disarms `esp_migration_stalled` for the rest of the tunnel's life and leaves a child SA pinned to the pre-move
 encapsulation port that **nothing** could see: the IKE SA did move, so it answers every DPD, which refreshes
 `last_rx_data` and clears `first_tx_since_rx` and therefore satisfies both liveness probes of §17.5 forever.
-`escalation_outcome(error, installed, suspended)` classifies what came back into four cases:
+`escalation_outcome(error, installed, path_unsettled)` routes what came back through the same `request_verdict`
+every other caller uses, and refines it into four cases:
 
-- **Fatal** — `rekey_failure_is_fatal`: retransmissions exhausted on a path that is *not* being repaired. `mark_dead`,
-  as for any other rekey.
+- **Fatal** — `RequestVerdict::GatewayGone`: retransmissions exhausted with the socket holding still. `mark_dead`, as
+  for any other rekey.
 - **Done** — the exchange completed, *or* it failed after `rekey_child` had already committed the new SAs (`installed`
   — only the DELETE of the old child SA failed, so the migration itself happened and blaming the gateway for it would
   be wrong). **A completed rekey is not proof that ESP came back.** The gateway this escalation exists for answers the
@@ -1216,15 +1196,19 @@ encapsulation port that **nothing** could see: the IKE SA did move, so it answer
   one-way `ONE_WAY_PROBE_SILENCE` after the next ESP transmission, the escalation runs again. Treating `Ok(())` as a
   repair — the original behaviour — disarmed the check permanently for that move, which is the same invisible black
   hole as forgetting a failure.
-- **Failed** — the gateway was reached and refused or could not complete it: `N(TEMPORARY_FAILURE)` while it rekeys on
-  its own (RFC 7296 §2.25), `NO_ADDITIONAL_SAS`, a protocol or builder-state error. Re-arm and spend an attempt.
-- **Abandoned** — a path-kind `Io` from the abort predicate, `Closed` during a teardown, or a `Timeout` while the path
-  is suspended: the request was abandoned before it reached the gateway, or its retransmissions left an address the
-  gateway has never been told about. It is evidence of **nothing**, so the request is simply re-made and **no attempt
-  is spent** (§17.4). The timer thread also declines to *take* a request while `suspended` is set, so the pointless
-  round trip is normally not started at all; the request stays pending until the path has settled. Charging those used
-  to kill a recoverable tunnel about 4 s into an outage whose advertised tolerance is `NO_ROUTE_GRACE`, with a reason
-  blaming the gateway for a CREATE_CHILD_SA that never left the host.
+- **Abandoned** — the narrow, enumerated set that proves nothing: an `Io` whose errno says the **route** broke
+  (`is_path_failure`), `Closed` during a teardown, or a `Timeout` over an unsettled path (`GatewayGone` already took
+  the settled case). Nothing left the host, or the gateway may never have been able to answer the source it left from,
+  so the request is simply re-made and **no attempt is spent** (§17.4). Charging those used to kill a recoverable
+  tunnel about 4 s into an outage whose advertised tolerance is `NO_ROUTE_GRACE`, with a reason blaming the gateway
+  for a CREATE_CHILD_SA that never left the host.
+- **Failed** — the **catch-all**, and it is this way round on purpose. The gateway was reached and refused or could not
+  complete it (`N(TEMPORARY_FAILURE)` while it rekeys on its own, RFC 7296 §2.25; `NO_ADDITIONAL_SAS`; a response we
+  cannot use), *or* the failure is local and **deterministic** — a transform we cannot instantiate, an encode error, a
+  send the host refuses for a reason that is not a broken route (`EPERM` from a local filter, `ENOBUFS`). Re-arm and
+  spend an attempt. Were the catch-all `Abandoned` instead, a deterministic failure would re-request itself once per
+  timer tick forever with no attempt ever spent, so `ESP_MIGRATION_REKEY_ATTEMPTS` could never be reached and the
+  tunnel would report itself alive over a permanently black-holed child SA.
 
 Both **Done** and **Failed** spend one of this move's `ESP_MIGRATION_REKEY_ATTEMPTS` attempts. The decision to give up
 is taken where the stall is re-evaluated, not where the outcome is taken: when `esp_migration_stalled` fires again and
@@ -1260,32 +1244,66 @@ tunnel is declared dead only after `NO_ROUTE_GRACE`, with a reason that says whi
   the socket; the classifier now agrees.
 
 The grace is evaluated at the top of a tick, and a tick cannot run while the path thread is inside a blocking
-exchange — so `announce()` is given the grace deadline (`impaired_since + NO_ROUTE_GRACE`) in its abort predicate and
-abandons there instead of running its schedule to the end. The abandon classifies as transient, so the next tick
-declares death with the right reason. Death therefore lands within one `PATH_PROBE_INTERVAL` of the grace rather than
-up to a whole retransmit schedule late.
+exchange. The announce is one: it waits for `request_lock` and then runs its own schedule, so death lands **after** the
+nominal deadline, by the sum of
 
-While the monitor is repairing the path, `PathState::suspended` is set, and the liveness checks of §17.5 stand down —
-silence during a handover is ours, not the gateway's. For the same reason `ike_request` takes an **abort** predicate:
-`path_abort` fires while the path is suspended, which the monitor raises before every rebind and clears only once the
-gateway has acknowledged the new address — so a request that went out from an address that no longer exists abandons
-within one 200 ms slice with a path `Io` error instead of timing out 15.5 s later and being read as a dead peer. (There
-is no second condition: every post-establishment request holds `request_lock` for its whole life, so one cannot be
-outstanding across a completed move without having seen `suspended` set. A separate generation counter only ever
-misfired, on a stale sample taken before the request had the lock.) `do_dpd`, `rekey_child` and `rekey_ike` — each of
-the rekeys on both of its exchanges — combine it with `closing_abort`, so `close()` can never end up waiting out a
-retransmit schedule behind any of them; the timer's DPD retry sleep gives way to `closing` too, and neither the timer
-nor `EpdgTunnel::dpd()` marks a tunnel dead over a probe that a close abandoned. `rekey_child` / `rekey_ike` hold
-`request_lock` across *both* of their exchanges so a move cannot interleave between them.
+- however long `request_lock` is held by whatever was already outstanding: up to one 15.5 s schedule for a single
+  exchange, and up to ~31 s for a lifetime or escalation rekey, which holds the lock across **both** of its exchanges;
+- the announce's own schedule, up to a further 15.5 s;
+- one `PATH_PROBE_INTERVAL`.
 
-The timer thread classifies a failed rekey with `rekey_failure_is_fatal`: only exhausted retransmissions on a path that
-is *not* being repaired prove a dead peer. An aborted rekey (a path `Io`, or `Closed` while shutting down) and any
-timeout while `suspended` is set are retried after `REKEY_RETRY_DELAY` instead — a rekey that happens to fall inside a
-handover must not cost the tunnel. The §17.3 escalation obeys the same rule all the way through: such a rekey never
-reached the gateway, so it re-arms the request without spending one of the move's attempts (the `Abandoned` case
-above). Note the abort predicate fires at the **top of attempt 0**, before any send, so a rekey issued while the path
-is suspended returns in microseconds with `Io(NetworkDown)` and nothing on the wire — which is why counting it was
-able to exhaust the budget within two path ticks.
+So the worst case is `NO_ROUTE_GRACE` + ~46.5 s, not + 15.5 s. That is deliberate. `NO_ROUTE_GRACE` is the instant from
+which tearing the registration down is *allowed*, not a promise to tear it down to the millisecond, and buying
+punctuality with a cutoff would mean abandoning the very `UPDATE_SA_ADDRESSES` the outage needs — which is what the
+previous design did, at the cost of an abandoned message id and everything that had to be built to make one safe. Only
+the pure `PathMonitor` bound is unit-tested; the composed one is reasoned about here.
+
+**No local address change abandons an in-flight request.** §17.2's rebind moves the request's remaining
+retransmissions to the new socket, and the request runs to its own conclusion there — a teardown and an exhausted
+schedule are the only things that end one early. What a move changes is only how that conclusion is *read*, and that is
+one pure function:
+
+```
+request_verdict(error, path_unsettled) -> Answered | GatewayGone | Transient
+```
+
+`GatewayGone` is `Error::Timeout` over a **settled** path — exhausted retransmissions while the gateway knew where we
+were — and nothing else. Everything else is `Transient`: a send the host refused whatever its errno, a teardown, a
+response we could not use, and a timeout taken over a path that was not settled.
+
+"Settled" is the pair of monotonic counters `PathState::moves` / `PathState::announced`: the path thread bumps `moves`
+the instant it rebinds and, when the announce is acknowledged, stores that value into `announced`. `settle_sample()`
+returns `Some(moves)` while the two agree and `None` while a repair is outstanding; `unsettled_since(sample)` is true
+for a `None` sample or for any move since. Counters rather than a flag precisely because they cannot be left stuck the
+way a "suspended" flag could, and because they are read only to classify an outcome, never to cancel anything.
+
+Both halves of that predicate are load-bearing, and the second one was learned the hard way. A move *during* the
+request is not the only case the gateway cannot answer: a probe that runs entirely **between** the rebind and the
+announce never straddles a move at all, yet the gateway has not been told where its datagrams come from. Reading its
+silence as a dead gateway killed the tunnel ~16 s into an outage whose advertised tolerance is 30 s — the "new AP whose
+uplink is not usable yet" case above, arriving through the liveness probes instead of through the announce. The
+bracket is also deliberately a little wider than the request itself (the sample is taken before `request_lock`, so a
+rebind while the caller is still queued counts): erring this way can only delay a death, never invent one.
+
+Every site that could `mark_dead` over a request goes through it: the bundle DPD, both liveness probes of §17.5,
+`EpdgTunnel::dpd()`, both lifetime rekeys and §17.3's escalation. Death over an impaired *path*, as opposed to an
+answered-and-refused move, remains `NO_ROUTE_GRACE`'s job alone.
+
+One residual is worth naming rather than papering over. Because `GatewayGone` is the only fatal verdict a request can
+produce, a DPD or probe error that is **not** a settled-path timeout is never fatal — the bundle DPD used to tear the
+tunnel down on any error at all. What catches such an error instead is the path monitor: `note_path_error` asks for an
+out-of-band probe, and a route that is really gone starts the grace clock, while a socket whose sends keep failing
+trips §17.1's wedge rule. The gap that leaves is a send that fails **persistently with an errno `is_path_error` does
+not recognise** (an `EPERM` from a local filter): `note_send_error` deliberately ignores those, so neither the grace
+nor the wedge rule starts, and the tunnel stays alive with nothing moving. That is the same gap an operator bundle
+with `dpd.enabled = false` has always had; closing it needs a failure budget that does not exist yet.
+
+`close()` is the one thing that abandons a request *early*: `closing_abort` fires within one 200 ms slice for every
+post-establishment request, so shutdown never waits out a retransmit schedule behind `request_lock`. Its own
+DELETE(IKE) is sent through `ike_request_while_closing`, the single caller that opts out. The timer's DPD retry sleep
+gives way to `closing` too, and a probe a close abandoned returns `Error::Closed`, which is `Transient`, so neither the
+timer nor `EpdgTunnel::dpd()` can relabel a deliberate close as a gateway failure. `rekey_child` / `rekey_ike` hold
+`request_lock` across *both* of their exchanges, so an announce cannot interleave between them.
 
 ### 17.5 The one-way traffic probe
 
@@ -1309,8 +1327,9 @@ hole moves its latest transmission forward every few hundred milliseconds, so an
 the probe would never become due — which is precisely the case this check exists for (a child SA that is one-way from
 the start, where `last_rx_data` is `None` forever). Once `ONE_WAY_PROBE_SILENCE` has passed since that first
 transmission, the timer thread runs **one** DPD with the normal retransmit policy, regardless of `cfg.ike.dpd.enabled`.
-Exhaustion is `mark_dead("gateway stopped answering")` — unless the path monitor is suspended, in which case the
-silence is ours. It does not re-fire without new one-way evidence: any inbound IKE/ESP (a successful probe's response
+Exhaustion is `mark_dead("gateway stopped answering")` — unless the path was unsettled (a repair the gateway has not
+acknowledged yet, whether it started before the probe or under it), in which case `request_verdict` (§17.4) calls it
+transient, because the silence may be ours. It does not re-fire without new one-way evidence: any inbound IKE/ESP (a successful probe's response
 included) clears `first_tx_since_rx`, and the previous probe must in any case be `ONE_WAY_PROBE_SILENCE` old.
 
 `sends_failing_since` — the wedge rule's only input — is started **only** by a send that failed with a path-kind error
@@ -1326,8 +1345,8 @@ nothing would notice until the next outgoing request, minutes or hours later. So
 `idle_probe_due`: nothing received from the gateway (IKE/ESP, keepalives excluded) for `IDLE_PROBE_SILENCE`, anchored
 at establishment for a tunnel that has never received anything, and re-armed by our own probe so an unanswered but
 non-fatal probe does not re-fire every tick. It is the same DPD with the same consequences. The bundle-driven idle DPD
-is unchanged, except that it too stands down while the path is suspended, treats a path-kind `Io` from its own send as
-transient rather than as a dead peer, and no longer reads a probe that `close()` abandoned as a dead peer.
+is unchanged, except that it classifies every outcome through `request_verdict` too, so a refused send, a probe a
+`close()` abandoned and a timeout across a rebind are all transient rather than a dead peer.
 
 ### 17.6 Death propagation to the SIP transport
 
@@ -1407,30 +1426,31 @@ embedders, so a new field there is a breaking change.
 |---|---|---|
 | `PATH_PROBE_INTERVAL` | 2 s | a handover is announced long before the SIP registration expires; a bind+connect probe is cheap enough to run for the tunnel's life |
 | `PATH_PROBE_MIN_SPACING` | 250 ms | floor for out-of-band probe requests; a downed interface fails thousands of sends per second. `network_changed()` bypasses it |
-| `NO_ROUTE_GRACE` | 30 s | survives a screen-off Wi-Fi blip without tearing down the registration; an announce in flight is abandoned at the deadline, so death lands within one `PATH_PROBE_INTERVAL` of it |
+| `NO_ROUTE_GRACE` | 30 s | survives a screen-off Wi-Fi blip without tearing down the registration. Comfortably longer than the 15.5 s retransmit schedule, which is what makes "the announce simply waits for `request_lock`" affordable (§17.2) |
 | `ONE_WAY_PROBE_SILENCE` | 20 s | one-way-traffic threshold, and the ESP-stall threshold of §17.3 |
 | `IDLE_PROBE_SILENCE` | 120 s | the same probe for a tunnel that never transmits, which is the only liveness check an idle registration has when the bundle disables DPD |
 | `MIN_ADDRESS_UPDATE_INTERVAL` | 5 s | flap damping: a move within this window of the previous one waits it out — a move to a new address *and* the rebind that recovers from an impairment on the address we are already bound to (§17.1), which is the other half of a flap. The first move after a quiet period passes immediately, so a handover is never delayed |
 | `ESP_SEND_ERROR_LOG_INTERVAL` | 5 s | the ESP sink logs per datagram; the keepalive and IKE-request error sites are rare enough to log unconditionally |
 | `PROBE_ERROR_LOG_INTERVAL` | 60 s | a probe that cannot *run* (EMFILE, a sandbox/MDM EPERM on the throwaway socket) is usually permanent and deliberately never impairs the tunnel, so the warning would otherwise repeat every `PATH_PROBE_INTERVAL` for the life of the registration |
-| `SPEND_MSGID_ATTEMPTS` | 2 (≈1.5 s) | transmissions for the DPD that spends an abandoned message id (§17.2). The spend is a courtesy; the silent gateway that makes it necessary is also the one that cannot answer it, so it must not own the grace |
 | `ESP_MIGRATION_REKEY_ATTEMPTS` | 2 | child rekeys per move for the non-MOBIKE ESP escalation (§17.3) before `mark_dead`. `N(TEMPORARY_FAILURE)` is worth one retry; a child SA still black-holed after that is invisible to every liveness check, so it must end in death. Only a rekey that reached the gateway spends an attempt — a completed one included, since completing is not the same as repairing |
 | `OUTER_SEND_TIMEOUT` (`epdg::ike::transport`) | 250 ms | write timeout on every outer socket. The ESP sink runs the send synchronously under the inner stack's `state` mutex (§17.6), so it caps how long one held datagram stalls the stack; it is well inside the 500 ms first retransmit interval |
 
 ### 17.8 Known limits
 
 - The old socket is kept alive across the announce but **not read from**: ESP the gateway sends to the old port during
-  the move is lost. IKE retransmission covers the only traffic that must not be — the announce itself.
-- An abandoned message id costs one extra exchange before the SA can move: `announce` spends it on an empty
-  INFORMATIONAL (a DPD) and only then sends the `UPDATE_SA_ADDRESSES`, because a response on a reused id cannot be
-  told from the gateway's cached replay (§17.2 item 3). Against a responsive gateway that is one RTT — it either
-  replays immediately or answers the DPD. Against a silent one the spend cannot be answered at all, so it is capped at
-  `SPEND_MSGID_ATTEMPTS` (≈1.5 s of the grace) and the address update goes out on the reused id anyway; its response
-  is then refused as a possible replay, and the retry commits on the next id. So the worst case for a handover whose
-  first update is lost is ≈1.5 s plus one wasted exchange, not a silent outage. The impairment clock runs throughout,
-  so the grace still bounds it.
-- Death lands within one `PATH_PROBE_INTERVAL` of `NO_ROUTE_GRACE`, not exactly at it: the grace is evaluated at the
-  top of a tick.
+  the move is lost. IKE retransmission covers the only traffic that must not be — the announce itself, and any request
+  that was already outstanding, whose retransmissions moved to the new socket with it (§17.2).
+- The announce waits for whatever exchange is already outstanding to settle, so a move that lands on top of a rekey
+  (two exchanges, up to ~31 s) is announced that much later. Bounded by `close()`'s abort and by the grace, which
+  keeps running throughout.
+- Death inherits that wait. The grace is evaluated at the top of a tick and a tick cannot run while the path thread is
+  blocked in `announce()`, so death lands at `NO_ROUTE_GRACE` + the lock wait (up to ~31 s behind a rekey) + the
+  announce's own schedule (up to 15.5 s) + one `PATH_PROBE_INTERVAL` — ~46.5 s of overshoot in the worst case, not
+  15.5 s (§17.4). Only the pure `PathMonitor` deadline is unit-tested.
+- An announce that lands on a message id an abandoned request already spent costs one extra round trip: its response
+  is refused unconditionally (§17.2), because a gateway that processed the abandoned request is obliged to replay its
+  cached answer instead of processing this one, and the two are indistinguishable. The refusal spends the id, so the
+  retry — the next tick's, at most `PATH_PROBE_INTERVAL` later — runs clean.
 - Every liveness signal runs over the IKE SA, so a black-holed child SA under a working IKE SA is invisible to all of
   them. The §17.3 escalation is the only thing that sees it, and only on a non-MOBIKE peer after a move it observed:
   it ends in `mark_dead` once `ESP_MIGRATION_REKEY_ATTEMPTS` rekeys have failed, but a child SA that stops carrying
@@ -1449,6 +1469,30 @@ embedders, so a new field there is a breaking change.
   observes the close, so the very next `recv_timeout` after `mark_dead` is not necessarily the one that reports it.
 
 ## 15. Amendment log
+- 2026-09-15 (§17.2/§17.4 rewritten — a move never interrupts a request): the first §17 landed with a mechanism for
+  *cancelling* an exchange the path had moved under (a `suspended` flag, a `path_abort` predicate on every request, an
+  abandoned-message-id record, a reused-id refusal in three response handlers, and a spend-DPD with its own attempt
+  budget to avoid needing that refusal). All of it existed to repair damage the cancellation itself caused. Since
+  `IkeTransport` re-reads its socket per send, the request does not need cancelling: its remaining retransmissions
+  leave the new socket unchanged, the gateway answers the source it hears, and the window stays in step. So
+  `abort_unsent_request`, `next_msgid_is_abandoned`, the three per-exchange `reused_msgid` fields,
+  `PathState::suspended`, `path_abort`, the `Abort` predicate type, `announce`'s grace deadline and spend block,
+  `SPEND_MSGID_ATTEMPTS` and `rekey_failure_is_fatal` are all gone. What replaces them is one pure classifier,
+  `request_verdict(error, path_unsettled)` (§17.4), fed by the monotonic `PathState::moves` / `announced` pair; the
+  announce simply takes `request_lock` when it is free, and `NO_ROUTE_GRACE` remains the single authority for death.
+  `close()`'s DELETE(IKE) is the one request that opts out of the closing abort (`ike_request_while_closing`).
+- 2026-09-15 (corrections to the rewrite above, from the round-6 review): three of its claims did not survive contact
+  with the code. (a) "No message id is ever abandoned" was false — a move never abandons one, but an exhausted
+  retransmit schedule does, and §17.4 deliberately makes that *survivable*, so the announce or a rekey can be built on
+  an id whose cached response the gateway is obliged to replay. `IkeInitiator::abandoned_msgid` is back, as **one**
+  field with **one** unconditional check in `accept_response` for the exchanges that commit on a bare acknowledgement
+  (§17.2), rather than the three per-exchange flags it replaced. (b) `request_verdict`'s input was "a move landed
+  during this request", which left a probe that ran entirely between the rebind and the announce reading a silent
+  gateway as a dead one, ~16 s into a 30 s grace; it is now "the path was not settled", from the `moves` / `announced`
+  pair. (c) `escalation_outcome`'s catch-all had been inverted to `Abandoned`, which let a deterministic rekey failure
+  re-arm forever with no attempt spent and no path to `ESP_MIGRATION_REKEY_ATTEMPTS`; `Failed` is the catch-all again
+  and `Abandoned` is the enumerated narrow set (§17.3). The grace-overshoot bound in §17.4/§17.8 was also understated
+  by a factor of three.
 - 2026-09-15: §17 added — mobility and liveness: the `epdg-path` monitor (route probe, rebind, no-route grace),
   MOBIKE `UPDATE_SA_ADDRESSES` with the RFC 7296 §2.23 fallback, the one-way-traffic probe, and the death chain down
   to `TransportEvent::Closed`. §0/§7/§12 amended accordingly. Signature changes it required:

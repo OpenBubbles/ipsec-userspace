@@ -21,9 +21,10 @@
 //!   never transmits at all (both independent of the bundle's DPD flag, which operators
 //!   often clear); the child rekey the path monitor asks for after a move it could not
 //!   verify; child rekey then IKE rekey at the soft lifetime
-//!   `lifetime × (1 − rekey_margin_fraction)` (no jitter, like AOSP). A rekey that fails
-//!   while the path monitor is repairing the path is retried, never read as a dead peer.
-//!   This is the thread that is allowed to block for a retransmit schedule.
+//!   `lifetime × (1 − rekey_margin_fraction)` (no jitter, like AOSP). A rekey whose
+//!   retransmissions run out over a path the gateway has not acknowledged is retried,
+//!   never read as a dead peer. This is the thread that is allowed to block for a
+//!   retransmit schedule.
 //! - **path** (`epdg-path`): mobility (DESIGN §17). Every [`PATH_PROBE_INTERVAL`] — and
 //!   immediately on [`EpdgTunnel::network_changed`] or a failed outer send — it re-runs
 //!   the egress route probe. A changed address rebinds the outer socket (same SAs, same
@@ -31,17 +32,18 @@
 //!   §3.5), or with an empty INFORMATIONAL when the peer has no MOBIKE (the RFC 7296
 //!   §2.23 dynamic address update). A path it cannot repair within [`NO_ROUTE_GRACE`]
 //!   marks the tunnel dead, which fails every inner socket with `Error::Closed` so the
-//!   SIP transport above tears its connection down. It never runs a blocking exchange
-//!   itself beyond the announce (which is abandoned at the grace deadline): it is the only
-//!   thread that enforces the grace, so the child rekeys a non-MOBIKE move can call for
-//!   are handed to the timer thread, which reports each outcome back.
+//!   SIP transport above tears its connection down. The child rekeys a non-MOBIKE move
+//!   can call for are handed to the timer thread, which reports each outcome back.
 //!
 //! All post-establishment IKE requests go through one `ike_request` helper that
 //! serialises on a mutex (one outstanding request), retransmits per the configured
-//! policy and gets its response from the rx thread's pending slot. It also takes an
-//! optional abort predicate, so a request abandons within one tick when the path moved
-//! under it (its source address no longer exists, and its silence says nothing about the
-//! gateway) or when `close()` has started. Nothing here logs key material.
+//! policy and gets its response from the rx thread's pending slot. A rebind never
+//! interrupts one: `IkeTransport` re-reads the current socket per send, so the remaining
+//! retransmissions — same message id, same bytes — simply leave the new socket and the
+//! gateway answers the source it heard from. The only things that end a request early are
+//! `close()` / `Drop`; a schedule that runs out ends it at its own conclusion, and the
+//! message id it abandons is guarded where it matters (DESIGN §17.2). Nothing here logs
+//! key material.
 //!
 //! **Death propagation** (DESIGN §17.6). When the tunnel becomes unrecoverable —
 //! a peer `DELETE(IKE)`, a DPD or one-way probe that went unanswered, a rekey that timed
@@ -60,7 +62,7 @@
 //! the config structs are built with exhaustive struct literals by embedders:
 //! [`PATH_PROBE_INTERVAL`], [`PATH_PROBE_MIN_SPACING`], [`NO_ROUTE_GRACE`],
 //! [`ONE_WAY_PROBE_SILENCE`], [`IDLE_PROBE_SILENCE`], [`MIN_ADDRESS_UPDATE_INTERVAL`],
-//! [`ESP_SEND_ERROR_LOG_INTERVAL`], [`PROBE_ERROR_LOG_INTERVAL`], [`SPEND_MSGID_ATTEMPTS`],
+//! [`ESP_SEND_ERROR_LOG_INTERVAL`], [`PROBE_ERROR_LOG_INTERVAL`],
 //! [`ESP_MIGRATION_REKEY_ATTEMPTS`] (and [`crate::ike::transport::OUTER_SEND_TIMEOUT`]).
 
 use std::collections::{BTreeMap, HashMap};
@@ -181,16 +183,6 @@ pub const ESP_SEND_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
 /// registration would be pure spam.
 pub const PROBE_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Transmissions the DPD that spends an abandoned message id gets before `announce`
-/// gives up on it and sends the address update on that id anyway (DESIGN §17.2).
-///
-/// 2 (≈1.5 s with the default schedule) rather than the full 5 (≈15.5 s): the spend is a
-/// courtesy, not the point of the exchange. A silent gateway — the dominant announce
-/// failure — cannot answer it, and a spend that owned the whole schedule would spend
-/// [`NO_ROUTE_GRACE`] transmitting empty INFORMATIONALs instead of the
-/// `UPDATE_SA_ADDRESSES` the move actually needs.
-pub const SPEND_MSGID_ATTEMPTS: u32 = 2;
-
 /// Child-SA rekeys the non-MOBIKE ESP-migration escalation attempts per move before the
 /// tunnel is declared dead (DESIGN §17.3).
 ///
@@ -202,8 +194,8 @@ pub const SPEND_MSGID_ATTEMPTS: u32 = 2;
 ///
 /// Only a rekey that REACHED the gateway spends an attempt — a completed one included,
 /// since a gateway that answers the CREATE_CHILD_SA on the (moved) IKE SA may still
-/// leave ESP black-holed. One the path monitor abandoned before it was sent spends
-/// nothing (DESIGN §17.3/§17.4).
+/// leave ESP black-holed. One that never left the host, or whose silence fell inside a
+/// move, spends nothing (DESIGN §17.3/§17.4).
 pub const ESP_MIGRATION_REKEY_ATTEMPTS: u32 = 2;
 
 // ---------------------------------------------------------------------------
@@ -305,17 +297,22 @@ struct Counters {
 
 /// Mobility state shared by the path thread, the rx/keepalive/timer threads and the ESP
 /// TX sink (DESIGN §17). One mutex holds every clock the decision core reads, so a tick
-/// sees a consistent picture; the flags the abort closures poll are atomics, because
-/// those run while the `pending` mutex is held.
+/// sees a consistent picture.
 #[derive(Default)]
 struct PathState {
     inner: Mutex<PathInner>,
     cv: Condvar,
-    /// True from the moment the monitor decides to move (or repair) the path until the
-    /// gateway has acknowledged the new address. A request outstanding across that was
-    /// sent from an address that no longer exists, so its silence says nothing about the
-    /// peer, and liveness checks must stay out of the way.
-    suspended: AtomicBool,
+    /// How often the outer socket has been rebound, and how many of those moves the
+    /// gateway has acknowledged. `announced == moves` is "the path is settled"; anything
+    /// else is a repair in progress — we are sending from an address the gateway has not
+    /// been told about, so its silence says nothing about the peer ([`request_verdict`]).
+    ///
+    /// A caller samples both before a request ([`PathState::settle_sample`]) and checks
+    /// afterwards ([`PathState::unsettled_since`]). Counters, not flags: they cannot be
+    /// left stuck, and they are read only to classify an outcome, never to abandon a
+    /// request.
+    moves: AtomicU64,
+    announced: AtomicU64,
     /// The handshake for the post-move child rekey (DESIGN §17.3): the path thread
     /// decides, the timer thread executes — it is allowed to block for a retransmit
     /// schedule, the path thread is not, being the only one that enforces
@@ -543,12 +540,31 @@ impl PathState {
         self.esp_rekey.compare_exchange(ESP_REKEY_DONE, ESP_REKEY_IDLE, Ordering::SeqCst, Ordering::SeqCst).is_ok()
     }
 
-    fn suspended(&self) -> bool {
-        self.suspended.load(Ordering::SeqCst)
+    /// The outer socket was rebound (DESIGN §17.1). Published before the announce, so a
+    /// request decided on from here until the gateway acknowledges the move is running
+    /// over an unsettled path.
+    fn note_move(&self) {
+        self.moves.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn set_suspended(&self, v: bool) {
-        self.suspended.store(v, Ordering::SeqCst);
+    /// The gateway acknowledged the address we are bound to: the path is settled again.
+    /// Only the path thread rebinds and announces, and it does so in that order, so
+    /// taking the CURRENT move count here cannot mark a later, unannounced move settled.
+    fn note_announced(&self) {
+        self.announced.store(self.moves.load(Ordering::SeqCst), Ordering::SeqCst);
+    }
+
+    /// Sample the path before running a request: `Some(moves)` when it is settled, `None`
+    /// when a repair is already outstanding.
+    fn settle_sample(&self) -> Option<u64> {
+        let moves = self.moves.load(Ordering::SeqCst);
+        (self.announced.load(Ordering::SeqCst) == moves).then_some(moves)
+    }
+
+    /// Was the path anything other than settled between `sampled` and now — already
+    /// being repaired when the request was decided on, or moved since?
+    fn unsettled_since(&self, sampled: Option<u64>) -> bool {
+        sampled.is_none_or(|n| self.moves.load(Ordering::SeqCst) != n)
     }
 
     /// Wake the path thread (shutdown, or a tunnel that just died).
@@ -793,8 +809,8 @@ impl PathMonitor {
         // An already-running grace clock is evaluated FIRST, whatever the probe said.
         // A probe that cannot run (EMFILE, a sandbox EPERM on the throwaway socket) is
         // usually persistent, and returning early here used to freeze the clock forever:
-        // the tunnel stayed `suspended`, which disables DPD, both liveness probes and
-        // every rekey, so nothing could ever declare it dead (DESIGN §17.1/§17.4).
+        // the clock never reached NO_ROUTE_GRACE, so nothing could ever declare the
+        // tunnel dead (DESIGN §17.1/§17.4).
         if let Some(since) = self.impaired_since
             && i.now.saturating_duration_since(since) >= NO_ROUTE_GRACE
         {
@@ -956,15 +972,40 @@ fn address_update_failure(e: &Error) -> Option<String> {
     }
 }
 
-/// Does a failed rekey prove the gateway is gone?
+/// What one post-establishment request's outcome proves about the GATEWAY (DESIGN §17.4).
 ///
-/// Only retransmissions running out on a path that is NOT being repaired does. While the
-/// path monitor is moving the SA, a rekey request left an address the gateway has never
-/// been told about, so its silence says nothing — and an aborted rekey (a path-kind `Io`
-/// from the abort predicate, or `Closed` while shutting down) never reached the gateway
-/// at all. Everything else is retried after `REKEY_RETRY_DELAY`.
-fn rekey_failure_is_fatal(e: &Error, path_suspended: bool) -> bool {
-    matches!(e, Error::Timeout(_)) && !path_suspended
+/// This is the whole of the mobility/liveness decision logic outside `PathMonitor::tick`:
+/// death is `NO_ROUTE_GRACE`'s job, and the only thing a request itself can prove is that
+/// the peer stopped answering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestVerdict {
+    /// The exchange completed.
+    Answered,
+    /// Retransmissions ran out over a settled path: the one outcome that proves the
+    /// gateway is gone.
+    GatewayGone,
+    /// Anything else — a local send failure, a teardown, a response we refused, or
+    /// silence over a path that was being repaired. It says nothing about the gateway.
+    Transient,
+}
+
+/// Classify a request's outcome. `path_unsettled` is [`PathState::unsettled_since`] for a
+/// sample taken before the request: the outer socket was already rebound and unannounced
+/// when we decided to make this request, or it moved before the outcome arrived.
+///
+/// A rebind does not interrupt the request — the remaining retransmissions leave the new
+/// socket with the same message id — but until the announce completes the gateway has not
+/// been told where those datagrams come from, and an answer aimed at the OLD source is
+/// lost. So exhaustion over an unsettled path is evidence of nothing, and the grace
+/// period, not this request, decides whether the tunnel survives. The bracket is
+/// deliberately wider than the request itself: erring this way can only delay a death,
+/// never invent one.
+fn request_verdict(e: Option<&Error>, path_unsettled: bool) -> RequestVerdict {
+    match e {
+        None => RequestVerdict::Answered,
+        Some(Error::Timeout(_)) if !path_unsettled => RequestVerdict::GatewayGone,
+        Some(_) => RequestVerdict::Transient,
+    }
 }
 
 /// What the post-move escalation (DESIGN §17.3) does with the outcome of the child rekey
@@ -984,28 +1025,33 @@ enum EscalationOutcome {
     Abandoned,
 }
 
-/// Classify that outcome. `installed` is [`rekey_child`]'s flag: the CREATE_CHILD_SA half
-/// committed the new SAs before the error, so only the DELETE of the old child failed and
-/// the repair itself did happen.
-fn escalation_outcome(e: Option<&Error>, installed: bool, path_suspended: bool) -> EscalationOutcome {
-    match e {
-        None => EscalationOutcome::Done,
-        // Retransmissions exhausted on a path that is NOT being repaired: the same proof
-        // of a dead gateway here as for a lifetime rekey.
-        Some(e) if rekey_failure_is_fatal(e, path_suspended) => EscalationOutcome::Fatal,
-        Some(_) if installed => EscalationOutcome::Done,
-        // The abort predicate fired (the path monitor is moving the SA) or the tunnel is
-        // being torn down — in both cases possibly before the first datagram was sent.
-        // A `Timeout` can only reach this arm while the path is being repaired (the arm
-        // above takes the settled case), and retransmissions that left an address the
-        // gateway has never been told about are evidence of nothing either.
-        Some(e) if is_path_failure(e) || matches!(e, Error::Closed(_) | Error::Timeout(_)) => {
+/// Classify that outcome with the same [`request_verdict`] every other caller uses.
+/// `installed` is [`rekey_child`]'s flag: the CREATE_CHILD_SA half committed the new SAs
+/// before the error, so only the DELETE of the old child failed and the repair itself did
+/// happen.
+fn escalation_outcome(e: Option<&Error>, installed: bool, path_unsettled: bool) -> EscalationOutcome {
+    match request_verdict(e, path_unsettled) {
+        RequestVerdict::Answered => EscalationOutcome::Done,
+        // The same proof of a dead gateway here as for a lifetime rekey.
+        RequestVerdict::GatewayGone => EscalationOutcome::Fatal,
+        RequestVerdict::Transient if installed => EscalationOutcome::Done,
+        // The narrow set that proves nothing: a route that broke under the exchange, a
+        // crossing teardown, or silence over an unsettled path (`GatewayGone` already
+        // took the settled case, so a `Timeout` here always straddled a repair).
+        RequestVerdict::Transient
+            if matches!(e, Some(e) if is_path_failure(e) || matches!(e, Error::Closed(_) | Error::Timeout(_))) =>
+        {
             EscalationOutcome::Abandoned
         }
+        // EVERYTHING else counts, and the catch-all is deliberately this way round:
         // `N(TEMPORARY_FAILURE)` while the gateway rekeys on its own (RFC 7296 §2.25),
-        // `NO_ADDITIONAL_SAS`, a protocol or builder-state error: the gateway was reached
-        // (or the request is one we can never send), so it counts.
-        Some(_) => EscalationOutcome::Failed,
+        // `NO_ADDITIONAL_SAS`, a response we cannot use, a transform we cannot
+        // instantiate, a send the host refuses for a reason that is not a broken route
+        // (EPERM from a local filter, ENOBUFS). Those last ones are DETERMINISTIC: were
+        // they abandoned, the escalation would re-arm itself once per tick forever with
+        // no attempt spent and no path to [`ESP_MIGRATION_REKEY_ATTEMPTS`], leaving a
+        // black-holed child SA on a tunnel that reports itself alive.
+        RequestVerdict::Transient => EscalationOutcome::Failed,
     }
 }
 
@@ -1540,29 +1586,10 @@ fn handshake_keepalive_ticker(
 // Post-establishment request helper
 // ---------------------------------------------------------------------------
 
-/// An extra early exit for a request's wait loop, re-checked before every send and on
-/// every wake. `Some(err)` abandons the request with that error instead of waiting out
-/// the whole retransmit schedule. It runs while the `pending` mutex is held, so it must
-/// only read atomics.
-type Abort<'a> = &'a dyn Fn() -> Option<Error>;
-
-/// The path moved (or is being repaired) under an outstanding request: its silence says
-/// nothing about the peer, so the caller must not read it as a dead gateway.
-///
-/// `suspended` is the single condition: the monitor raises it before every rebind and
-/// clears it only once the gateway has acknowledged the new address, and every
-/// post-establishment request holds `request_lock` for its whole life — so a request
-/// cannot be outstanding across a completed move without having seen it set.
-fn path_abort(shared: &Shared) -> Option<Error> {
-    shared.path.suspended().then(|| {
-        Error::Io(std::io::Error::new(
-            std::io::ErrorKind::NetworkDown,
-            "the local path changed while the request was outstanding",
-        ))
-    })
-}
-
-/// `close()` is running: abandon so shutdown never waits out a retransmit schedule.
+/// `close()` is running: abandon so shutdown never waits out a retransmit schedule. This
+/// is the only thing that cuts a request short of its own schedule (DESIGN §17.4) — a
+/// path change never does, because the retransmissions simply leave the rebound socket.
+/// (A schedule that runs out ends its request too, of course; see `abort_request`.)
 fn closing_abort(shared: &Shared) -> Option<Error> {
     shared.closing.load(Ordering::SeqCst).then(|| Error::Closed("tunnel closing".into()))
 }
@@ -1577,29 +1604,33 @@ fn ike_request(
     build: impl FnOnce(&mut IkeInitiator) -> Result<IkeMessage>,
 ) -> Result<IkeMessage> {
     let _serial = lock(&shared.request_lock);
-    ike_request_locked(shared, what, policy, None, build)
+    ike_request_locked(shared, what, policy, true, build)
 }
 
-/// [`ike_request`] with an [`Abort`] predicate.
-fn ike_request_abortable(
+/// [`ike_request`] for `close()`'s own `DELETE(IKE)`, which is the one request that must
+/// run WHILE `closing` is set.
+fn ike_request_while_closing(
     shared: &Shared,
     what: &'static str,
     policy: &RetransmitConfig,
-    abort: Abort<'_>,
     build: impl FnOnce(&mut IkeInitiator) -> Result<IkeMessage>,
 ) -> Result<IkeMessage> {
     let _serial = lock(&shared.request_lock);
-    ike_request_locked(shared, what, policy, Some(abort), build)
+    ike_request_locked(shared, what, policy, false, build)
 }
 
 /// The body of [`ike_request`] for a caller that already holds `request_lock` (a
 /// multi-exchange operation such as a rekey holds it across both of its exchanges, so an
 /// address update can never interleave between them).
+///
+/// `give_way_to_close` is true for everything except `close()`'s own DELETE(IKE): such a
+/// request abandons within one [`TICK_SLICE`] once `closing` is set, so shutdown never
+/// waits out a retransmit schedule behind `request_lock`.
 fn ike_request_locked(
     shared: &Shared,
     what: &'static str,
     policy: &RetransmitConfig,
-    abort: Option<Abort<'_>>,
+    give_way_to_close: bool,
     build: impl FnOnce(&mut IkeInitiator) -> Result<IkeMessage>,
 ) -> Result<IkeMessage> {
     if !shared.is_alive() {
@@ -1618,27 +1649,16 @@ fn ike_request_locked(
 
     let attempts = policy.max_attempts.max(1);
     let mut outcome = Err(Error::Timeout(what));
-    // Did any datagram reach the socket? A request no datagram of which was ever handed
-    // to the socket was never seen by the gateway, so its id cannot have a cached
-    // response (DESIGN §17.2). Counted, not assumed: `send_raw` swallows
-    // `WouldBlock`/`TimedOut` as `Ok`, so an `Err` out of `send_ike` proves that
-    // datagram did NOT go out — the EHOSTUNREACH/EPERM of a handover's very first
-    // datagram out of a brand-new interface. A send that fails AFTER an earlier
-    // datagram of the same message went out (fragment 2 of N) still counts as sent.
-    let mut sent = false;
+    let abort = || give_way_to_close.then(|| closing_abort(shared)).flatten();
     'attempts: for attempt in 0..attempts {
-        if let Some(e) = abort.and_then(|a| a()) {
+        if let Some(e) = abort() {
             outcome = Err(e);
             break;
         }
-        let mut delivered = 0usize;
-        let result = datagrams.iter().try_for_each(|d| {
-            shared.transport.send_ike(d)?;
-            delivered += 1;
-            Ok(())
-        });
-        sent |= delivered > 0;
-        match result {
+        // Every attempt re-reads the transport's CURRENT socket, so a rebind between two
+        // of them simply moves the remaining retransmissions — same message id, same
+        // bytes — to the new source address (DESIGN §17.2).
+        match datagrams.iter().try_for_each(|d| shared.transport.send_ike(d)) {
             Ok(()) => shared.path.note_data_tx(),
             Err(e) => {
                 // An outer send failure is also path evidence: record it (and, when it
@@ -1661,7 +1681,7 @@ fn ike_request_locked(
                 outcome = Err(shared.closed_error());
                 break 'attempts;
             }
-            if let Some(e) = abort.and_then(|a| a()) {
+            if let Some(e) = abort() {
                 outcome = Err(e);
                 break 'attempts;
             }
@@ -1669,8 +1689,9 @@ fn ike_request_locked(
             if remaining.is_zero() {
                 break;
             }
-            // Sliced so an `abort` (a path change, a close) is noticed within one tick
-            // instead of at the end of this attempt's retransmit timeout.
+            // Sliced so a close is noticed within one tick instead of at the end of this
+            // attempt's retransmit timeout. A path change is NOT an abort: the remaining
+            // retransmissions simply leave the rebound socket.
             let slice = remaining.min(TICK_SLICE);
             slot = shared.pending_cv.wait_timeout(slot, slice).unwrap_or_else(|e| e.into_inner()).0;
         }
@@ -1680,12 +1701,12 @@ fn ike_request_locked(
         }
     }
     if outcome.is_err() {
-        // Free the session's single request slot (RFC 7296 §2.1: the unanswered message
-        // id is reused by the next request); otherwise every later DPD / rekey / DELETE
-        // would fail with "another request is outstanding". Only a request that actually
-        // reached the socket marks its id abandoned.
-        let mut ike = lock(&shared.ike);
-        if sent { ike.abort_request() } else { ike.abort_unsent_request() }
+        // Free the session's single request slot, or every later DPD / rekey / DELETE
+        // would fail with "another request is outstanding". The unanswered message id is
+        // reused by the next request (the window is one wide) and remembered as
+        // abandoned, because the gateway may hold a cached response for it — see
+        // `IkeInitiator::accept_response` (DESIGN §17.2).
+        lock(&shared.ike).abort_request();
     }
     *lock(&shared.pending) = None;
     match &outcome {
@@ -1709,15 +1730,12 @@ fn settle<T>(shared: &Shared, handle: impl FnOnce(&mut IkeInitiator) -> Result<T
 
 /// Empty INFORMATIONAL (liveness check); returns the round-trip time.
 ///
-/// Abandoned (with a `NetworkDown` `Io` error, not a `Timeout`) when the path moves
-/// while it is outstanding: a probe sent from an address that no longer exists must
-/// never be read as a dead peer.
+/// A rebind under an outstanding probe does not abandon it: the remaining retransmissions
+/// go out the new socket. Whether its silence means anything is decided afterwards by
+/// [`request_verdict`], which the callers that can `mark_dead` all use.
 fn do_dpd(shared: &Shared, policy: &RetransmitConfig) -> Result<Duration> {
     let started = Instant::now();
-    // `closing_abort` first: `close()` must never wait out a retransmit schedule behind
-    // `request_lock`, which its DELETE(IKE) needs (DESIGN §17.6).
-    let abort = || closing_abort(shared).or_else(|| path_abort(shared));
-    let response = ike_request_abortable(shared, "DPD", policy, &abort, |ike| ike.build_dpd())?;
+    let response = ike_request(shared, "DPD", policy, |ike| ike.build_dpd())?;
     settle(shared, |ike| ike.handle_informational_response(&response))?;
     let rtt = started.elapsed();
     info!("DPD ok, rtt {:?}", rtt);
@@ -1736,15 +1754,9 @@ fn do_dpd(shared: &Shared, policy: &RetransmitConfig) -> Result<Duration> {
 fn rekey_child(shared: &Shared, installed: &mut bool) -> Result<()> {
     let policy = &shared.cfg.ike.retransmit;
     let _serial = lock(&shared.request_lock);
-    // Same abort protocol as `do_dpd`, for the same two reasons: a rekey whose request
-    // left an address that no longer exists must not be read as a dead peer (its
-    // retransmissions would otherwise run the full schedule and `timer_loop` would tear
-    // the tunnel down in the middle of a handover), and `close()` must never wait out a
-    // retransmit schedule behind `request_lock`.
-    let abort = || closing_abort(shared).or_else(|| path_abort(shared));
     let old_spi_in = lock(&shared.ike).child().map(|c| c.spi_in).ok_or_else(|| Error::Protocol("no child SA to rekey".into()))?;
     let response =
-        ike_request_locked(shared, "CREATE_CHILD_SA (rekey child)", policy, Some(&abort), |ike| ike.build_rekey_child())?;
+        ike_request_locked(shared, "CREATE_CHILD_SA (rekey child)", policy, true, |ike| ike.build_rekey_child())?;
     let new = settle(shared, |ike| ike.handle_rekey_child_response(&response))?;
     let (outbound, inbound) = esp_pair(&new);
     lock(&shared.inbound).push(inbound);
@@ -1754,7 +1766,7 @@ fn rekey_child(shared: &Shared, installed: &mut bool) -> Result<()> {
     shared.counters.child_rekeys.fetch_add(1, Ordering::Relaxed);
     info!("child SA rekeyed: SPI_in {:#010x} SPI_out {:#010x}; deleting old {:#010x}", new.spi_in, new.spi_out, old_spi_in);
 
-    let response = ike_request_locked(shared, "DELETE(ESP)", policy, Some(&abort), |ike| ike.build_delete_child(old_spi_in))?;
+    let response = ike_request_locked(shared, "DELETE(ESP)", policy, true, |ike| ike.build_delete_child(old_spi_in))?;
     settle(shared, |ike| ike.handle_informational_response(&response))?;
     lock(&shared.inbound).retain(|sa| sa.spi() != old_spi_in);
     Ok(())
@@ -1765,9 +1777,8 @@ fn rekey_child(shared: &Shared, installed: &mut bool) -> Result<()> {
 fn rekey_ike(shared: &Shared) -> Result<()> {
     let policy = &shared.cfg.ike.retransmit;
     let _serial = lock(&shared.request_lock);
-    let abort = || closing_abort(shared).or_else(|| path_abort(shared));
     let response =
-        ike_request_locked(shared, "CREATE_CHILD_SA (rekey IKE)", policy, Some(&abort), |ike| ike.build_rekey_ike())?;
+        ike_request_locked(shared, "CREATE_CHILD_SA (rekey IKE)", policy, true, |ike| ike.build_rekey_ike())?;
     settle(shared, |ike| ike.handle_rekey_ike_response(&response))?;
     *lock(&shared.ike_created) = Instant::now();
     shared.counters.ike_rekeys.fetch_add(1, Ordering::Relaxed);
@@ -1775,12 +1786,12 @@ fn rekey_ike(shared: &Shared) -> Result<()> {
         let ike = lock(&shared.ike);
         info!("IKE SA rekeyed: SPIs {:#018x}/{:#018x}; deleting the old IKE SA", ike.spi_i(), ike.spi_r());
     }
-    let response = ike_request_locked(shared, "DELETE(IKE) old SA", policy, Some(&abort), |ike| ike.build_delete_ike())?;
+    let response = ike_request_locked(shared, "DELETE(IKE) old SA", policy, true, |ike| ike.build_delete_ike())?;
     settle(shared, |ike| ike.handle_informational_response(&response))?;
     Ok(())
 }
 
-/// Announce the outer socket's current 5-tuple to the gateway (DESIGN §17).
+/// Announce the outer socket's current 5-tuple to the gateway (DESIGN §17.2).
 ///
 /// With MOBIKE this is `INFORMATIONAL { N(UPDATE_SA_ADDRESSES), NAT-D }` (RFC 4555
 /// §3.5); without it an empty INFORMATIONAL, which the gateway accepts as the RFC 7296
@@ -1788,19 +1799,13 @@ fn rekey_ike(shared: &Shared) -> Result<()> {
 /// has it convinced we are behind a NAT. Either way the ESP SAs are untouched — same
 /// SPIs, keys and replay state — only the 5-tuple moved.
 ///
-/// Serialised against every other post-establishment request, so no DPD or rekey
-/// retransmission can straddle the swap.
-///
-/// `deadline` is the instant the path monitor's grace period expires. The announce is
-/// abandoned there instead of running its retransmit schedule to the end, so the path
-/// thread is back in `tick` — the only place that can declare the tunnel dead — within
-/// one probe interval of [`NO_ROUTE_GRACE`] rather than up to a whole schedule later.
-///
-/// Every call that reaches that deadline with time to spare transmits an address update:
-/// the optional DPD that spends an abandoned message id is bounded by
-/// [`SPEND_MSGID_ATTEMPTS`] (≈1.5 s of a 30 s grace) and never aborts the announce on its
-/// own — only a teardown or the deadline itself does.
-fn announce(shared: &Shared, deadline: Option<Instant>) -> Result<SocketAddr> {
+/// It takes `request_lock` like every other post-establishment request, and that is the
+/// whole of the ordering rule: the announce goes out once the exchange that was already
+/// outstanding has SETTLED. Waiting is always affordable — the full retransmit schedule
+/// is 15.5 s and [`NO_ROUTE_GRACE`] is 30 s — and the request it waits for is not
+/// disturbed: its own retransmissions have been leaving the rebound socket since the
+/// swap, so the gateway sees the new address from it too.
+fn announce(shared: &Shared) -> Result<SocketAddr> {
     let _serial = lock(&shared.request_lock);
     if !shared.is_alive() {
         return Err(shared.closed_error());
@@ -1814,67 +1819,12 @@ fn announce(shared: &Shared, deadline: Option<Instant>) -> Result<SocketAddr> {
     let remote = shared.transport.remote_addr();
     let mobike = lock(&shared.ike).mobike_enabled();
     let what = if mobike { "INFORMATIONAL (UPDATE_SA_ADDRESSES)" } else { "INFORMATIONAL (address update)" };
-    let abort = || {
-        closing_abort(shared).or_else(|| {
-            deadline
-                .is_some_and(|d| Instant::now() >= d)
-                .then_some(Error::Timeout("address update (grace period expired)"))
-        })
-    };
-    // Never announce on a message id that was abandoned earlier: RFC 7296 §2.1 lets the
-    // gateway replay its CACHED response for such an id instead of processing the new
-    // request, and that replay cannot be told from an acknowledgement — if the abandoned
-    // request was itself an UPDATE_SA_ADDRESSES, its cached response carries the very
-    // NAT-D pair a genuine one does, hashed over the address we were moving to LAST time.
-    // Committing it would leave us believing we are at C while the gateway keeps the SA
-    // at B, and RFC 4555 §3.8 forbids the responder to re-learn our address from ESP, so
-    // the tunnel would be a black hole until the liveness probes killed it.
-    //
-    // So the abandoned id is SPENT on a plain DPD first. A replay there is harmless (an
-    // empty INFORMATIONAL and an old address-update response are both "the peer answered"
-    // to a DPD), and receiving anything for that id advances the window — the announce
-    // then runs on a provably fresh id. Note this does not skip an id: the window stays
-    // in step either way, so the gateway never sees a gap.
-    //
-    // The spend gets [`SPEND_MSGID_ATTEMPTS`], NOT the full retransmit schedule, and an
-    // unanswered spend does NOT abort the announce. A silent gateway is the DOMINANT
-    // announce failure (see `address_update_failure`), and it is exactly the case in
-    // which the spend cannot be answered: letting it run the whole schedule and then
-    // return would mean the only thing this tunnel ever transmits during an outage is
-    // empty INFORMATIONALs — which RFC 4555 §3.8 does not let the responder move the
-    // child SAs from — until `NO_ROUTE_GRACE` kills the tunnel. So we fall through and
-    // send the real `UPDATE_SA_ADDRESSES` on the reused id: `handle_address_update_response`
-    // refuses a reused-id response unconditionally, so a replay is rejected (transient,
-    // nothing committed) and costs one exchange, while a gateway that never saw the
-    // abandoned request gets a genuine address update on every retry inside the grace.
-    if lock(&shared.ike).next_msgid_is_abandoned() {
-        let spend_policy = RetransmitConfig { max_attempts: SPEND_MSGID_ATTEMPTS, ..shared.cfg.ike.retransmit.clone() };
-        match ike_request_locked(shared, "DPD (spending an abandoned message id)", &spend_policy, Some(&abort), |ike| {
-            ike.build_dpd()
-        }) {
-            Ok(spend) => {
-                if let Err(e) = settle(shared, |ike| ike.handle_informational_response(&spend)) {
-                    // The CONTENT is irrelevant — most likely the gateway's cached response
-                    // for the request we gave up on. Receiving it is what mattered.
-                    debug!("the response that spent the abandoned message id was not a clean DPD reply ({e}); continuing");
-                }
-            }
-            Err(e) => {
-                // Only a teardown or the grace deadline ends the announce here; silence
-                // does not.
-                if let Some(fatal) = abort() {
-                    return Err(fatal);
-                }
-                if !shared.is_alive() {
-                    return Err(shared.closed_error());
-                }
-                debug!("the abandoned message id could not be spent ({e}); announcing on it anyway");
-            }
-        }
-    }
     let response =
-        ike_request_locked(shared, what, &shared.cfg.ike.retransmit, Some(&abort), |ike| ike.build_address_update(new, remote))?;
+        ike_request_locked(shared, what, &shared.cfg.ike.retransmit, true, |ike| ike.build_address_update(new, remote))?;
     settle(shared, |ike| ike.handle_informational_response(&response))?;
+    // The gateway now knows where we are: the path is settled, so a later request's
+    // silence is once again evidence about the peer (DESIGN §17.4).
+    shared.path.note_announced();
     shared.counters.address_updates.fetch_add(1, Ordering::Relaxed);
     if shared.transport.using_natt() {
         // Re-open the gateway's NAT binding for the new port straight away instead of
@@ -1981,10 +1931,14 @@ fn path_loop(shared: Arc<Shared>) {
                 continue;
             }
             PathAction::Rebind(ip) => {
-                shared.path.set_suspended(true);
                 match shared.transport.rebind(ip) {
                     Ok((new, old)) => {
                         replaced = Some(old);
+                        // Published BEFORE the announce: a request that is outstanding
+                        // right now keeps retransmitting (from the new socket, same
+                        // message id), and whoever is waiting on it must be able to see
+                        // that the source address changed under it.
+                        shared.path.note_move();
                         debug!("path: outer socket moved to {new}; announcing it");
                         // The session's own address is committed by the response
                         // handler, not here: `nat::evaluate` compares the gateway's
@@ -1999,24 +1953,24 @@ fn path_loop(shared: Arc<Shared>) {
                     }
                 }
             }
-            PathAction::Announce => {
-                shared.path.set_suspended(true);
-                announce_now = true;
-            }
+            PathAction::Announce => announce_now = true,
         }
 
         if announce_now {
-            // Give the announce back to this loop at the grace deadline: `tick` is the
-            // only place that declares the tunnel dead, and it cannot run while we are
-            // inside a retransmit schedule.
-            let deadline = m.impaired_since.map(|since| since + NO_ROUTE_GRACE);
-            match announce(&shared, deadline) {
+            // Blocks until any exchange that was already outstanding has settled, then
+            // runs its own retransmit schedule. `tick` — the only place that declares the
+            // tunnel dead — cannot run meanwhile, so NO_ROUTE_GRACE is a deadline for
+            // tearing the tunnel down, not a promise. The overshoot is the wait plus this
+            // announce's own schedule: up to ~15.5 s behind a single exchange and up to
+            // ~31 s behind a lifetime or escalation rekey (which holds `request_lock`
+            // across BOTH of its exchanges), plus ~15.5 s here and one
+            // PATH_PROBE_INTERVAL (DESIGN §17.4/§17.8).
+            match announce(&shared) {
                 Ok(new) => {
                     m.announced(Instant::now());
                     moved_at = Some(Instant::now());
                     rekeyed_after_move = false;
                     esp_rekey_attempts = 0;
-                    shared.path.set_suspended(false);
                     info!("path: tunnel moved {bound} -> {new}");
                 }
                 // A crossing teardown won the race; its reason is the right one.
@@ -2031,9 +1985,6 @@ fn path_loop(shared: Arc<Shared>) {
             }
         }
         drop(replaced);
-        // Leave "suspended" set while the monitor still has work to do, so the liveness
-        // checks stay out of the way.
-        shared.path.set_suspended(m.needs_announce || m.impaired_since.is_some());
 
         // The timer thread reports the OUTCOME of the rekey it ran. `rekeyed_after_move`
         // is a flag for "the repair is in flight", so only an outcome may clear it;
@@ -2416,11 +2367,9 @@ fn timer_loop(shared: Arc<Shared>) {
         if shared.closing.load(Ordering::SeqCst) {
             continue;
         }
-        // While the path monitor is repairing the path, a silent gateway proves nothing.
-        let suspended = shared.path.suspended();
-
         // Dead peer detection (only when the bundle enables it).
-        if cfg.ike.dpd.enabled && !suspended && shared.idle_for() >= dpd_interval {
+        if cfg.ike.dpd.enabled && shared.idle_for() >= dpd_interval {
+            let path = shared.path.settle_sample();
             let mut ok = false;
             for attempt in 0..=cfg.ike.dpd.max_retries {
                 match do_dpd(&shared, &cfg.ike.retransmit) {
@@ -2428,38 +2377,37 @@ fn timer_loop(shared: Arc<Shared>) {
                         ok = true;
                         break;
                     }
-                    // The probe never left a working socket: that is a local path
-                    // failure, not a dead peer. Leave it to the path monitor.
-                    Err(ref e) if is_path_failure(e) => {
-                        warn!("DPD could not be sent on a broken path ({e}); leaving it to the path monitor");
-                        ok = true;
-                        break;
-                    }
-                    Err(Error::Timeout(_)) if attempt < cfg.ike.dpd.max_retries => {
-                        warn!("DPD attempt {}/{} timed out; retrying in {:?}", attempt + 1, cfg.ike.dpd.max_retries + 1, dpd_retry);
-                        if !sleep_unless_closing(&shared, dpd_retry) {
-                            return;
+                    // Only exhausted retransmissions on a path that held still say
+                    // anything about the peer. A refused send, a teardown, a move under
+                    // the probe or an answer we could not use do not.
+                    Err(e) => match request_verdict(Some(&e), shared.path.unsettled_since(path)) {
+                        RequestVerdict::GatewayGone if attempt < cfg.ike.dpd.max_retries => {
+                            warn!(
+                                "DPD attempt {}/{} timed out; retrying in {:?}",
+                                attempt + 1,
+                                cfg.ike.dpd.max_retries + 1,
+                                dpd_retry
+                            );
+                            if !sleep_unless_closing(&shared, dpd_retry) {
+                                return;
+                            }
                         }
-                    }
-                    // `close()` abandoned the probe (or the tunnel is already dead): that
-                    // is not a dead peer, and marking it one here would both lose the real
-                    // reason and clear `alive` under the DELETE(IKE) still to be sent.
-                    Err(Error::Closed(_)) => {
-                        debug!("DPD abandoned: the tunnel is closing");
-                        ok = true;
-                        break;
-                    }
-                    Err(e) => {
-                        warn!("DPD failed: {e}");
-                        break;
-                    }
+                        RequestVerdict::GatewayGone => break,
+                        // Deliberately never fatal, which is a change from the pre-§17
+                        // behaviour of tearing the tunnel down on any DPD error: death is
+                        // the path monitor's job now (NO_ROUTE_GRACE, and the wedge rule
+                        // for a socket whose sends keep failing). The residual gap is
+                        // stated in DESIGN §17.4.
+                        _ => {
+                            shared.path.note_path_error(&e);
+                            debug!("DPD inconclusive ({e}); leaving it to the path monitor");
+                            ok = true;
+                            break;
+                        }
+                    },
                 }
             }
             if !ok {
-                if shared.path.suspended() {
-                    // The path moved while we were probing.
-                    continue;
-                }
                 // AOSP: torn down WITHOUT sending DELETE.
                 shared.mark_dead("dead peer detection failed");
                 continue;
@@ -2472,9 +2420,7 @@ fn timer_loop(shared: Arc<Shared>) {
         // the gateway has said nothing at all for IDLE_PROBE_SILENCE.
         let times = shared.path.snapshot();
         let now = Instant::now();
-        let probe = if suspended {
-            None
-        } else if one_way_probe_due(times.first_tx_since_rx, last_one_way, now, ONE_WAY_PROBE_SILENCE) {
+        let probe = if one_way_probe_due(times.first_tx_since_rx, last_one_way, now, ONE_WAY_PROBE_SILENCE) {
             last_one_way = Some(now);
             Some(format!("one-way traffic: nothing received for {ONE_WAY_PROBE_SILENCE:?} while sending"))
         } else if idle_probe_due(times.last_rx_data, last_idle_probe, established, now, IDLE_PROBE_SILENCE) {
@@ -2485,33 +2431,33 @@ fn timer_loop(shared: Arc<Shared>) {
         };
         if let Some(why) = probe {
             warn!("{why}; probing the gateway");
+            let path = shared.path.settle_sample();
             match do_dpd(&shared, &cfg.ike.retransmit) {
                 Ok(rtt) => info!("liveness probe answered in {rtt:?}"),
-                Err(Error::Timeout(_)) if !shared.path.suspended() && !shared.closing.load(Ordering::SeqCst) => {
-                    shared.mark_dead("gateway stopped answering");
-                    continue;
-                }
-                // The path moved (or the tunnel is going down) under the probe.
-                Err(Error::Timeout(_)) | Err(Error::Closed(_)) => continue,
-                Err(e) => {
-                    shared.path.note_path_error(&e);
-                    warn!("liveness probe failed: {e}");
-                }
+                Err(e) => match request_verdict(Some(&e), shared.path.unsettled_since(path)) {
+                    RequestVerdict::GatewayGone => {
+                        shared.mark_dead("gateway stopped answering");
+                        continue;
+                    }
+                    // A broken local path, a teardown, or a move under the probe: the
+                    // grace period decides, not this probe.
+                    _ => {
+                        shared.path.note_path_error(&e);
+                        warn!("liveness probe inconclusive: {e}");
+                    }
+                },
             }
         }
 
         // The path thread found the child SA stalled after a non-MOBIKE move and handed
         // the repair here (DESIGN §17.3): this thread may block for a retransmit
         // schedule, the path thread — the only one that enforces NO_ROUTE_GRACE — may not.
-        // Not while the path monitor is repairing the path: `rekey_child`'s abort
-        // predicate would fire before the first send, so the exchange would be charged as
-        // a failed repair without a single datagram leaving the host (DESIGN §17.4). The
-        // request simply stays pending until the path has settled.
-        if !suspended && shared.path.take_esp_rekey_request() {
+        if shared.path.take_esp_rekey_request() {
             warn!("rekeying the child SA after the address update (no ESP came back and the peer has no MOBIKE)");
+            let path = shared.path.settle_sample();
             let mut installed = false;
             let error = rekey_child(&shared, &mut installed).err();
-            match escalation_outcome(error.as_ref(), installed, shared.path.suspended()) {
+            match escalation_outcome(error.as_ref(), installed, shared.path.unsettled_since(path)) {
                 EscalationOutcome::Fatal => {
                     // Only ever returned for an error.
                     if let Some(e) = error {
@@ -2530,9 +2476,7 @@ fn timer_loop(shared: Arc<Shared>) {
                 }
                 EscalationOutcome::Abandoned => {
                     if let Some(e) = &error {
-                        debug!(
-                            "the child rekey after the move was abandoned before it reached the gateway ({e}); re-arming"
-                        );
+                        debug!("the child rekey after the move proved nothing ({e}); re-arming");
                     }
                     shared.path.request_esp_rekey();
                 }
@@ -2551,10 +2495,11 @@ fn timer_loop(shared: Arc<Shared>) {
         if child_due {
             // The lifetime rekey does not care WHERE it failed: a failed DELETE of the
             // old child SA is retried with the whole exchange after `REKEY_RETRY_DELAY`.
+            let path = shared.path.settle_sample();
             let mut installed = false;
             match rekey_child(&shared, &mut installed) {
                 Ok(()) => child_retry_after = None,
-                Err(e) if rekey_failure_is_fatal(&e, shared.path.suspended()) => {
+                Err(e) if request_verdict(Some(&e), shared.path.unsettled_since(path)) == RequestVerdict::GatewayGone => {
                     shared.mark_dead(format!("child rekey: {e}"));
                     continue;
                 }
@@ -2569,9 +2514,10 @@ fn timer_loop(shared: Arc<Shared>) {
         let ike_due = lock(&shared.ike_created).elapsed() >= ike_soft
             && ike_retry_after.is_none_or(|t| Instant::now() >= t);
         if ike_due {
+            let path = shared.path.settle_sample();
             match rekey_ike(&shared) {
                 Ok(()) => ike_retry_after = None,
-                Err(e) if rekey_failure_is_fatal(&e, shared.path.suspended()) => {
+                Err(e) if request_verdict(Some(&e), shared.path.unsettled_since(path)) == RequestVerdict::GatewayGone => {
                     shared.mark_dead(format!("IKE rekey: {e}"));
                 }
                 Err(e) => {
@@ -2678,14 +2624,12 @@ impl EpdgTunnel {
 
     /// On-demand liveness check (empty INFORMATIONAL); returns the round-trip time.
     pub fn dpd(&self) -> Result<Duration> {
+        let path = self.shared.path.settle_sample();
         let r = do_dpd(&self.shared, &self.shared.cfg.ike.retransmit);
-        if let Err(Error::Timeout(_)) = &r
-            && !self.shared.path.suspended()
-            && !self.shared.closing.load(Ordering::SeqCst)
-        {
-            // AOSP: retransmission exhaustion tears the session down WITHOUT a DELETE.
-            // Unless the path monitor is mid-repair: then the silence is ours, not the
-            // gateway's, and the grace period decides.
+        // AOSP: retransmission exhaustion tears the session down WITHOUT a DELETE. Unless
+        // the socket moved under the probe: then the silence may be ours, not the
+        // gateway's, and the grace period decides.
+        if request_verdict(r.as_ref().err(), self.shared.path.unsettled_since(path)) == RequestVerdict::GatewayGone {
             self.shared.mark_dead("dead peer detection failed");
         }
         r
@@ -2725,7 +2669,7 @@ impl EpdgTunnel {
                 max_attempts: CLOSE_ATTEMPTS,
             };
             info!("closing tunnel: DELETE(IKE)");
-            let r = ike_request(shared, "DELETE(IKE)", &policy, |ike| ike.build_delete_ike())
+            let r = ike_request_while_closing(shared, "DELETE(IKE)", &policy, |ike| ike.build_delete_ike())
                 .and_then(|resp| settle(shared, |ike| ike.handle_informational_response(&resp)));
             match r {
                 Ok(()) => {
@@ -2968,10 +2912,9 @@ mod tests {
     /// Regression: a probe that cannot run (EMFILE under fd pressure, a sandbox/MDM EPERM
     /// on the throwaway route-probe socket, `discover_egress` finding no address) is
     /// usually PERSISTENT. Returning `Idle` before the grace check froze an
-    /// already-running impairment clock forever, and `path_loop` re-latched `suspended`
-    /// from the unchanged monitor state — which disables the bundle DPD, both liveness
-    /// probes and every rekey. The tunnel then had no path to death at all: `is_alive()`
-    /// stayed true while it carried nothing. The clock is evaluated first now.
+    /// already-running impairment clock forever, so the tunnel had no path to death at
+    /// all: `is_alive()` stayed true while it carried nothing. The clock is evaluated
+    /// first now.
     #[test]
     fn a_frozen_probe_still_lets_the_grace_expire() {
         let t0 = Instant::now();
@@ -3368,20 +3311,24 @@ mod tests {
         assert!(address_update_failure(&Error::Encode("x".into())).is_none());
     }
 
-    /// Regression: a rekey running while the path monitor moves the SA used to time out
-    /// (its request had left an address that no longer existed) and be read as a dead
-    /// peer, tearing the tunnel down in the middle of the handover R1 exists to survive.
+    /// The whole of the mobility/liveness decision logic outside `PathMonitor::tick`:
+    /// only exhausted retransmissions with the socket holding still blame the gateway.
+    /// A rekey or probe whose retransmissions straddled a rebind left an address the
+    /// gateway may never have answered from, so reading its silence as a dead peer used
+    /// to tear the tunnel down in the middle of the handover R1 exists to survive.
     #[test]
-    fn rekey_failures_are_only_fatal_on_a_settled_path() {
+    fn request_verdict_only_blames_the_gateway_on_a_settled_path() {
+        assert_eq!(request_verdict(None, false), RequestVerdict::Answered);
+        assert_eq!(request_verdict(None, true), RequestVerdict::Answered, "a move does not undo an answer");
         let timeout = Error::Timeout("CREATE_CHILD_SA (rekey child)");
-        assert!(rekey_failure_is_fatal(&timeout, false), "a settled path: the gateway is gone");
-        assert!(!rekey_failure_is_fatal(&timeout, true), "the monitor is repairing the path");
-        // What the abort predicate returns when the path moved or close() started: the
-        // request never reached the gateway.
-        let aborted = Error::Io(std::io::Error::new(std::io::ErrorKind::NetworkDown, "the local path changed"));
-        assert!(!rekey_failure_is_fatal(&aborted, false));
-        assert!(!rekey_failure_is_fatal(&Error::Closed("tunnel closing".into()), false));
-        assert!(!rekey_failure_is_fatal(&Error::Protocol("no child SA to rekey".into()), false));
+        assert_eq!(request_verdict(Some(&timeout), false), RequestVerdict::GatewayGone);
+        assert_eq!(request_verdict(Some(&timeout), true), RequestVerdict::Transient, "the socket moved under it");
+        // Nothing else is ever proof, whether the path moved or not.
+        let refused = Error::Io(std::io::Error::new(std::io::ErrorKind::NetworkDown, "no route"));
+        for e in [refused, Error::Closed("tunnel closing".into()), Error::Protocol("no child SA to rekey".into())] {
+            assert_eq!(request_verdict(Some(&e), false), RequestVerdict::Transient, "{e}");
+            assert_eq!(request_verdict(Some(&e), true), RequestVerdict::Transient, "{e}");
+        }
     }
 
     #[test]
@@ -3619,7 +3566,6 @@ mod tests {
         h.join().unwrap();
         assert!(probed, "a forced probe request runs well before the {PATH_PROBE_INTERVAL:?} tick");
         assert!(shared.is_alive());
-        assert!(!shared.path.suspended());
     }
 
     #[test]
@@ -3642,19 +3588,17 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
     }
 
+    /// A teardown is the ONLY thing that abandons a request in flight (DESIGN §17.4).
+    /// A move does not: it bumps a counter the CALLER reads afterwards, and the request
+    /// itself keeps retransmitting from the rebound socket.
     #[test]
-    fn path_abort_fires_while_the_path_is_suspended() {
+    fn closing_is_the_only_abort() {
         let shared = test_shared();
-        assert!(path_abort(&shared).is_none());
-        shared.path.set_suspended(true);
-        match path_abort(&shared) {
-            Some(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NetworkDown),
-            other => panic!("expected NetworkDown, got {other:?}"),
-        }
-        shared.path.set_suspended(false);
-        assert!(path_abort(&shared).is_none());
-        // And `close()` aborts a request the same way.
         assert!(closing_abort(&shared).is_none());
+        let path = shared.path.settle_sample();
+        shared.path.note_move();
+        assert!(shared.path.unsettled_since(path), "a move is observable...");
+        assert!(closing_abort(&shared).is_none(), "...but it never abandons a request");
         shared.closing.store(true, Ordering::SeqCst);
         assert!(matches!(closing_abort(&shared), Some(Error::Closed(_))));
     }
@@ -3686,26 +3630,13 @@ mod tests {
         assert!(shared.request_lock.try_lock().is_ok(), "request_lock is free for the DELETE(IKE)");
         assert!(lock(&shared.dead_reason).is_none(), "a deliberate close is not a gateway failure");
         assert!(shared.alive.load(Ordering::SeqCst));
-        shared.stack.stop();
-    }
-
-    /// Regression (finding: the grace could overshoot by a whole retransmit schedule):
-    /// `announce` used to run its 15.5 s schedule to the end whatever the clock said, and
-    /// `PathMonitor::tick` — the only place that declares the tunnel dead — cannot run
-    /// while the path thread is inside it. An announce that straddles the deadline is now
-    /// abandoned there, transiently, so the next tick declares death on time.
-    #[test]
-    fn an_announce_is_abandoned_at_the_grace_deadline() {
-        let shared = test_shared();
-        lock(&shared.ike).force_established_for_tests();
-        let started = Instant::now();
-        let r = announce(&shared, Some(started + Duration::from_millis(200)));
-        let waited = started.elapsed();
-        let e = r.expect_err("nothing answers on loopback:500");
-        assert!(matches!(e, Error::Timeout(_)), "{e}");
-        assert!(waited < Duration::from_secs(2), "the announce ran on for {waited:?}");
-        assert!(address_update_failure(&e).is_none(), "abandoning is transient; the grace decides");
-        assert!(lock(&shared.dead_reason).is_none());
+        // ... and `close()`'s own DELETE(IKE) is the one request that still runs while
+        // `closing` is set: it must not abandon itself at attempt 0. A `Timeout` proves
+        // the datagram went out and only the answer is missing; `Closed` would mean it
+        // never left.
+        let policy = RetransmitConfig { initial_timeout_ms: 50, backoff_multiplier: 1.0, max_attempts: 1 };
+        let r = ike_request_while_closing(&shared, "DELETE(IKE)", &policy, |ike| ike.build_delete_ike());
+        assert!(matches!(r, Err(Error::Timeout(_))), "{r:?}");
         shared.stack.stop();
     }
 
@@ -3744,83 +3675,15 @@ mod tests {
         shared.stack.stop();
     }
 
-    /// Regression (round-3 finding): a request abandoned BEFORE its first datagram left
-    /// the socket must not mark its message id as abandoned. `do_dpd`'s abort predicate
-    /// fires at the top of attempt 0, so a `dpd()` that loses the race with the path
-    /// monitor never reaches the wire — yet it used to poison the next id, which the
-    /// announce then had to spend an extra exchange on.
+    /// The core of the model (DESIGN §17.2): a local address change NEVER interrupts an
+    /// outstanding IKE request. The monitor rebinds the socket immediately; the request
+    /// keeps its message id and its bytes, its remaining retransmissions leave the NEW
+    /// socket (`IkeTransport` re-reads the current one per send), the gateway answers the
+    /// source it heard from, and the exchange completes normally. The announce that
+    /// follows therefore runs on the next message id — nothing was abandoned, so nothing
+    /// can be replayed.
     #[test]
-    fn an_unsent_request_does_not_poison_the_next_message_id() {
-        let shared = test_shared();
-        lock(&shared.ike).force_established_for_tests();
-        // The path monitor is repairing the path: every request aborts at attempt 0.
-        shared.path.set_suspended(true);
-        let started = Instant::now();
-        let e = do_dpd(&shared, &shared.cfg.ike.retransmit).unwrap_err();
-        assert!(matches!(e, Error::Io(_)), "{e}");
-        assert!(started.elapsed() < Duration::from_secs(1), "it must not run the schedule");
-        assert!(shared.path.snapshot().first_tx_since_rx.is_none(), "nothing left the socket");
-        assert!(!lock(&shared.ike).has_pending_request(), "the request slot is free again");
-        assert!(!lock(&shared.ike).next_msgid_is_abandoned(), "an id the gateway never saw is not abandoned");
-        shared.stack.stop();
-    }
-
-    /// Regression (round-4 finding): the other way a request can fail to reach the wire.
-    /// `ike_request_locked` used to raise its "sent" flag BEFORE offering the datagram to
-    /// the socket, so a single-datagram request whose only `send_ike` returned an error
-    /// — the EHOSTUNREACH/EPERM of the first datagram out of a brand-new interface,
-    /// which is exactly the handover this feature exists for — marked its id abandoned
-    /// although nothing had left the host. `send_raw` swallows WouldBlock/TimedOut as
-    /// `Ok`, so an `Err` there proves the datagram did not go out.
-    ///
-    /// The cost was the next announce paying a spend-DPD it did not need.
-    #[test]
-    fn a_request_whose_only_send_failed_does_not_poison_the_next_message_id() {
-        // Aimed at the v4 broadcast address: `send_to` fails immediately with EACCES on a
-        // socket that never asked for SO_BROADCAST. No datagram leaves the host.
-        let shared = test_shared_remote(Ipv4Addr::BROADCAST, 500);
-        lock(&shared.ike).force_established_for_tests();
-        let started = Instant::now();
-        let e = do_dpd(&shared, &shared.cfg.ike.retransmit).unwrap_err();
-        assert!(matches!(e, Error::Io(_)), "{e}");
-        assert!(started.elapsed() < Duration::from_secs(1), "a refused send must not run the schedule");
-        assert!(shared.path.snapshot().first_tx_since_rx.is_none(), "the path monitor agrees nothing went out");
-        assert!(!lock(&shared.ike).has_pending_request(), "the request slot is free again");
-        assert!(
-            !lock(&shared.ike).next_msgid_is_abandoned(),
-            "a datagram the socket refused cannot have been cached by the gateway"
-        );
-        // So the next announce goes straight to the address update, with no spend-DPD.
-        assert!(lock(&shared.ike).build_address_update(shared.transport.local_addr(), shared.transport.remote_addr()).is_ok());
-        shared.stack.stop();
-    }
-
-    /// Regression (round-3 finding): an announce must never go out on a message id that
-    /// was abandoned earlier. RFC 7296 §2.1 lets the gateway replay its CACHED response
-    /// for such an id, and if the request cached under it was itself an
-    /// UPDATE_SA_ADDRESSES that replay carries the very NAT-D pair a genuine answer does
-    /// — so it cannot be told apart, and we would commit a move the gateway never made.
-    /// The id is spent on a plain DPD first (a replay there is harmless), and only then
-    /// is the SA moved.
-    ///
-    /// The discriminator is the datagram itself: an empty INFORMATIONAL is materially
-    /// shorter than `N(UPDATE_SA_ADDRESSES) + NAT_DETECTION_SOURCE_IP + _DESTINATION_IP`.
-    #[test]
-    fn an_announce_spends_an_abandoned_message_id_on_a_dpd_first() {
-        let update = announce_datagrams(false, Duration::from_millis(400));
-        let spend = announce_datagrams(true, Duration::from_millis(400));
-        assert!(
-            spend[0].len() < update[0].len(),
-            "on an abandoned id the first datagram must be the empty DPD ({} bytes), not the \
-             address update ({} bytes)",
-            spend[0].len(),
-            update[0].len()
-        );
-    }
-
-    /// Every datagram an `announce` against a silent loopback peer puts on the wire,
-    /// with the message id optionally poisoned first.
-    fn announce_datagrams(abandon: bool, grace: Duration) -> Vec<Vec<u8>> {
+    fn a_request_outstanding_across_a_rebind_finishes_on_the_new_socket() {
         let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let shared = test_shared_to(peer.local_addr().unwrap().port());
@@ -3828,95 +3691,245 @@ mod tests {
             let mut ike = lock(&shared.ike);
             ike.force_established_for_tests();
             ike.force_mobike_peer_for_tests();
-            if abandon {
-                let _ = ike.build_dpd().unwrap();
-                ike.abort_request();
-                assert!(ike.next_msgid_is_abandoned());
-            }
         }
+        let msgid = lock(&shared.ike).next_message_id();
+        let first_port = shared.transport.local_addr().port();
+        // A slow schedule: the rebind below has a whole second before the retransmission.
+        let policy = RetransmitConfig { initial_timeout_ms: 1_000, backoff_multiplier: 1.0, max_attempts: 5 };
+
+        let probing = {
+            let shared = Arc::clone(&shared);
+            let policy = policy.clone();
+            thread::spawn(move || do_dpd(&shared, &policy))
+        };
+        let mut buf = [0u8; 2048];
+        let (_, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(from.port(), first_port, "attempt 1 leaves the original socket");
+
+        // The path monitor moves the socket under the outstanding request.
+        let (moved_to, _old) = shared.transport.rebind(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        shared.path.note_move();
+        assert_ne!(moved_to.port(), first_port);
+
+        let (n, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(from.port(), moved_to.port(), "the retransmission leaves the NEW socket");
+        assert_eq!(
+            IkeHeader::decode(&buf[..n]).unwrap().message_id,
+            msgid,
+            "same request, same message id: the window stays in step"
+        );
+
+        // The gateway answers the retransmission, as it would answer any source it heard
+        // from: the exchange completes and consumes its id.
+        deliver_response(&shared, msgid);
+        probing.join().unwrap().expect("the probe survived the rebind");
+        assert!(!lock(&shared.ike).has_pending_request());
+
+        // And the announce simply takes `request_lock` afterwards, on the NEXT id.
         let announcing = {
             let shared = Arc::clone(&shared);
-            thread::spawn(move || {
-                // Nothing ever answers, so the announce gives up at the grace deadline.
-                let _ = announce(&shared, Some(Instant::now() + grace));
-            })
+            thread::spawn(move || announce(&shared))
         };
-        // Let the announce run to its deadline, then drain: a handful of small datagrams
-        // sits in the kernel receive buffer, and reading them afterwards keeps the
-        // helper free of timing assumptions about when each one goes out.
-        announcing.join().unwrap();
-        peer.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
-        let mut seen = Vec::new();
-        let mut buf = [0u8; 2048];
-        while let Ok(n) = peer.recv(&mut buf) {
-            seen.push(buf[..n].to_vec());
+        let (n, from) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(from.port(), moved_to.port(), "announced from the socket we moved to");
+        assert_eq!(IkeHeader::decode(&buf[..n]).unwrap().message_id, msgid + 1, "the announce follows on the next id");
+        deliver_response(&shared, msgid + 1);
+        announcing.join().unwrap().expect("the address update was acknowledged");
+        assert_eq!(shared.stats().address_updates, 1);
+        shared.stack.stop();
+    }
+
+    /// Hand the rx thread's job to the test: put a plaintext INFORMATIONAL response into
+    /// the pending slot, which is what `handle_ike_datagram` does once a datagram has
+    /// decoded and authenticated.
+    fn deliver_response(shared: &Shared, message_id: u32) {
+        let (spi_i, spi_r) = {
+            let ike = lock(&shared.ike);
+            (ike.spi_i(), ike.spi_r())
+        };
+        let msg = IkeMessage::new(spi_i, spi_r, EXCH_INFORMATIONAL, FLAG_RESPONSE, message_id, Vec::new());
+        {
+            let mut slot = lock(&shared.pending);
+            let slot = slot.as_mut().expect("a request is outstanding");
+            assert_eq!(slot.message_id, message_id);
+            slot.response = Some(msg);
         }
-        shared.stack.stop();
-        assert!(!seen.is_empty(), "the tunnel sent something");
-        seen
+        shared.pending_cv.notify_all();
     }
 
-    /// Regression (round-4 finding): the spend-DPD must not be able to own the whole
-    /// grace period.
-    ///
-    /// A silent gateway is the DOMINANT announce failure (a new AP whose uplink is not
-    /// usable yet), and it is precisely the case in which the spend cannot be answered.
-    /// Driving it with the full retransmit schedule and propagating its failure meant
-    /// the only thing the tunnel transmitted during an outage was empty INFORMATIONALs
-    /// — which RFC 4555 §3.8 does not let the responder move the child SAs from — until
-    /// `NO_ROUTE_GRACE` killed the tunnel: the `UPDATE_SA_ADDRESSES` was never sent, not
-    /// once, no matter how many times the path monitor retried inside the grace.
-    ///
-    /// The spend is bounded by `SPEND_MSGID_ATTEMPTS` now and never aborts the announce.
+    /// The only new decision the model needs: a request whose retransmissions ran out
+    /// while the path was being repaired is TRANSIENT, not a dead gateway. The outage
+    /// stays bounded by `NO_ROUTE_GRACE`, which is the single authority for death.
     #[test]
-    fn a_silent_gateway_still_sees_the_address_update_after_an_unspendable_message_id() {
-        // The length of a real address update, from an announce on a clean id.
-        let update_len = announce_datagrams(false, Duration::from_millis(400))[0].len();
-        // Long enough for the bounded spend (2 attempts ≈ 1.5 s) plus the first update.
-        let seen = announce_datagrams(true, Duration::from_millis(2_000));
-        assert!(seen[0].len() < update_len, "the spend-DPD still goes first");
-        let updates = seen.iter().filter(|d| d.len() == update_len).count();
-        assert!(
-            updates >= 1,
-            "an unanswered spend must not swallow the address update; datagram sizes: {:?} \
-             (an update is {update_len} bytes)",
-            seen.iter().map(|d| d.len()).collect::<Vec<_>>()
-        );
-    }
-
-    /// Regression (round-5 findings 3/4): an escalation rekey the path monitor aborted
-    /// never reached the gateway, so it must not spend one of this move's attempts.
-    ///
-    /// `rekey_child`'s abort predicate fires at the top of attempt 0 while the path is
-    /// suspended, so the request returns in microseconds with a path-kind `Io` and
-    /// nothing on the wire. Charging that used to cost an attempt per path tick, so two
-    /// ticks (~4 s) tore the tunnel down inside a `NO_ROUTE_GRACE` window that had 25 s
-    /// left — blaming the child SA for a CREATE_CHILD_SA that was never sent.
-    #[test]
-    fn an_escalation_rekey_that_never_reached_the_gateway_does_not_spend_an_attempt() {
-        let shared = test_shared();
+    fn a_request_that_exhausts_its_schedule_during_a_repair_is_transient() {
+        let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let shared = test_shared_to(peer.local_addr().unwrap().port());
         lock(&shared.ike).force_established_for_tests();
-        // The path monitor is repairing the path, so `rekey_child`'s abort predicate —
-        // the same one `do_dpd` uses — fires at the top of attempt 0.
-        shared.path.set_suspended(true);
-        let started = Instant::now();
-        let e = ike_request_locked(&shared, "CREATE_CHILD_SA (rekey child)", &shared.cfg.ike.retransmit, Some(&|| {
-            closing_abort(&shared).or_else(|| path_abort(&shared))
-        }), |ike| ike.build_dpd())
-        .unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(1), "the abort fires before the first send");
-        assert!(shared.path.snapshot().first_tx_since_rx.is_none(), "nothing left the socket");
-        assert!(is_path_failure(&e), "{e}");
-        assert!(!rekey_failure_is_fatal(&e, true), "an aborted rekey is never fatal");
-        assert_eq!(escalation_outcome(Some(&e), false, true), EscalationOutcome::Abandoned);
+        // Nothing ever answers; three short attempts run out in ~150 ms.
+        let policy = RetransmitConfig { initial_timeout_ms: 50, backoff_multiplier: 1.0, max_attempts: 3 };
+        let path = shared.path.settle_sample();
+        let probing = {
+            let shared = Arc::clone(&shared);
+            let policy = policy.clone();
+            thread::spawn(move || do_dpd(&shared, &policy))
+        };
+        let mut buf = [0u8; 2048];
+        peer.recv_from(&mut buf).unwrap();
+        // The monitor repairs the path under it. The request is NOT abandoned.
+        let _ = shared.transport.rebind(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        shared.path.note_move();
+
+        let e = probing.join().unwrap().expect_err("nothing answers");
+        assert!(matches!(e, Error::Timeout(_)), "it ran its whole schedule: {e}");
+        assert!(shared.path.unsettled_since(path));
+        assert_eq!(request_verdict(Some(&e), shared.path.unsettled_since(path)), RequestVerdict::Transient);
+        // ... whereas the very same outcome on a settled path IS the proof of death.
+        assert_eq!(request_verdict(Some(&e), false), RequestVerdict::GatewayGone);
+        assert!(shared.is_alive(), "no probe marks a tunnel dead across a move");
+        assert!(lock(&shared.dead_reason).is_none());
+        assert!(!lock(&shared.ike).has_pending_request(), "the request slot is free again");
         shared.stack.stop();
 
-        // The path-kind `Io` the abort predicate itself produces classifies the same way,
-        // as does a crossing teardown.
-        let io = Error::Io(std::io::Error::new(std::io::ErrorKind::NetworkDown, "x"));
-        assert!(is_path_failure(&io));
-        assert_eq!(escalation_outcome(Some(&io), false, true), EscalationOutcome::Abandoned);
+        // The outage is still bounded: the monitor's own clock, which none of this
+        // touches, declares the tunnel dead NO_ROUTE_GRACE after the rebind.
+        let mut m = PathMonitor::default();
+        let t0 = Instant::now();
+        m.rebound(t0);
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + NO_ROUTE_GRACE - Duration::from_secs(1))), PathAction::Announce);
+        assert!(matches!(m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + NO_ROUTE_GRACE)), PathAction::Dead(_)));
+    }
+
+    /// Regression (round-6 findings 7, 1/6/12), end to end on loopback. Two things the
+    /// previous shape got wrong, in the order a real handover produces them:
+    ///
+    /// 1. A probe that runs entirely BETWEEN the rebind and the announce never straddles
+    ///    a move, yet the gateway has still not been told where its datagrams come from.
+    ///    Classifying its silence as a dead gateway killed the tunnel ~16 s into an
+    ///    outage whose advertised tolerance is `NO_ROUTE_GRACE` — the "new AP whose
+    ///    uplink is not usable yet" case this feature exists for. It is the SAMPLE, not
+    ///    only the move counter, that has to know the path is unsettled.
+    /// 2. That probe's exhausted schedule abandons its message id, and the announce which
+    ///    follows reuses it. A gateway that did process the probe replays its cached
+    ///    response (RFC 7296 §2.1) without processing the address update, so believing it
+    ///    would commit a move that never happened. The refusal spends the id; the retry
+    ///    on the clean id is what actually moves the SA.
+    #[test]
+    fn a_probe_before_the_announce_is_transient_and_the_announce_refuses_its_replay() {
+        let peer = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let shared = test_shared_to(peer.local_addr().unwrap().port());
+        lock(&shared.ike).force_established_for_tests();
+        let policy = RetransmitConfig { initial_timeout_ms: 50, backoff_multiplier: 1.0, max_attempts: 3 };
+        let mut buf = [0u8; 2048];
+
+        // The monitor rebound the socket. The gateway has not acknowledged it yet, so the
+        // path is unsettled even though nothing is going to move again.
+        let (moved_to, _old) = shared.transport.rebind(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
+        shared.path.note_move();
+        assert!(shared.path.settle_sample().is_none(), "a repair is outstanding");
+
+        let path = shared.path.settle_sample();
+        let e = do_dpd(&shared, &policy).expect_err("nothing answers from the new address yet");
+        assert!(matches!(e, Error::Timeout(_)), "it ran its whole schedule: {e}");
+        assert!(shared.path.unsettled_since(path), "the sample itself says the path was not settled");
+        assert_eq!(request_verdict(Some(&e), shared.path.unsettled_since(path)), RequestVerdict::Transient);
+        assert!(shared.is_alive(), "the grace period decides, not this probe");
+        assert!(lock(&shared.dead_reason).is_none());
+
+        let mut probe_msgid = None;
+        for _ in 0..policy.max_attempts {
+            let (n, from) = peer.recv_from(&mut buf).unwrap();
+            assert_eq!(from.port(), moved_to.port());
+            probe_msgid = Some(IkeHeader::decode(&buf[..n]).unwrap().message_id);
+        }
+        let probe_msgid = probe_msgid.unwrap();
+
+        // The announce reuses the probe's unanswered id, and the gateway — which DID
+        // process the probe — replays its cached empty response for it.
+        let announcing = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || announce(&shared))
+        };
+        let (n, _) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(IkeHeader::decode(&buf[..n]).unwrap().message_id, probe_msgid, "the abandoned id is reused");
+        deliver_response(&shared, probe_msgid);
+        let e = announcing.join().unwrap().expect_err("a replay must not be read as an acknowledgement");
+        assert!(matches!(e, Error::Protocol(ref s) if s.contains("abandoned request")), "{e}");
+        assert_eq!(shared.stats().address_updates, 0, "no move was committed");
+        assert!(address_update_failure(&e).is_none(), "and it is a retry, not a reason to die");
+        assert!(shared.path.settle_sample().is_none(), "still unsettled");
+
+        // The retry runs on the fresh id the refusal spent, and that one settles the path.
+        let announcing = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || announce(&shared))
+        };
+        let (n, _) = peer.recv_from(&mut buf).unwrap();
+        assert_eq!(IkeHeader::decode(&buf[..n]).unwrap().message_id, probe_msgid + 1);
+        deliver_response(&shared, probe_msgid + 1);
+        announcing.join().unwrap().expect("the address update was acknowledged");
+        assert_eq!(shared.stats().address_updates, 1);
+
+        // Settled again: the very same timeout is now proof that the gateway is gone.
+        let path = shared.path.settle_sample();
+        assert!(path.is_some(), "the gateway knows where we are");
+        assert!(!shared.path.unsettled_since(path));
+        assert_eq!(request_verdict(Some(&e), shared.path.unsettled_since(path)), RequestVerdict::Transient);
+        assert_eq!(
+            request_verdict(Some(&Error::Timeout("probe")), shared.path.unsettled_since(path)),
+            RequestVerdict::GatewayGone
+        );
+        shared.stack.stop();
+    }
+
+    /// A send the host refuses outright leaves nothing on the wire: the request gives up
+    /// at once, without running the schedule.
+    ///
+    /// Whether that costs one of the move's attempts depends on WHY the send failed, and
+    /// the two halves are asserted together because the distinction is the whole point
+    /// (round-6 finding 3). A broken route is evidence of nothing and re-arms for free —
+    /// charging it used to tear the tunnel down about 4 s into an outage whose advertised
+    /// tolerance is `NO_ROUTE_GRACE`. A refusal that is NOT a broken route (EACCES from a
+    /// local filter, ENOBUFS) is deterministic: it would repeat identically on every
+    /// tick, so it has to count, or the escalation re-arms forever with no path to
+    /// `ESP_MIGRATION_REKEY_ATTEMPTS` and the tunnel never dies over a black-holed child
+    /// SA.
+    #[test]
+    fn a_rekey_whose_send_was_refused_spends_an_attempt_only_when_the_route_is_intact() {
+        // The v4 broadcast address: `send_to` fails immediately with EACCES on a socket
+        // that never asked for SO_BROADCAST.
+        let shared = test_shared_remote(Ipv4Addr::BROADCAST, 500);
+        lock(&shared.ike).force_established_for_tests();
+        let started = Instant::now();
+        let e = ike_request(&shared, "CREATE_CHILD_SA (rekey child)", &shared.cfg.ike.retransmit, |ike| ike.build_dpd())
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1), "a refused send must not run the schedule");
+        assert!(shared.path.snapshot().first_tx_since_rx.is_none(), "nothing left the socket");
+        assert!(matches!(e, Error::Io(_)), "{e}");
+        assert!(!lock(&shared.ike).has_pending_request(), "the request slot is free again");
+        assert_eq!(request_verdict(Some(&e), false), RequestVerdict::Transient);
+        assert!(!is_path_failure(&e), "EACCES is not a broken route: {e}");
+        assert_eq!(escalation_outcome(Some(&e), false, false), EscalationOutcome::Failed);
+        shared.stack.stop();
+
+        // A send that failed because the route itself is gone, and a crossing teardown:
+        // both are evidence of nothing, so neither spends an attempt.
+        let down = Error::Io(std::io::Error::new(std::io::ErrorKind::NetworkDown, "x"));
+        assert!(is_path_failure(&down));
+        assert_eq!(escalation_outcome(Some(&down), false, false), EscalationOutcome::Abandoned);
         assert_eq!(escalation_outcome(Some(&Error::Closed("closing".into())), false, false), EscalationOutcome::Abandoned);
+
+        // The deterministic response-side failures the catch-all must keep charging.
+        for e in [
+            Error::Unsupported("ENCR transform 99".into()),
+            Error::Crypto("bad key length".into()),
+            Error::Encode("message too large".into()),
+            Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "filtered")),
+        ] {
+            assert_eq!(escalation_outcome(Some(&e), false, false), EscalationOutcome::Failed, "{e}");
+            assert_eq!(escalation_outcome(Some(&e), false, true), EscalationOutcome::Failed, "{e} over a repair");
+        }
     }
 
     /// The rest of the escalation's outcome table (DESIGN §17.3/§17.4).
@@ -3930,8 +3943,8 @@ mod tests {
         // Retransmissions exhausted on a settled path: the gateway is gone.
         let timeout = Error::Timeout("CREATE_CHILD_SA (rekey child)");
         assert_eq!(escalation_outcome(Some(&timeout), false, false), EscalationOutcome::Fatal);
-        // ... but not while the path is being repaired: those retransmissions left an
-        // address the gateway has never been told about, so their silence says nothing.
+        // ... but not when the socket moved under it: the gateway may never have been
+        // able to answer the source those retransmissions came from.
         assert_eq!(escalation_outcome(Some(&timeout), false, true), EscalationOutcome::Abandoned);
         // The migration happened and only the DELETE of the old child SA failed: the
         // gateway completed the repair, so it must not be reported as a failure.
@@ -3993,8 +4006,8 @@ mod tests {
     /// Regression (round-4 finding): the escalation must be driven by the OUTCOME of the
     /// rekey, not by the fact that one was requested.
     ///
-    /// `rekey_failure_is_fatal` is only "a timeout on a path that is not being repaired",
-    /// so the gateway's normal `N(TEMPORARY_FAILURE)` while it rekeys on its own (RFC 7296
+    /// `request_verdict` blames the gateway only for a timeout on a settled path, so the
+    /// gateway's normal `N(TEMPORARY_FAILURE)` while it rekeys on its own (RFC 7296
     /// §2.25) lands in the non-fatal arm. That used to be a bare `warn!`, and because the
     /// path thread had already set `rekeyed_after_move` when it made the REQUEST,
     /// `esp_migration_stalled` stayed disarmed for the rest of the tunnel's life — leaving

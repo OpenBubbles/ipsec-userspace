@@ -170,10 +170,6 @@ struct RekeyChildState {
     proposals: Vec<Proposal>,
     ts_i: TsPayload,
     ts_r: TsPayload,
-    /// See [`AddressUpdate::reused_msgid`]. A cached CREATE_CHILD_SA response carries the
-    /// nonce of the attempt we gave up on, so deriving keys from it would install a child
-    /// SA whose keys the gateway does not have (DESIGN §17.2).
-    reused_msgid: bool,
 }
 
 struct RekeyIkeState {
@@ -181,10 +177,6 @@ struct RekeyIkeState {
     nonce_i: Vec<u8>,
     dh_pair: Box<dyn DhKeyPair>,
     proposal: Proposal,
-    /// See [`AddressUpdate::reused_msgid`]. A cached response carries the KE public value
-    /// of the attempt we gave up on, so the new IKE SA's keys would be garbage
-    /// (DESIGN §17.2).
-    reused_msgid: bool,
 }
 
 /// Where an outstanding address update asked the gateway to move the SA.
@@ -201,10 +193,6 @@ struct AddressUpdate {
     mobike: bool,
     /// NAT-D payloads were sent, so the response's are worth evaluating.
     nat_d: bool,
-    /// The request went out on a message id that an earlier, abandoned request had
-    /// already used, so the responder may answer it from its cache without processing
-    /// the update at all (RFC 7296 §2.1). Such a response is not evidence of a move.
-    reused_msgid: bool,
 }
 
 /// The one request we currently have outstanding after establishment.
@@ -273,12 +261,6 @@ pub struct IkeInitiator {
 
     // Message ids
     our_msgid: u32,
-    /// A message id that was used for a request nobody answered ([`IkeInitiator::abort_request`]).
-    /// The next request reuses it (RFC 7296 §2.1 leaves `our_msgid` alone), and a
-    /// responder that HAD processed the abandoned request replays its cached response
-    /// instead of processing the new one — so a response on this id proves nothing.
-    /// Cleared as soon as any response advances `our_msgid`.
-    abandoned_msgid: Option<u32>,
     peer_msgid: u32,
     last_peer_response: Option<(u32, IkeMessage)>,
 
@@ -297,6 +279,17 @@ pub struct IkeInitiator {
     child_negotiated: Option<Proposal>,
     old_child: Option<ChildSaInfo>,
     pending: Pending,
+    /// The message id of a request that was abandoned with its retransmit schedule
+    /// exhausted (or on teardown), i.e. an id that WAS on the wire and was never
+    /// answered. `our_msgid` is not advanced for it — the window is one message wide, so
+    /// skipping an id would stall the responder — which means the NEXT request, possibly
+    /// a different exchange, is built on it. A responder that did process the abandoned
+    /// request is then obliged by RFC 7296 §2.1 to replay its cached response for it
+    /// WITHOUT processing the new one, and nothing in the header tells the two apart. See
+    /// [`IkeInitiator::accept_response`] for which exchanges therefore refuse it.
+    ///
+    /// Cleared as soon as any response is accepted for the id (`consume_message_id`).
+    abandoned_msgid: Option<u32>,
     old_ike: Option<OldIkeSa>,
     reassembler: Reassembler,
 }
@@ -728,7 +721,6 @@ impl IkeInitiator {
             peer_fragmentation: false,
             peer_mobike: false,
             our_msgid: 0,
-            abandoned_msgid: None,
             peer_msgid: 0,
             last_peer_response: None,
             id_i: IdPayload { id_type: cfg.identity.local_id.id_type, data: cfg.identity.local_id.data.clone() },
@@ -742,6 +734,7 @@ impl IkeInitiator {
             child_negotiated: None,
             old_child: None,
             pending: Pending::None,
+            abandoned_msgid: None,
             old_ike: None,
             reassembler: Reassembler::new(),
         })
@@ -1012,9 +1005,8 @@ impl IkeInitiator {
         Ok(msg)
     }
 
-    /// A response was accepted for `our_msgid`: move on to the next id. Whatever the
-    /// responder did with it, the id is now spent, so it can no longer be the abandoned
-    /// one a replay would be cached under.
+    /// A response was accepted for `our_msgid`: move on to the next id. The id is spent,
+    /// so whatever was abandoned on it can no longer be replayed onto a later request.
     fn consume_message_id(&mut self) {
         self.our_msgid = self.our_msgid.wrapping_add(1);
         self.abandoned_msgid = None;
@@ -1060,7 +1052,35 @@ impl IkeInitiator {
                 h.exchange_type, exchange
             )));
         }
+        // RFC 7296 §2.1: a responder that has already answered this message id replays
+        // its cached response WITHOUT processing the request. When the previous request
+        // on this id exhausted its retransmit schedule, the next request — possibly a
+        // DIFFERENT exchange — reuses it (see `abandoned_msgid`), and the header cannot
+        // tell the replay from a genuine answer.
+        //
+        // The exchanges that commit state on a bare acknowledgement must therefore refuse
+        // it: an address update would move the SA the gateway never moved (RFC 4555 §3.8
+        // forbids it to re-learn our address from ESP, so ESP would be black-holed while
+        // IKE still looked healthy), and a rekey would derive keys against the cached
+        // response's nonce and then DELETE the SA that still works. A DPD or a DELETE
+        // does not need the guard: a replay is still the gateway answering this very
+        // datagram, which is all they ask.
+        //
+        // The id is consumed either way, so one refusal unpoisons the session and the
+        // retry runs on a fresh id (DESIGN §17.2).
+        let replayable = self.abandoned_msgid == Some(self.our_msgid);
         self.consume_message_id();
+        if replayable && matches!(self.pending, Pending::AddressUpdate(_) | Pending::RekeyChild(_) | Pending::RekeyIke(_))
+        {
+            // As above: drop the slot here so `abort_request` cannot flag the id we have
+            // just advanced TO, an id no datagram has ever carried.
+            self.pending = Pending::None;
+            return Err(Error::Protocol(format!(
+                "{what}: message id {} was already spent by an abandoned request, so this may be \
+                 the responder's cached response for it (RFC 7296 §2.1); refusing to commit on it",
+                h.message_id
+            )));
+        }
         Ok(())
     }
 
@@ -1392,18 +1412,15 @@ impl IkeInitiator {
     }
 
     /// Abandon the outstanding request (retransmissions exhausted, send failure, tunnel
-    /// closed) so the next request can be built. `our_msgid` is left unchanged: the
-    /// abandoned id was never answered, so the next request reuses it (RFC 7296 §2.1).
-    /// Rekey state (new SPI / nonce / DH pair) is dropped with it.
+    /// closed) so the next request can be built. Rekey state (new SPI / nonce / DH pair)
+    /// is dropped with it.
     ///
-    /// The id is remembered in `abandoned_msgid`: the responder may well have processed
-    /// the request we gave up on, in which case RFC 7296 §2.1 has it replay the cached
-    /// response for that id rather than process what we send next. A response on a reused
-    /// id therefore proves nothing, which every exchange whose response carries key
-    /// material or moves the SA has to know: [`IkeInitiator::build_address_update`],
-    /// [`IkeInitiator::build_rekey_child`] and [`IkeInitiator::build_rekey_ike`] all
-    /// record it, their handlers refuse such a response, and the tunnel's `announce`
-    /// spends the id on a DPD first (DESIGN §17.2).
+    /// `our_msgid` is left unchanged — the window is one message wide, so skipping the id
+    /// would stall the responder — and the id is remembered in `abandoned_msgid`, because
+    /// the request it carried may well have been processed and its response cached. A
+    /// move never reaches this path (a rebind does not interrupt a request: the remaining
+    /// retransmissions simply leave the new socket), but an exhausted schedule and a
+    /// teardown both do (DESIGN §17.2).
     pub fn abort_request(&mut self) {
         if !matches!(self.pending, Pending::None) {
             warn!("abandoning the outstanding request (msgid {})", self.our_msgid);
@@ -1411,29 +1428,6 @@ impl IkeInitiator {
             self.abandoned_msgid = Some(self.our_msgid);
         }
     }
-
-    /// [`IkeInitiator::abort_request`] for a request NO datagram of which ever reached
-    /// the socket (the caller's abort predicate fired before the first send): the
-    /// responder cannot have processed an id it never saw, so there is nothing to
-    /// replay and the id is not recorded as abandoned. Recording it anyway would make
-    /// the next request look like a replay candidate and cost a needless extra exchange
-    /// (DESIGN §17.2). A send that FAILED still counts as sent — a fragment may have
-    /// gone out before the error.
-    pub fn abort_unsent_request(&mut self) {
-        if !matches!(self.pending, Pending::None) {
-            debug!("dropping the outstanding request (msgid {}); nothing was sent", self.our_msgid);
-            self.pending = Pending::None;
-        }
-    }
-
-    /// Would the next request reuse an id that was abandoned (and that the gateway may
-    /// therefore have a cached response for)? The tunnel spends such an id on a DPD
-    /// before it announces a new address, so the announce runs on a provably fresh id
-    /// (DESIGN §17.2).
-    pub fn next_msgid_is_abandoned(&self) -> bool {
-        self.abandoned_msgid == Some(self.our_msgid)
-    }
-
 
     /// Put the session into the post-establishment state with deterministic dummy keys,
     /// so a tunnel-level test can drive a real request (build → encode → send → wait)
@@ -1526,10 +1520,9 @@ impl IkeInitiator {
                 payloads.push(Payload::Notify(dst));
             }
         }
-        let reused_msgid = self.abandoned_msgid == Some(self.our_msgid);
-        self.pending = Pending::AddressUpdate(AddressUpdate { local, remote, mobike, nat_d, reused_msgid });
+        self.pending = Pending::AddressUpdate(AddressUpdate { local, remote, mobike, nat_d });
         info!(
-            "address update request: msgid {} {} -> {} (dst {remote}, mobike={mobike}, nat-d={nat_d}, reused-id={reused_msgid})",
+            "address update request: msgid {} {} -> {} (dst {remote}, mobike={mobike}, nat-d={nat_d})",
             self.our_msgid, self.local, local
         );
         Ok(self.request(EXCH_INFORMATIONAL, payloads))
@@ -1681,51 +1674,19 @@ impl IkeInitiator {
     /// address. A NAT-D block that does not parse is then a `warn!` that keeps the
     /// previous [`NatStatus`] (AOSP treats it as non-fatal): the move itself succeeded.
     ///
-    /// One shape is refused before any of that: a request that reused an abandoned
-    /// message id (`AddressUpdate::reused_msgid`). RFC 7296 §2.1 has the responder replay
-    /// its cached response for an id it already processed instead of processing the new
-    /// request, so the move would silently not happen while we logged it as done. The
-    /// replay cannot be told from an acknowledgement — NOT EVEN BY ITS NAT-D PAYLOADS,
-    /// because the request cached under that id may itself have been an
-    /// UPDATE_SA_ADDRESSES whose response carries exactly the NAT-D pair a genuine one
-    /// does, hashed over the address we were moving to LAST time. So a reused id is
-    /// refused unconditionally, with `Error::Protocol`, which the path monitor treats as
-    /// transient; the retry uses the next message id (already advanced by
-    /// `accept_response`), which the gateway has not consumed, and it is the one that
-    /// commits.
+    /// A response without NAT-D commits the move: RFC 4555 does not require the responder
+    /// to re-run NAT detection, and AOSP (`IkeSessionStateMachine.handleNatDetection`)
+    /// treats the same message as a successful move, at most marking NAT-T unsupported.
+    /// Refusing it would kill a tunnel whose handover the gateway accepted.
     ///
-    /// This is not merely a backstop. The tunnel spends an abandoned id on a short DPD
-    /// first (`announce` in `tunnel.rs`, DESIGN §17.2), but when that DPD is itself
-    /// unanswered the announce goes ahead on the reused id rather than sit out the grace
-    /// period sending empty INFORMATIONALs the responder may not move an SA from
-    /// (RFC 4555 §3.8). So `reused_msgid` IS reachable from the path monitor, and this
-    /// check is what makes it safe: a genuine gateway that never saw the abandoned
-    /// request still receives a real `UPDATE_SA_ADDRESSES`, we simply refuse to believe
-    /// its answer and commit on the next, provably fresh id.
-    ///
-    /// On a FRESH id a response without NAT-D commits the move: RFC 4555 does not require
-    /// the responder to re-run NAT detection, and AOSP
-    /// (`IkeSessionStateMachine.handleNatDetection`) treats the same message as a
-    /// successful move, at most marking NAT-T unsupported. Refusing it would kill a
-    /// tunnel whose handover the gateway accepted.
+    /// Which is exactly why this exchange must never run on a message id an abandoned
+    /// request already spent: on such an id a bare INFORMATIONAL response is just as
+    /// likely to be the responder's cached answer to that earlier request (RFC 7296
+    /// §2.1), and committing it would move the SA the gateway never moved. That case is
+    /// refused one level up, in [`IkeInitiator::accept_response`], so by the time we get
+    /// here the acknowledgement can be believed (DESIGN §17.2).
     fn handle_address_update_response(&mut self, msg: &IkeMessage, st: AddressUpdate) -> Result<()> {
         const WHAT: &str = "INFORMATIONAL (address update)";
-        // FIRST, ahead of every content check: on a reused id NOTHING in this message may
-        // be attributed to our request, not even an error notify. The cached response the
-        // gateway replays belongs to the request we gave up on — a rekey answered
-        // TEMPORARY_FAILURE, an older update answered UNACCEPTABLE_ADDRESSES for an
-        // address we are no longer moving to — and reading it as a rejection of THIS move
-        // would turn a stale replay into `Error::PeerNotify`, which the path monitor
-        // treats as fatal. `Error::Protocol` is transient, so the retry runs on the next
-        // id (already advanced by `accept_response`) and that one commits.
-        if st.reused_msgid {
-            return Err(Error::Protocol(format!(
-                "{WHAT}: the request reused message id {} (abandoned earlier), so this may be \
-                 the gateway's cached response for that id rather than an acknowledgement of \
-                 the move; retrying with the next id",
-                msg.header.message_id
-            )));
-        }
         if let Some(e) = msg.error_notify(WHAT) {
             return Err(e);
         }
@@ -1942,9 +1903,7 @@ impl IkeInitiator {
             "CREATE_CHILD_SA (rekey child {:#010x} -> new SPI_in {:#010x}) msgid {}",
             old_spi_in, spi_in, self.our_msgid
         );
-        let reused_msgid = self.abandoned_msgid == Some(self.our_msgid);
-        self.pending =
-            Pending::RekeyChild(RekeyChildState { spi_in, nonce_i, proposals, ts_i, ts_r, reused_msgid });
+        self.pending = Pending::RekeyChild(RekeyChildState { spi_in, nonce_i, proposals, ts_i, ts_r });
         Ok(self.request(EXCH_CREATE_CHILD_SA, payloads))
     }
 
@@ -1959,22 +1918,6 @@ impl IkeInitiator {
             Pending::RekeyChild(s) => s,
             _ => return Err(Error::Protocol("no child rekey outstanding".into())),
         };
-        // Before any content check, and before any state is committed: on a reused id the
-        // gateway may replay the cached response for the attempt we abandoned (RFC 7296
-        // §2.1). That response carries THAT exchange's nonce, so `derive_child_keys` below
-        // would mix it with this attempt's nonce and install a child SA whose keys the
-        // gateway does not hold — a silent, bidirectional ESP black hole, since we would
-        // also delete the child SA that still works. `Error::Protocol` is transient, so the
-        // caller retries on the next id (already advanced by `accept_response`), which is
-        // provably fresh (DESIGN §17.2).
-        if st.reused_msgid {
-            return Err(Error::Protocol(format!(
-                "CREATE_CHILD_SA (rekey child) response: the request reused message id {} \
-                 (abandoned earlier), so this may be the gateway's cached response for that \
-                 id rather than an answer to this rekey; retrying with the next id",
-                msg.header.message_id
-            )));
-        }
         if let Some(e) = msg.error_notify("CREATE_CHILD_SA") {
             return Err(e);
         }
@@ -2044,8 +1987,7 @@ impl IkeInitiator {
             Payload::Nonce(nonce_i.clone()),
         ];
         info!("CREATE_CHILD_SA (rekey IKE, new SPIi {:#018x}) msgid {}", spi_i, self.our_msgid);
-        let reused_msgid = self.abandoned_msgid == Some(self.our_msgid);
-        self.pending = Pending::RekeyIke(RekeyIkeState { spi_i, nonce_i, dh_pair, proposal, reused_msgid });
+        self.pending = Pending::RekeyIke(RekeyIkeState { spi_i, nonce_i, dh_pair, proposal });
         Ok(self.request(EXCH_CREATE_CHILD_SA, payloads))
     }
 
@@ -2062,18 +2004,6 @@ impl IkeInitiator {
             Pending::RekeyIke(s) => s,
             _ => return Err(Error::Protocol("no IKE rekey outstanding".into())),
         };
-        // Same rule as the child rekey above: a cached response for an abandoned id carries
-        // the KE public value of the attempt we gave up on, so the new IKE SA's keys would
-        // be derived from a shared secret the gateway never computed — every later message
-        // would fail integrity. Refuse before committing anything (DESIGN §17.2).
-        if st.reused_msgid {
-            return Err(Error::Protocol(format!(
-                "CREATE_CHILD_SA (rekey IKE) response: the request reused message id {} \
-                 (abandoned earlier), so this may be the gateway's cached response for that \
-                 id rather than an answer to this rekey; retrying with the next id",
-                msg.header.message_id
-            )));
-        }
         if let Some(e) = msg.error_notify("CREATE_CHILD_SA") {
             return Err(e);
         }
@@ -2108,8 +2038,6 @@ impl IkeInitiator {
         self.nonce_i = st.nonce_i;
         self.nonce_r = nr.to_vec();
         self.our_msgid = 0;
-        // Fresh SA, fresh id space: an id abandoned on the old SA cannot be replayed here.
-        self.abandoned_msgid = None;
         self.peer_msgid = 0;
         self.last_peer_response = None;
         self.reassembler = Reassembler::new();
@@ -3473,175 +3401,27 @@ mod tests {
         assert_eq!(init.nat().unwrap(), before);
     }
 
-    /// Regression: an aborted DPD leaves its message id unanswered, so the address update
-    /// reuses it. If the gateway HAD processed that DPD it replays the cached (empty)
-    /// response instead of processing the update — committing the new address then would
-    /// leave us believing we moved while the gateway still points at the dead 5-tuple.
+    /// A response on the right id but the WRONG exchange type consumes the id (AOSP
+    /// parity) and must release the request slot with it, or the next request could never
+    /// be built (`require_idle` would report one outstanding).
     #[test]
-    fn address_update_rejects_a_replayed_response_for_a_reused_message_id() {
-        let (mut init, resp, _) = establish(false);
-        let before = init.local_addr();
-        // A DPD that is abandoned (the path moved under it) keeps its message id.
-        let dpd = init.build_dpd().unwrap();
-        let msgid = dpd.header.message_id;
-        init.abort_request();
-        let m = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m.header.message_id, msgid, "the abandoned id is reused");
-        assert_eq!(notify_types(&m)[0], N_UPDATE_SA_ADDRESSES);
-        // What the gateway replays for an id it already answered: its empty DPD response.
-        let r = resp.seal_response(EXCH_INFORMATIONAL, msgid, Vec::new());
-        let rm = init.decode(&r).unwrap();
-        let e = init.handle_informational_response(&rm).unwrap_err();
-        assert!(matches!(e, Error::Protocol(ref m) if m.contains("reused message id")), "{e}");
-        assert_eq!(init.local_addr(), before, "nothing is committed");
-        // The retry uses the next id, which the gateway has not consumed.
-        assert_eq!(init.next_message_id(), msgid + 1);
-        let m2 = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m2.header.message_id, msgid + 1);
-        let r2 = resp.seal_response(EXCH_INFORMATIONAL, msgid + 1, nat_d_response_for(&resp, new_local()));
-        let rm2 = init.decode(&r2).unwrap();
-        init.handle_informational_response(&rm2).unwrap();
-        assert_eq!(init.local_addr(), new_local());
-    }
-
-    /// Regression (round-3 finding): the guard used to accept a reused-id response as
-    /// long as it carried NAT_DETECTION payloads, on the premise that "a replay cannot
-    /// carry the NAT-D pair a genuine MOBIKE response carries". That premise is false.
-    /// When the request cached under that id was ITSELF an `UPDATE_SA_ADDRESSES` — the
-    /// route flipped A->B->C, so announce #1 for B was abandoned and announce #2 reused
-    /// its id for C — the gateway's cached response carries exactly that pair, hashed
-    /// over B. `nat::evaluate` cannot notice: a destination hash that does not match only
-    /// sets `local_behind_nat`, which `force_udp_encap` forces on anyway. We would commit
-    /// the move to C while the gateway kept the SA at B, and RFC 4555 §3.8 forbids it to
-    /// re-learn our address from ESP — a black hole until the liveness probes tore the
-    /// registration down. A reused id is refused unconditionally now.
-    #[test]
-    fn address_update_rejects_a_cached_response_from_an_earlier_address_update() {
-        let (mut init, resp, _) = establish(false);
-        let b = new_local();
-        let c: SocketAddr = "10.44.0.7:52000".parse().unwrap();
-        // Announce #1: move to B. The gateway processes it and caches its NAT-D response,
-        // which is lost (the route flipped again and the send failed).
-        let m1 = init.build_address_update(b, natt_remote()).unwrap();
-        let msgid = m1.header.message_id;
-        let cached = resp.seal_response(EXCH_INFORMATIONAL, msgid, nat_d_response_for(&resp, b));
-        init.abort_request();
-        // Announce #2 on the reused id: move to C.
-        let m2 = init.build_address_update(c, natt_remote()).unwrap();
-        assert_eq!(m2.header.message_id, msgid, "the abandoned id is reused");
-        // The gateway replays the cached response for the move to B.
-        let rm = init.decode(&cached).unwrap();
-        let e = init.handle_informational_response(&rm).unwrap_err();
-        assert!(matches!(e, Error::Protocol(ref m) if m.contains("reused message id")), "{e}");
-        assert_ne!(init.local_addr(), c, "the move to C must NOT be committed");
-        assert_ne!(init.local_addr(), b, "and neither must the move to B");
-        // The retry on the next id is the one that commits.
-        let m3 = init.build_address_update(c, natt_remote()).unwrap();
-        assert_eq!(m3.header.message_id, msgid + 1);
-        let r3 = resp.seal_response(EXCH_INFORMATIONAL, msgid + 1, nat_d_response_for(&resp, c));
-        let rm3 = init.decode(&r3).unwrap();
-        init.handle_informational_response(&rm3).unwrap();
-        assert_eq!(init.local_addr(), c);
-    }
-
-    /// Regression (round-3 finding): a request whose abort predicate fired BEFORE its
-    /// first datagram reached the socket (a `dpd()` call that lost the race with the path
-    /// monitor, a rekey's second exchange aborted mid-flight) was still recorded as an
-    /// abandoned id. The gateway cannot have cached a response for an id it never saw, and
-    /// treating the next request as a replay candidate costs a needless extra exchange.
-    #[test]
-    fn an_unsent_request_does_not_mark_its_message_id_abandoned() {
-        let (mut init, resp, _) = establish(false);
-        let _ = init.build_dpd().unwrap();
-        let msgid = init.next_message_id();
-        init.abort_unsent_request();
-        assert!(!init.next_msgid_is_abandoned(), "an id that never reached the wire is not abandoned");
-        // ... whereas one that did is.
-        let _ = init.build_dpd().unwrap();
-        init.abort_request();
-        assert!(init.next_msgid_is_abandoned());
-        // The address update built after the UNSENT abort is judged on its own merits.
-        init.abort_unsent_request();
-        let _ = init.build_dpd().unwrap();
-        init.abort_unsent_request();
-        assert!(init.next_msgid_is_abandoned(), "the earlier SENT abort still stands");
-        // Spend the abandoned id (what `announce` does) and the update commits.
-        let _ = init.build_dpd().unwrap();
-        let r = resp.seal_response(EXCH_INFORMATIONAL, msgid, Vec::new());
-        let rm = init.decode(&r).unwrap();
-        init.handle_informational_response(&rm).unwrap();
-        assert!(!init.next_msgid_is_abandoned());
-        let m = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m.header.message_id, msgid + 1);
-        let r = resp.seal_response(EXCH_INFORMATIONAL, msgid + 1, Vec::new());
-        let rm = init.decode(&r).unwrap();
-        init.handle_informational_response(&rm).unwrap();
-        assert_eq!(init.local_addr(), new_local());
-    }
-
-    /// Regression (round-4 finding): the reused-id refusal must come FIRST, ahead of the
-    /// notify checks. The response replayed for an abandoned id belongs to the request we
-    /// gave up on — here a child rekey the gateway answered `TEMPORARY_FAILURE`
-    /// (RFC 7296 §2.25, its normal answer while it rekeys on its own) — and reading that
-    /// as a rejection of the MOVE returns `Error::PeerNotify`, which the path monitor
-    /// treats as fatal and turns a stale replay into a dead tunnel. `Error::Protocol` is
-    /// transient, so the retry runs on the next id.
-    #[test]
-    fn a_replayed_error_notify_on_a_reused_id_is_transient_not_a_rejection() {
-        let (mut init, resp, _) = establish(false);
-        let before = init.local_addr();
-        let _ = init.build_rekey_child().unwrap();
-        let msgid = init.next_message_id();
-        init.abort_request();
-        let m = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m.header.message_id, msgid, "the abandoned id is reused");
-        // The gateway replays what it cached for that id: its refusal of the REKEY.
-        let r = resp.seal_response(
-            EXCH_INFORMATIONAL,
-            msgid,
-            vec![Payload::Notify(NotifyPayload::status(N_TEMPORARY_FAILURE, vec![]))],
-        );
-        let rm = init.decode(&r).unwrap();
-        let e = init.handle_informational_response(&rm).unwrap_err();
-        assert!(matches!(e, Error::Protocol(ref m) if m.contains("reused message id")), "{e}");
-        assert_eq!(init.local_addr(), before, "nothing is committed");
-        // Transient: the retry on the next id is the one that commits.
-        let m2 = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m2.header.message_id, msgid + 1);
-        let r2 = resp.seal_response(EXCH_INFORMATIONAL, msgid + 1, nat_d_response_for(&resp, new_local()));
-        let rm2 = init.decode(&r2).unwrap();
-        init.handle_informational_response(&rm2).unwrap();
-        assert_eq!(init.local_addr(), new_local());
-    }
-
-    /// Regression (round-4 finding): a response on the right id but the WRONG exchange
-    /// type consumes the id (AOSP parity) and must release the request slot with it.
-    /// Otherwise the tunnel's `settle`, which calls `abort_request` on any handler error,
-    /// would flag the id we have just advanced TO — an id no datagram has ever carried —
-    /// and the next request would pay a needless extra exchange (DESIGN §17.2).
-    ///
-    /// Exactly the shape `announce`'s spend-DPD produces: a rekey abandoned mid-flight,
-    /// the DPD reusing its id, and the gateway replaying the cached CREATE_CHILD_SA
-    /// response for it.
-    #[test]
-    fn a_wrong_exchange_response_does_not_poison_the_next_message_id() {
+    fn a_wrong_exchange_response_consumes_the_id_and_releases_the_slot() {
         let (mut init, resp, _) = establish(false);
         let _ = init.build_rekey_child().unwrap();
         let msgid = init.next_message_id();
         init.abort_request();
-        // The spend-DPD reuses the abandoned id.
+        // The next request reuses the unanswered id (RFC 7296 §2.1).
         let dpd = init.build_dpd().unwrap();
         assert_eq!(dpd.header.message_id, msgid);
-        // The gateway replays its cached CREATE_CHILD_SA response for that id.
+        // The gateway answers with the wrong exchange type.
         let r = resp.seal_response(EXCH_CREATE_CHILD_SA, msgid, Vec::new());
         let rm = init.decode(&r).unwrap();
         let e = init.handle_informational_response(&rm).unwrap_err();
         assert!(matches!(e, Error::Protocol(ref m) if m.contains("exchange type")), "{e}");
         assert_eq!(init.next_message_id(), msgid + 1, "the id is spent either way");
         assert!(!init.has_pending_request(), "and the request slot is released with it");
-        // What `settle` does on a handler error must now be a no-op.
+        // What `settle` does on a handler error must be a no-op here.
         init.abort_request();
-        assert!(!init.next_msgid_is_abandoned(), "the fresh id was never transmitted");
         let m = init.build_address_update(new_local(), natt_remote()).unwrap();
         assert_eq!(m.header.message_id, msgid + 1);
         let r2 = resp.seal_response(EXCH_INFORMATIONAL, msgid + 1, nat_d_response_for(&resp, new_local()));
@@ -3650,18 +3430,16 @@ mod tests {
         assert_eq!(init.local_addr(), new_local(), "committed on the first try");
     }
 
-    /// Regression (the other half of the replay guard): a conformant gateway that accepts
-    /// the move but does not re-run NAT detection answers with a BARE INFORMATIONAL. On a
-    /// fresh message id nothing can have been replayed, so that is a successful move —
-    /// AOSP's `handleNatDetection` returns normally and migrates the SAs. Refusing it
-    /// would have the path monitor re-announce until `NO_ROUTE_GRACE` and then kill a
-    /// tunnel the gateway had already moved.
+    /// A conformant gateway that accepts the move but does not re-run NAT detection
+    /// answers with a BARE INFORMATIONAL, which is a successful move — AOSP's
+    /// `handleNatDetection` returns normally and migrates the SAs. Refusing it would have
+    /// the path monitor re-announce until `NO_ROUTE_GRACE` and then kill a tunnel the
+    /// gateway had already moved.
     #[test]
-    fn address_update_commits_a_nat_d_less_response_on_a_fresh_id() {
+    fn address_update_commits_a_nat_d_less_response() {
         let (mut init, resp, _) = establish(false);
         let before = init.nat().unwrap();
         let m = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m.header.message_id, 4, "a fresh, never-abandoned id");
         let r = resp.seal_response(EXCH_INFORMATIONAL, m.header.message_id, Vec::new());
         let rm = init.decode(&r).unwrap();
         init.handle_informational_response(&rm).unwrap();
@@ -3669,55 +3447,93 @@ mod tests {
         assert_eq!(init.nat().unwrap(), before, "the previous NatStatus is kept");
     }
 
-    /// A response that normally answers a reused id clears the "abandoned" mark, so a
-    /// LATER address update is judged on its own (fresh) id and a terse response commits.
+    /// Regression (round-6 findings 1/6/12): the flip side of the test above. A bare
+    /// INFORMATIONAL commits the move — so the one case where it must NOT is a message id
+    /// an abandoned request already spent, because RFC 7296 §2.1 obliges the responder to
+    /// replay its cached response for that earlier request WITHOUT processing this one.
+    ///
+    /// The live shape: a DPD exhausts its schedule while the path is being repaired, the
+    /// tunnel survives it (that silence is not evidence about the gateway), and the
+    /// announce that follows reuses the unanswered id. Committing the replay would move
+    /// the SA the gateway never moved; RFC 4555 §3.8 forbids it to re-learn our address
+    /// from ESP, so ESP would be black-holed while every IKE liveness signal stayed green.
     #[test]
-    fn an_answered_request_clears_the_abandoned_message_id() {
+    fn a_replayed_response_on_an_abandoned_id_cannot_commit_an_address_update() {
         let (mut init, resp, _) = establish(false);
         let dpd = init.build_dpd().unwrap();
         let msgid = dpd.header.message_id;
+        // The retransmit schedule ran out: the id was on the wire and was never answered.
         init.abort_request();
-        // The next DPD reuses the abandoned id and IS answered: the id is spent.
-        let dpd2 = init.build_dpd().unwrap();
-        assert_eq!(dpd2.header.message_id, msgid);
-        let r = resp.seal_response(EXCH_INFORMATIONAL, msgid, Vec::new());
-        let rm = init.decode(&r).unwrap();
-        init.handle_informational_response(&rm).unwrap();
-        // A terse response to the address update on the next id is now a real move.
         let m = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m.header.message_id, msgid + 1);
-        let r = resp.seal_response(EXCH_INFORMATIONAL, m.header.message_id, Vec::new());
-        let rm = init.decode(&r).unwrap();
-        init.handle_informational_response(&rm).unwrap();
-        assert_eq!(init.local_addr(), new_local());
-    }
+        assert_eq!(m.header.message_id, msgid, "the window is one wide; the id is reused");
 
-    /// Regression: on the non-MOBIKE RFC 7296 §2.23 fallback the request is an EMPTY
-    /// INFORMATIONAL, so a replayed cached response is byte-identical to a successful
-    /// one. A reused message id is therefore never read as an acknowledgement — otherwise
-    /// the tunnel would report a move the gateway never made and stop retrying.
-    #[test]
-    fn address_update_without_mobike_rejects_a_reused_message_id() {
-        let (mut init, resp, _) = establish_with(false, false);
-        let before = init.local_addr();
-        let dpd = init.build_dpd().unwrap();
-        let msgid = dpd.header.message_id;
-        init.abort_request();
-        let m = init.build_address_update(new_local(), natt_remote()).unwrap();
-        assert_eq!(m.header.message_id, msgid, "the abandoned id is reused");
-        assert!(m.payloads.is_empty());
+        // The gateway had processed the DPD and now replays its cached empty response.
         let r = resp.seal_response(EXCH_INFORMATIONAL, msgid, Vec::new());
         let rm = init.decode(&r).unwrap();
         let e = init.handle_informational_response(&rm).unwrap_err();
-        assert!(matches!(e, Error::Protocol(ref m) if m.contains("reused message id")), "{e}");
-        assert_eq!(init.local_addr(), before, "nothing is committed");
-        // The retry on the next id is authoritative.
+        assert!(matches!(e, Error::Protocol(ref s) if s.contains("abandoned request")), "{e}");
+        assert_eq!(init.local_addr(), local(), "a replay must not move the SA");
+
+        // One refusal unpoisons the session: the id is spent, the slot is free, and the
+        // retry runs on a fresh id where a bare response is believable again.
+        assert_eq!(init.next_message_id(), msgid + 1);
+        assert!(!init.has_pending_request());
         let m2 = init.build_address_update(new_local(), natt_remote()).unwrap();
         assert_eq!(m2.header.message_id, msgid + 1);
         let r2 = resp.seal_response(EXCH_INFORMATIONAL, msgid + 1, Vec::new());
         let rm2 = init.decode(&r2).unwrap();
         init.handle_informational_response(&rm2).unwrap();
-        assert_eq!(init.local_addr(), new_local());
+        assert_eq!(init.local_addr(), new_local(), "committed on the clean id");
+    }
+
+    /// Regression (round-6 finding 2): the same door, one exchange over. Two consecutive
+    /// CREATE_CHILD_SA requests on one abandoned id are indistinguishable to
+    /// `accept_response` — same exchange type, same id — so without the guard the second
+    /// would derive child keys against the cached response's nonce and then DELETE the SA
+    /// that still works. An IKE rekey landing on an abandoned child rekey's id is the
+    /// same shape.
+    #[test]
+    fn a_replayed_response_on_an_abandoned_id_cannot_complete_a_rekey() {
+        for ike_rekey in [false, true] {
+            let (mut init, resp, _) = establish(false);
+            let first = init.build_rekey_child().unwrap();
+            let msgid = first.header.message_id;
+            init.abort_request();
+            let second =
+                if ike_rekey { init.build_rekey_ike().unwrap() } else { init.build_rekey_child().unwrap() };
+            assert_eq!(second.header.message_id, msgid, "the id is reused (ike_rekey={ike_rekey})");
+            assert_eq!(second.header.exchange_type, EXCH_CREATE_CHILD_SA);
+
+            let r = resp.seal_response(EXCH_CREATE_CHILD_SA, msgid, Vec::new());
+            let rm = init.decode(&r).unwrap();
+            let e = if ike_rekey {
+                init.handle_rekey_ike_response(&rm).unwrap_err()
+            } else {
+                init.handle_rekey_child_response(&rm).unwrap_err()
+            };
+            assert!(matches!(e, Error::Protocol(ref s) if s.contains("abandoned request")), "{e}");
+            assert_eq!(init.next_message_id(), msgid + 1, "the id is spent by the refusal");
+            assert!(!init.has_pending_request(), "and the slot is released, so the retry can be built");
+        }
+    }
+
+    /// The guard is only on the exchanges that COMMIT state on a bare acknowledgement. A
+    /// DPD or a DELETE must still accept a response on a reused id: a replay is the
+    /// gateway answering this very datagram, which is all they ask — and refusing them
+    /// would leave the poisoned id unspent.
+    #[test]
+    fn an_abandoned_id_does_not_block_a_dpd_or_a_delete() {
+        let (mut init, resp, _) = establish(false);
+        let _ = init.build_address_update(new_local(), natt_remote()).unwrap();
+        let msgid = init.next_message_id();
+        init.abort_request();
+        let dpd = init.build_dpd().unwrap();
+        assert_eq!(dpd.header.message_id, msgid);
+        let r = resp.seal_response(EXCH_INFORMATIONAL, msgid, Vec::new());
+        let rm = init.decode(&r).unwrap();
+        init.handle_informational_response(&rm).unwrap();
+        assert_eq!(init.local_addr(), local(), "the abandoned update is still not committed");
+        assert_eq!(init.next_message_id(), msgid + 1);
     }
 
     #[test]
@@ -3904,105 +3720,6 @@ mod tests {
         init.handle_informational_response(&rm).unwrap();
         assert!(init.old_child().is_none());
         assert_eq!(init.child().unwrap().spi_in, new.spi_in);
-    }
-
-    /// Regression (round-5 finding): a RETRIED child rekey reuses the abandoned message
-    /// id, and RFC 7296 §2.1 lets the gateway replay its CACHED response for that id
-    /// instead of processing the new request. That cached response carries the FIRST
-    /// attempt's nonce and SPI, so deriving keys from it installs a child SA whose keys
-    /// the gateway does not hold — while `rekey_child` swaps `outbound` to it and deletes
-    /// the child SA that still worked. The result is a silent, bidirectional ESP black
-    /// hole behind a perfectly healthy IKE SA, which no liveness check can see.
-    ///
-    /// The retry itself became reachable when a rekey timeout on a suspended path stopped
-    /// being fatal, so the reused-id refusal that the address update has must apply here
-    /// too (DESIGN §17.2).
-    #[test]
-    fn a_child_rekey_on_a_reused_message_id_refuses_the_gateways_cached_response() {
-        let (mut init, resp, est) = establish(false);
-        // Attempt 1: the gateway PROCESSES it and caches its response, but the response
-        // is lost (the handover sent it to the address we just left).
-        let m1 = init.build_rekey_child().unwrap();
-        assert_eq!(m1.header.message_id, 4);
-        let ni_1 = m1.nonce().unwrap().to_vec();
-        let prop_1 = m1.sa().unwrap().proposals[0].clone();
-        let cached = resp.seal_response(
-            EXCH_CREATE_CHILD_SA,
-            4,
-            vec![
-                Payload::Sa(SaPayload { proposals: vec![Proposal { spi: 0x7777_8888u32.to_be_bytes().to_vec(), ..prop_1 }] }),
-                Payload::Nonce(random_bytes(32)),
-                Payload::TsI(est.child.ts_i.clone()),
-                Payload::TsR(est.child.ts_r.clone()),
-            ],
-        );
-
-        // Retransmissions run out; the path is being repaired, so the tunnel retries.
-        init.abort_request();
-        assert!(init.next_msgid_is_abandoned());
-        let m2 = init.build_rekey_child().unwrap();
-        assert_eq!(m2.header.message_id, 4, "RFC 7296 §2.1: the unanswered id is reused");
-        assert_ne!(m2.nonce().unwrap().to_vec(), ni_1, "with a fresh nonce");
-
-        // The gateway replays the cached response for id 4.
-        let rm = init.decode(&cached).unwrap();
-        let e = init.handle_rekey_child_response(&rm).unwrap_err();
-        match &e {
-            Error::Protocol(m) => assert!(m.contains("reused message id 4"), "{m}"),
-            other => panic!("expected a transient protocol error, got {other:?}"),
-        }
-        // Nothing was committed: the working child SA is untouched and no second SA exists.
-        assert_eq!(init.child().unwrap().spi_in, est.child.spi_in);
-        assert_eq!(init.child().unwrap().spi_out, est.child.spi_out);
-        assert!(init.old_child().is_none());
-        // And the retry runs on a provably fresh id.
-        assert_eq!(init.next_message_id(), 5);
-        assert!(!init.next_msgid_is_abandoned());
-        assert!(init.build_rekey_child().is_ok());
-    }
-
-    /// The IKE-rekey twin of the test above: a replayed response would have us derive the
-    /// new SA's keys from exchange #2's private DH key against exchange #1's public
-    /// value, then swap to those keys and DELETE the SA that still works.
-    #[test]
-    fn an_ike_rekey_on_a_reused_message_id_refuses_the_gateways_cached_response() {
-        let (mut init, resp, _) = establish(false);
-        let spi_i_before = init.spi_i();
-        let spi_r_before = init.spi_r();
-        let sk_ei_before = init.keys().sk_ei.clone();
-        let m1 = init.build_rekey_ike().unwrap();
-        assert_eq!(m1.header.message_id, 4);
-        let prop_1 = m1.sa().unwrap().proposals[0].clone();
-        let pair = registry::dh(14).unwrap().generate().unwrap();
-        let cached = resp.seal_response(
-            EXCH_CREATE_CHILD_SA,
-            4,
-            vec![
-                Payload::Sa(SaPayload {
-                    proposals: vec![Proposal { spi: 0x0bad_cafe_0011_2233u64.to_be_bytes().to_vec(), ..prop_1 }],
-                }),
-                Payload::Ke(KePayload { group: DH_MODP_2048, public: pair.public_value() }),
-                Payload::Nonce(random_bytes(32)),
-            ],
-        );
-        init.abort_request();
-        assert!(init.next_msgid_is_abandoned());
-        let m2 = init.build_rekey_ike().unwrap();
-        assert_eq!(m2.header.message_id, 4);
-
-        let rm = init.decode(&cached).unwrap();
-        let e = init.handle_rekey_ike_response(&rm).unwrap_err();
-        match &e {
-            Error::Protocol(m) => assert!(m.contains("reused message id 4"), "{m}"),
-            other => panic!("expected a transient protocol error, got {other:?}"),
-        }
-        // The IKE SA is untouched: same SPIs, same keys, no old SA waiting for a DELETE.
-        assert_eq!(init.spi_i(), spi_i_before);
-        assert_eq!(init.spi_r(), spi_r_before);
-        assert_eq!(init.keys().sk_ei, sk_ei_before);
-        assert!(init.established());
-        assert_eq!(init.next_message_id(), 5);
-        assert!(!init.next_msgid_is_abandoned());
     }
 
     #[test]
