@@ -28,13 +28,19 @@ fn live_in_process() {
     }
 
     // --- config -----------------------------------------------------------------
-    let cfg = Config::from_plist_files(
-        &fixture("tmobile_prod_bundle.plist"),
-        &fixture("tmobile_creds.plist"),
-        &fixture("client.crt"),
-        &fixture("client.key"),
-    )
-    .expect("load config from fixtures");
+    // EPDG_ACTIVATION_CONFIG=<plist>: the app-side activation config (bundle + credentials +
+    // DER client certificate/key in one file) instead of the fixture plists. The env var is
+    // inherited by the epdg-connect child, which honours it the same way.
+    let cfg = match std::env::var_os("EPDG_ACTIVATION_CONFIG") {
+        Some(p) => Config::from_activation_file(std::path::Path::new(&p)).expect("load activation config"),
+        None => Config::from_plist_files(
+            &fixture("tmobile_prod_bundle.plist"),
+            &fixture("tmobile_creds.plist"),
+            &fixture("client.crt"),
+            &fixture("client.key"),
+        )
+        .expect("load config from fixtures"),
+    };
     println!("gateway: {} (fallback {:?})", cfg.gateway.hostname, cfg.gateway.fallback_addr);
 
     // --- connect ------------------------------------------------------------------

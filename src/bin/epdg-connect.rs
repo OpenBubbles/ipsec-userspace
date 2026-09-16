@@ -4,7 +4,9 @@
 //! etc.) can be granted once: `cargo test` binaries get a new hash-suffixed path on
 //! every build, `target/debug/epdg-connect` does not.
 //!
-//! Usage: epdg-connect [--bundle P] [--creds P] [--cert PEM] [--key PEM] [--hold SECS] [--no-dns]
+//! Usage: epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] [--hold SECS] [--no-dns]
+//! `--activation` (or env EPDG_ACTIVATION_CONFIG) loads the app-side activation config, which
+//! carries the bundle, the credentials and the DER client certificate/key in one plist.
 //! Defaults point at tests/fixtures/. Set RUST_LOG=debug for hex dumps.
 
 use std::net::IpAddr;
@@ -31,6 +33,7 @@ fn main() {
     let mut creds = fixture("tmobile_creds.plist");
     let mut cert = fixture("client.crt");
     let mut key = fixture("client.key");
+    let mut activation = std::env::var_os("EPDG_ACTIVATION_CONFIG").map(PathBuf::from);
     let mut hold = Duration::from_secs(25);
     let mut do_dns = true;
     let mut args = std::env::args().skip(1);
@@ -41,17 +44,22 @@ fn main() {
             "--creds" => creds = PathBuf::from(val()),
             "--cert" => cert = PathBuf::from(val()),
             "--key" => key = PathBuf::from(val()),
+            "--activation" => activation = Some(PathBuf::from(val())),
             "--hold" => hold = Duration::from_secs(val().parse().expect("--hold seconds")),
             "--no-dns" => do_dns = false,
             "-h" | "--help" => {
-                println!("epdg-connect [--bundle P] [--creds P] [--cert PEM] [--key PEM] [--hold SECS] [--no-dns]");
+                println!("epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] [--hold SECS] [--no-dns]");
                 return;
             }
             other => panic!("unknown argument {other}"),
         }
     }
 
-    let cfg = match Config::from_plist_files(&bundle, &creds, &cert, &key) {
+    let loaded = match &activation {
+        Some(p) => Config::from_activation_file(p),
+        None => Config::from_plist_files(&bundle, &creds, &cert, &key),
+    };
+    let cfg = match loaded {
         Ok(c) => c,
         Err(e) => {
             eprintln!("config error: {e}");

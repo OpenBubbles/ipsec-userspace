@@ -648,6 +648,41 @@ impl Config {
         Config::from_plist_bundle(&bundle_v, &creds_v, &cert_der, &key_der)
     }
 
+    /// Build from an "activation config" plist: the app-side configuration serialized as one
+    /// file — `cred` (the `imsIndividualCredentials` dictionary), `bundle` (the carrier bundle
+    /// root with `imsCommonCredentials` / `CBRoot`) and `tunnel` (`certificate_der` and
+    /// `key_der` as `<data>`, already DER, plus `subscriber_id`). Everything
+    /// [`Config::from_plist_bundle`] needs, with no PEM anywhere.
+    pub fn from_activation_plist(root: &Value) -> Result<Config> {
+        let dict = root.as_dictionary().ok_or_else(|| cfg_err("activation config: root is not a dictionary"))?;
+        let bundle = dict.get("bundle").ok_or_else(|| cfg_err("activation config: missing `bundle`"))?;
+        let cred = dict.get("cred").ok_or_else(|| cfg_err("activation config: missing `cred`"))?.clone();
+        let tunnel = dict
+            .get("tunnel")
+            .and_then(Value::as_dictionary)
+            .ok_or_else(|| cfg_err("activation config: missing `tunnel` (no ePDG credentials)"))?;
+        let der = |key: &str| -> Result<Vec<u8>> {
+            match tunnel.get(key) {
+                Some(Value::Data(d)) if !d.is_empty() => Ok(d.clone()),
+                Some(_) => Err(cfg_err(format!("activation config: tunnel.{key} must be non-empty <data> (DER)"))),
+                None => Err(cfg_err(format!("activation config: missing tunnel.{key}"))),
+            }
+        };
+        let cert_der = der("certificate_der")?;
+        let key_der = der("key_der")?;
+        let mut creds = plist::Dictionary::new();
+        creds.insert("imsIndividualCredentials".into(), cred);
+        if let Some(id) = tunnel.get("subscriber_id") {
+            creds.insert("subscriberId".into(), id.clone());
+        }
+        Config::from_plist_bundle(bundle, &Value::Dictionary(creds), &cert_der, &key_der)
+    }
+
+    /// [`Config::from_activation_plist`] from a file.
+    pub fn from_activation_file(path: &Path) -> Result<Config> {
+        Config::from_activation_plist(&read_plist(path)?)
+    }
+
     /// Resolve the gateway: DNS `hostname` (all A/AAAA, IPv4 first), then `fallback_addr`
     /// appended if not already present. If DNS fails and a fallback exists, the fallback
     /// alone is returned; only a failed lookup with no fallback is an error.
@@ -805,6 +840,41 @@ mod tests {
         let dbg = format!("{:?}", c.eap_tls);
         assert!(dbg.contains("client_key_der: \"<redacted>\""), "{dbg}");
         assert!(!dbg.contains(&format!("{:?}", c.eap_tls.client_key_der)));
+    }
+
+    /// The app-side activation config carries the same information as the two plists plus
+    /// DER credentials; it must produce the same Config.
+    #[test]
+    fn activation_plist_matches_the_two_plist_form() {
+        let creds = parse(CREDS);
+        let creds_dict = creds.as_dictionary().unwrap();
+        let mut tunnel = plist::Dictionary::new();
+        tunnel.insert("certificate_der".into(), Value::Data(cert_der()));
+        tunnel.insert("key_der".into(), Value::Data(key_der()));
+        tunnel.insert("subscriber_id".into(), creds_dict.get("subscriberId").unwrap().clone());
+        let mut root = plist::Dictionary::new();
+        root.insert("cred".into(), creds_dict.get("imsIndividualCredentials").unwrap().clone());
+        root.insert("bundle".into(), parse(BUNDLE));
+        root.insert("instance".into(), Value::String("\"<urn:uuid:x>\"".into()));
+        root.insert("tunnel".into(), Value::Dictionary(tunnel.clone()));
+        let c = Config::from_activation_plist(&Value::Dictionary(root.clone())).expect("activation config");
+        let reference = fixture_config();
+        assert_eq!(c.identity.local_id, reference.identity.local_id);
+        assert_eq!(c.identity.eap_identity, reference.identity.eap_identity);
+        assert_eq!(c.eap_tls.client_cert_der, reference.eap_tls.client_cert_der);
+        assert_eq!(c.eap_tls.client_key_der, reference.eap_tls.client_key_der);
+        assert_eq!(c.gateway.hostname, reference.gateway.hostname);
+        assert_eq!(c.ims.pcscf_address, reference.ims.pcscf_address);
+        assert_eq!(c.child.cfg_requests, reference.child.cfg_requests);
+
+        // No tunnel block => no ePDG credentials => config error; PEM in a DER slot => error.
+        let mut no_tunnel = root.clone();
+        no_tunnel.remove("tunnel");
+        assert!(matches!(Config::from_activation_plist(&Value::Dictionary(no_tunnel)), Err(Error::Config(_))));
+        let mut pem = root.clone();
+        tunnel.insert("certificate_der".into(), Value::String(CERT_PEM.into()));
+        pem.insert("tunnel".into(), Value::Dictionary(tunnel));
+        assert!(matches!(Config::from_activation_plist(&Value::Dictionary(pem)), Err(Error::Config(_))));
     }
 
     #[test]
