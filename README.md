@@ -91,6 +91,7 @@ CLI (stable path — handy for per-application firewall rules):
 ```bash
 cargo build --bin epdg-connect
 RUST_LOG=info ./target/debug/epdg-connect            # connect, resolve the P-CSCF over the tunnel, DPD, hold, DELETE
+./target/debug/epdg-connect --hold 30 --rebind-after 8    # force one address update 8 s into the hold and prove it landed
 ./target/debug/epdg-connect probe-tls <ClientHello hex>   # diagnostic: see which TLS suite the EAP server picks
 ```
 
@@ -114,6 +115,16 @@ libc resolver against `localhost` only.
 resolves `ueb2bprod.pc.t-mobile.com` through `&dyn NetStack` (smoltcp DNS over ESP — proves ESP in both directions and covers the tunnel's `NetStack` implementation),
 runs a DPD, observes NAT-T keepalives, and tears down cleanly. It needs UDP egress on 500/4500; a per-application
 firewall (e.g. Little Snitch) must allow the test binary or `target/debug/epdg-connect`.
+
+`--rebind-after SECS` (off by default) exercises the mobility path without touching the network: that far into the
+hold it calls `EpdgTunnel::force_address_update()`, which makes the path monitor rebind the outer socket to a fresh
+source port on the same address and announce it exactly as a handover would (MOBIKE `UPDATE_SA_ADDRESSES` + NAT-D;
+the gateway sees a NAT rebinding — DESIGN.md §17.9). It then checks that the gateway followed the move — DPD over the
+new 5-tuple and ESP arriving after it — printing `ADDRESS-UPDATE`, `POST-MOVE DPD` and `POST-MOVE ESP rx` lines, or an
+`ADDRESS-UPDATE-FAILED <reason>` line, and exiting non-zero if any of that fails. `live_tmobile_address_update` is the
+live test that drives it. Because it goes through the production mobility path it also carries its risk: a gateway that
+ignores or rejects the update ends the tunnel within the 30 s no-route grace, exactly as a real handover would, so it
+is a diagnostic knob rather than something to run under a registration you need.
 
 ## Layout
 

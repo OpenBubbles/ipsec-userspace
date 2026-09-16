@@ -347,6 +347,9 @@ struct PathInner {
     requested: bool,
     /// A `network_changed()` request, which bypasses `PATH_PROBE_MIN_SPACING`.
     forced: bool,
+    /// A forced-move request ([`EpdgTunnel::force_address_update`]): the next tick treats
+    /// the CURRENT egress address as a move (DESIGN §17.9).
+    forced_move: bool,
     last_probe: Option<Instant>,
     /// The FIRST IKE/ESP transmission since the last thing we received (cleared by
     /// `note_rx_data`; NAT-T keepalives are excluded on both sides, being sent
@@ -404,6 +407,24 @@ impl PathState {
             p.forced |= force;
         }
         self.cv.notify_all();
+    }
+
+    /// Ask the path thread to treat the CURRENT egress address as a move on its next
+    /// tick — the diagnostic knob behind [`EpdgTunnel::force_address_update`] (DESIGN
+    /// §17.9). It also forces an immediate probe, so the move happens within
+    /// milliseconds instead of at the next cadence slot.
+    fn request_forced_move(&self) {
+        lock(&self.inner).forced_move = true;
+        self.request_probe(true);
+    }
+
+    /// Take the forced-move request, if any (the path thread's side). Ownership then
+    /// passes to [`PathMonitor`], which keeps it pending until a rebind actually
+    /// happens, so a tick that could not act on it (no route, an announce still
+    /// outstanding) does not swallow the request — and drops it after
+    /// [`NO_ROUTE_GRACE`] if no tick ever could.
+    fn take_forced_move(&self) -> bool {
+        std::mem::take(&mut lock(&self.inner).forced_move)
     }
 
     /// Record an operation that failed on the outer socket (a receive, a route probe, a
@@ -766,6 +787,9 @@ struct PathInput {
     bound: IpAddr,
     sends_failing_since: Option<Instant>,
     last_rx_data: Option<Instant>,
+    /// A forced move was requested since the last tick (DESIGN §17.9). It is latched by
+    /// the monitor, not consumed here.
+    forced_move: bool,
     now: Instant,
 }
 
@@ -795,6 +819,12 @@ struct PathMonitor {
     last_move: Option<Instant>,
     /// We already rebound once to break a wedged socket; a second wedge is fatal.
     wedge_rebound: bool,
+    /// A forced move ([`EpdgTunnel::force_address_update`]) is outstanding since this
+    /// instant: the next tick that can act rebinds on the current egress address,
+    /// whatever the flap damping says. Cleared by `rebound`, i.e. once a socket really
+    /// moved — or dropped after [`NO_ROUTE_GRACE`] if no tick could act on it at all
+    /// (DESIGN §17.9).
+    forced_move: Option<Instant>,
 }
 
 impl PathMonitor {
@@ -812,6 +842,23 @@ impl PathMonitor {
     }
 
     fn tick(&mut self, i: PathInput) -> PathAction {
+        // Latch a forced move (DESIGN §17.9). It is not consumed by the tick that saw
+        // it, so a request made while there is no route survives until the route comes
+        // back; `rebound` clears it once a socket really moved.
+        //
+        // It does expire, though, and for the same NO_ROUTE_GRACE every other impairment
+        // gets. A host whose route probe can never run (EMFILE, a sandbox EPERM on the
+        // throwaway socket) reaches neither the forced branch below nor the grace verdict
+        // above, so an unexpiring flag would sit armed for the life of the tunnel and
+        // fire a real, unrequested UPDATE_SA_ADDRESSES at the first probe that happened
+        // to succeed — long after the caller gave up on it.
+        if i.forced_move {
+            self.forced_move.get_or_insert(i.now);
+        }
+        if self.forced_move.is_some_and(|t| i.now.saturating_duration_since(t) >= NO_ROUTE_GRACE) {
+            debug!("path: dropping a forced address update no tick could act on for {NO_ROUTE_GRACE:?}");
+            self.forced_move = None;
+        }
         // An already-running grace clock is evaluated FIRST, whatever the probe said.
         // A probe that cannot run (EMFILE, a sandbox EPERM on the throwaway socket) is
         // usually persistent, and returning early here used to freeze the clock forever:
@@ -848,6 +895,19 @@ impl PathMonitor {
         // route moved again in the meantime, rebind to where it points now.
         if self.needs_announce {
             return if ip == i.bound { PathAction::Announce } else { PathAction::Rebind(ip) };
+        }
+
+        // A forced move (DESIGN §17.9): rebind on whatever address the route points at —
+        // normally the one we are already bound to, so only the ephemeral port moves —
+        // and let the announce below tell the gateway, exactly as a real handover would.
+        //
+        // It deliberately bypasses the flap damping below: it is caller-driven, rare and
+        // its entire point is to happen now, whereas MIN_ADDRESS_UPDATE_INTERVAL exists
+        // to stop a route that flaps on its own from spending one update per blip. Every
+        // rule ABOVE it still applies — the grace verdict, a probe that says there is no
+        // route, and an announce that has not been acknowledged yet all come first.
+        if self.forced_move.is_some() {
+            return PathAction::Rebind(ip);
         }
 
         // Flap damping: one move per MIN_ADDRESS_UPDATE_INTERVAL. A flapping default
@@ -892,8 +952,11 @@ impl PathMonitor {
         PathAction::Idle
     }
 
-    /// The socket was rebound; the gateway has not been told yet.
+    /// The socket was rebound; the gateway has not been told yet. This is also where a
+    /// forced move is satisfied: the request asked for a move, a move happened (whatever
+    /// decided on it), and the announce that follows is the rest of the production path.
     fn rebound(&mut self, now: Instant) {
+        self.forced_move = None;
         self.needs_announce = true;
         self.impair(now, "the gateway has not acknowledged our new address");
     }
@@ -2002,11 +2065,16 @@ fn path_loop(shared: Arc<Shared>) {
         };
         let times = shared.path.snapshot();
         let now = Instant::now();
+        let forced_move = shared.path.take_forced_move();
+        if forced_move {
+            info!("path: forced address update requested; moving to a fresh source port on {}", bound.ip());
+        }
         let action = m.tick(PathInput {
             probe,
             bound: bound.ip(),
             sends_failing_since: times.sends_failing_since,
             last_rx_data: times.last_rx_data,
+            forced_move,
             now,
         });
 
@@ -2692,6 +2760,47 @@ impl EpdgTunnel {
         }
     }
 
+    /// Diagnostic/test knob: exercise the address-update path without a network change
+    /// (DESIGN §17.9).
+    ///
+    /// The path thread treats the CURRENT egress address as a move on its next tick: it
+    /// rebinds the outer socket to the same IP on a fresh ephemeral port and runs the
+    /// ordinary announce through the production code path — `N(UPDATE_SA_ADDRESSES)` plus
+    /// NAT-D over the new source port when the peer announced MOBIKE (RFC 4555 §3.5), the
+    /// RFC 7296 §2.23 empty INFORMATIONAL otherwise, then the immediate NAT-T keepalive,
+    /// then `TunnelStats::address_updates` += 1. Both ESP SAs are untouched: same SPIs,
+    /// same keys, same replay state. RFC 4555 §3.5 lets the initiator move whenever it
+    /// likes, and from the gateway's point of view a new source port on the same address
+    /// is an ordinary NAT rebinding, which it must survive anyway.
+    ///
+    /// Every other rule of §17 still holds: `close()` cancels the pending request, an IKE
+    /// exchange that is already outstanding settles before the announce goes out (it takes
+    /// `request_lock` like every other post-establishment request), and no route at all
+    /// defers the move inside [`NO_ROUTE_GRACE`] instead of forcing a doomed rebind. The
+    /// one rule it deliberately bypasses is [`MIN_ADDRESS_UPDATE_INTERVAL`]: that damping
+    /// exists for a route that flaps on its own, and a caller-driven one-shot must not be
+    /// silently dropped because the tunnel happened to move a moment ago. A request no
+    /// tick could act on for [`NO_ROUTE_GRACE`] (a host where the route probe itself
+    /// never runs) is dropped rather than fired much later.
+    ///
+    /// Going through the production path also means inheriting its failure handling: the
+    /// move puts the tunnel into the "gateway has not acknowledged our new address" state,
+    /// so a gateway that ignores the update dies inside [`NO_ROUTE_GRACE`] and one that
+    /// rejects it dies at once — exactly as a real handover would. Do not call this on a
+    /// registration you are not prepared to lose.
+    ///
+    /// Returns as soon as the request is recorded — poll `stats().address_updates` (and
+    /// [`EpdgTunnel::local_addr`], whose port changes) for the outcome. `Err` when the
+    /// tunnel is already dead or closing.
+    pub fn force_address_update(&self) -> Result<()> {
+        if !self.shared.is_alive() {
+            return Err(self.shared.closed_error());
+        }
+        info!("forced address update requested (diagnostic)");
+        self.shared.path.request_forced_move();
+        Ok(())
+    }
+
     /// Create an inner UDP socket. `local_port == 0` picks a free port in
     /// `49152..=65535`. smoltcp picks the source address by destination family.
     pub fn bind_udp(&self, local_port: u16) -> Result<InnerUdpSocket> {
@@ -2960,7 +3069,7 @@ mod tests {
 
     /// A tick with no send failures and traffic flowing.
     fn input(probe: ProbeOutcome, bound: IpAddr, now: Instant) -> PathInput {
-        PathInput { probe, bound, sends_failing_since: None, last_rx_data: Some(now), now }
+        PathInput { probe, bound, sends_failing_since: None, last_rx_data: Some(now), forced_move: false, now }
     }
 
     #[test]
@@ -3107,6 +3216,7 @@ mod tests {
             bound: IP_A,
             sends_failing_since: Some(t0),
             last_rx_data: Some(t0),
+            forced_move: false,
             now,
         };
         assert_eq!(m.tick(wedged(t0 + Duration::from_secs(1))), PathAction::Idle);
@@ -3138,6 +3248,7 @@ mod tests {
             bound: IP_A,
             sends_failing_since,
             last_rx_data: Some(t0),
+            forced_move: false,
             now,
         };
         // A probe that cannot run still starts no clock of its own.
@@ -3201,6 +3312,123 @@ mod tests {
         let mut fresh = PathMonitor::default();
         assert_eq!(fresh.tick(input(ProbeOutcome::NoRoute, IP_A, t0)), PathAction::Idle);
         assert_eq!(fresh.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0)), PathAction::Rebind(IP_A));
+    }
+
+    /// A tick carrying a forced-move request (`EpdgTunnel::force_address_update`).
+    fn forced(probe: ProbeOutcome, bound: IpAddr, now: Instant) -> PathInput {
+        PathInput { forced_move: true, ..input(probe, bound, now) }
+    }
+
+    /// The diagnostic knob (DESIGN §17.9) moves the socket even though the route did not:
+    /// the egress address is the one we are bound to, so only the ephemeral port changes,
+    /// and the announce that follows is the production one.
+    #[test]
+    fn a_forced_move_rebinds_on_the_current_address() {
+        let t0 = Instant::now();
+        let mut m = PathMonitor::default();
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0)), PathAction::Idle);
+        assert_eq!(m.tick(forced(ProbeOutcome::Egress(IP_A), IP_A, t0)), PathAction::Rebind(IP_A));
+        m.rebound(t0);
+        // Same as any other move from here on: announce, then quiet.
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + Duration::from_secs(2))), PathAction::Announce);
+        m.announced(t0 + Duration::from_secs(2));
+        assert_eq!(
+            m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + Duration::from_secs(4))),
+            PathAction::Idle,
+            "one request must produce exactly one move"
+        );
+    }
+
+    /// It bypasses `MIN_ADDRESS_UPDATE_INTERVAL` on purpose: the damping exists for a
+    /// route that flaps on its own, and a caller-driven one-shot must not be dropped
+    /// because the tunnel happened to move a moment ago.
+    #[test]
+    fn a_forced_move_bypasses_the_flap_damping() {
+        let t0 = Instant::now();
+        let mut m = PathMonitor::default();
+        m.announced(t0);
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(t1 - t0 < MIN_ADDRESS_UPDATE_INTERVAL);
+        // A genuine move to another address inside the window is still damped...
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_B), IP_A, t1)), PathAction::Idle);
+        // ...while the forced move goes through.
+        assert_eq!(m.tick(forced(ProbeOutcome::Egress(IP_A), IP_A, t1)), PathAction::Rebind(IP_A));
+    }
+
+    /// The request is latched by the monitor, not consumed by the tick that saw it: a
+    /// tick that cannot act (no route, or a probe that would not run) must not swallow it.
+    #[test]
+    fn a_forced_move_survives_a_tick_that_cannot_act() {
+        let t0 = Instant::now();
+        let mut m = PathMonitor::default();
+        assert_eq!(m.tick(forced(ProbeOutcome::NoRoute, IP_A, t0)), PathAction::Idle);
+        assert_eq!(m.tick(input(ProbeOutcome::Unknown, IP_A, t0 + Duration::from_secs(2))), PathAction::Idle);
+        // A move just before the route came back, so the flap damping would hold the
+        // recovery rebind back: only the latched request can produce a move here, which
+        // is what makes this assertion about the request rather than about the
+        // impairment branch.
+        m.last_move = Some(t0 + Duration::from_secs(3));
+        // The route is back on the address we are bound to: the move happens now.
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + Duration::from_secs(4))), PathAction::Rebind(IP_A));
+        m.rebound(t0 + Duration::from_secs(4));
+        m.announced(t0 + Duration::from_secs(4));
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + Duration::from_secs(6))), PathAction::Idle);
+
+        // Same latching over a healthy but unprobeable path, where nothing else would
+        // ever rebind.
+        let mut m = PathMonitor::default();
+        assert_eq!(m.tick(forced(ProbeOutcome::Unknown, IP_A, t0)), PathAction::Idle);
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + Duration::from_secs(2))), PathAction::Rebind(IP_A));
+    }
+
+    /// ...but it does not wait forever. A probe that never runs (a sandbox EPERM on the
+    /// throwaway socket) neither impairs the tunnel nor lets the forced branch act, so
+    /// without an expiry the request would fire an unsolicited `UPDATE_SA_ADDRESSES` at
+    /// the first probe that happened to succeed, hours after the caller gave up.
+    #[test]
+    fn a_forced_move_no_tick_could_act_on_expires() {
+        let t0 = Instant::now();
+        let mut m = PathMonitor::default();
+        assert_eq!(m.tick(forced(ProbeOutcome::Unknown, IP_A, t0)), PathAction::Idle);
+        assert_eq!(m.tick(input(ProbeOutcome::Unknown, IP_A, t0 + NO_ROUTE_GRACE)), PathAction::Idle);
+        assert_eq!(
+            m.tick(input(ProbeOutcome::Egress(IP_A), IP_A, t0 + NO_ROUTE_GRACE + Duration::from_secs(1))),
+            PathAction::Idle,
+            "a request nothing could act on for the grace period must not move the socket later"
+        );
+        // A fresh request after the expiry is honoured normally.
+        assert_eq!(
+            m.tick(forced(ProbeOutcome::Egress(IP_A), IP_A, t0 + NO_ROUTE_GRACE + Duration::from_secs(2))),
+            PathAction::Rebind(IP_A)
+        );
+    }
+
+    /// An announce that is still outstanding finishes first: the forced move waits for it
+    /// rather than binding a second socket under the request the gateway has not answered.
+    #[test]
+    fn a_forced_move_waits_for_an_outstanding_announce() {
+        let t0 = Instant::now();
+        let mut m = PathMonitor::default();
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_B), IP_A, t0)), PathAction::Rebind(IP_B));
+        m.rebound(t0);
+        // The forced request arrives while the first move is unacknowledged.
+        assert_eq!(m.tick(forced(ProbeOutcome::Egress(IP_B), IP_B, t0 + Duration::from_secs(2))), PathAction::Announce);
+        m.announced(t0 + Duration::from_secs(2));
+        // Only now does it move again — and it is not damped by the move just made.
+        assert_eq!(m.tick(input(ProbeOutcome::Egress(IP_B), IP_B, t0 + Duration::from_secs(3))), PathAction::Rebind(IP_B));
+    }
+
+    /// The grace verdict outranks it: a forced move cannot resurrect a tunnel that has
+    /// already run out of grace.
+    #[test]
+    fn a_forced_move_does_not_outrank_the_grace_period() {
+        let t0 = Instant::now();
+        let mut m = PathMonitor::default();
+        assert_eq!(m.tick(input(ProbeOutcome::NoRoute, IP_A, t0)), PathAction::Idle);
+        match m.tick(forced(ProbeOutcome::Egress(IP_A), IP_A, t0 + NO_ROUTE_GRACE)) {
+            PathAction::Dead(reason) => assert!(reason.contains("no route to the gateway"), "{reason}"),
+            other => panic!("expected death, got {other:?}"),
+        }
     }
 
     /// Regression (finding: two gates doing one job): a candidate that merely differs

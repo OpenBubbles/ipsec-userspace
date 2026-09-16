@@ -2,12 +2,22 @@
 //!
 //! Needs network access and the real credentials in `tests/fixtures/`. Skipped
 //! (with a printed reason) when `EPDG_SKIP_LIVE` is set. Run with
-//! `RUST_LOG=debug cargo test --test live_tmobile -- --nocapture` for hex dumps.
+//! `RUST_LOG=debug cargo test --test live_tmobile -- --nocapture` for hex dumps; the tests
+//! in this file serialize themselves on `LIVE`, so running them all at once is safe.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use epdg::{Config, EpdgTunnel, Error};
+
+/// The live tests share one subscriber identity (one IMSI + APN, one EAP-AKA sequence
+/// number), so two tunnels must never be established at once: an ePDG tears the older
+/// session down on a duplicate PDN, and concurrent EAP-AKA runs desynchronise the SQN.
+/// libtest runs the tests of one integration binary in parallel by default, so every live
+/// test takes this lock for its whole run. Poisoning is irrelevant here — a panicking test
+/// has already finished with the network.
+static LIVE: Mutex<()> = Mutex::new(());
 
 const TARGET_HOST: &str = "ueb2bprod.pc.t-mobile.com";
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -153,6 +163,7 @@ fn live_in_process() {
 /// Set `EPDG_LIVE_INPROCESS=1` to run the tunnel inside the test process instead.
 #[test]
 fn live_tmobile_tunnel() {
+    let _live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
     if std::env::var_os("EPDG_SKIP_LIVE").is_some() {
         println!("SKIPPED: EPDG_SKIP_LIVE is set (live T-Mobile ePDG test not run)");
         return;
@@ -177,4 +188,84 @@ fn live_tmobile_tunnel() {
         stdout.contains("ueb2bprod.pc.t-mobile.com -> [") && !stdout.contains("ueb2bprod.pc.t-mobile.com -> []"),
         "P-CSCF did not resolve over the tunnel"
     );
+}
+
+/// Live MOBIKE address update: drive the same stable-path CLI, force one move part way
+/// through the hold and check that the gateway followed it (DESIGN §17.9).
+///
+/// `--rebind-after 8` makes `epdg-connect` call `EpdgTunnel::force_address_update()` 8 s
+/// into a 30 s hold: the path thread rebinds the outer socket to a fresh ephemeral port on
+/// the SAME egress address and announces it through the production announce path —
+/// `N(UPDATE_SA_ADDRESSES)` + NAT-D over the new port, since this ePDG announces
+/// `MOBIKE_SUPPORTED` — which the gateway sees as an ordinary NAT rebinding (RFC 4555
+/// §3.5). No Wi-Fi change is needed, so this runs anywhere the plain live test runs.
+///
+/// The binary prints one machine-checkable line per fact and exits non-zero if any of them
+/// failed; this test parses them so a failure names which half of the move broke.
+#[test]
+fn live_tmobile_address_update() {
+    let _live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if std::env::var_os("EPDG_SKIP_LIVE").is_some() {
+        println!("SKIPPED: EPDG_SKIP_LIVE is set (live T-Mobile ePDG test not run)");
+        return;
+    }
+    let exe = env!("CARGO_BIN_EXE_epdg-connect");
+    println!("driving {exe} --hold 30 --rebind-after 8");
+    let out = std::process::Command::new(exe)
+        .args(["--hold", "30", "--rebind-after", "8"])
+        .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
+        .output()
+        .expect("spawn epdg-connect");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    assert!(out.status.success(), "epdg-connect exited with {:?}", out.status);
+
+    // ADDRESS-UPDATE old=<ip:port> new=<ip:port> updates=<n> ok
+    let line = marker(&stdout, "ADDRESS-UPDATE ");
+    assert!(line.ends_with(" ok"), "address update did not complete: {line}");
+    let old = field(&line, "old=");
+    let new = field(&line, "new=");
+    let updates: u64 = field(&line, "updates=").parse().expect("updates count");
+    assert!(updates >= 1, "expected at least one address update: {line}");
+    let port = |a: &str| a.rsplit_once(':').expect("ip:port").1.to_string();
+    assert_ne!(port(&old), port(&new), "the outer socket kept its source port: {line}");
+
+    // POST-MOVE DPD rtt=<ms>: the gateway still answers IKE at the new 5-tuple.
+    let dpd = marker(&stdout, "POST-MOVE DPD ");
+    field(&dpd, "rtt=").parse::<u64>().expect("DPD rtt in ms");
+
+    // POST-MOVE ESP rx delta=<n>: ESP received AFTER the update — the gateway sends the
+    // child SA's traffic to the new port, which is the half a NAT rebinding can break.
+    let esp = marker(&stdout, "POST-MOVE ESP rx ");
+    let delta: u64 = field(&esp, "delta=").parse().expect("ESP rx delta");
+    assert!(delta > 0, "no ESP arrived after the address update: {esp}");
+
+    println!();
+    println!("PASS: live T-Mobile ePDG address update");
+    println!("  outer socket    {old} -> {new}");
+    println!("  address updates {updates}");
+    println!("  post-move       {dpd}, {esp}");
+}
+
+/// The single line of `stdout` starting with `prefix`; panics with the whole output when
+/// it is missing, so a failed run says what the binary did print. A second line with the
+/// same prefix is a failure too, not something to resolve silently in favour of the first:
+/// these markers are one fact each, so two of them mean the binary contradicted itself.
+fn marker(stdout: &str, prefix: &str) -> String {
+    let mut hits = stdout.lines().filter(|l| l.starts_with(prefix));
+    let line = hits.next().unwrap_or_else(|| panic!("no {prefix:?} line in epdg-connect output")).to_string();
+    if let Some(second) = hits.next() {
+        panic!("two {prefix:?} lines in epdg-connect output: {line:?} and {second:?}");
+    }
+    line
+}
+
+/// The whitespace-delimited value of `key=` in a marker line.
+fn field(line: &str, key: &str) -> String {
+    line.split_whitespace()
+        .find_map(|t| t.strip_prefix(key))
+        .unwrap_or_else(|| panic!("no {key:?} in {line:?}"))
+        .to_string()
 }

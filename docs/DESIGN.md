@@ -1501,6 +1501,50 @@ embedders, so a new field there is a breaking change.
 - Up to `UDP_QUEUE_DEPTH` (256) datagrams already buffered in a binding's channel are drained before the receiver
   observes the close, so the very next `recv_timeout` after `mark_dead` is not necessarily the one that reports it.
 
+### 17.9 Forcing a move (`EpdgTunnel::force_address_update`)
+
+Everything above only runs when the host's egress address actually changes, which on a developer machine means
+toggling Wi-Fi — not something a test can do, and not something the live run against T-Mobile PROD could ever cover.
+`EpdgTunnel::force_address_update()` is the diagnostic knob that closes that gap: it sets one flag, `PathInner::forced_move`,
+and forces a probe. The next `PathMonitor::tick` latches the flag and, as soon as the probe reports an egress address,
+returns `Rebind(ip)` — normally the address we are already bound to, so only the ephemeral port moves. From there it is
+the production path, byte for byte: `IkeTransport::rebind`, `rebound()`, then `announce()` with
+`N(UPDATE_SA_ADDRESSES)` + NAT-D hashed over the **new** source port (§17.2) or the §17.3 fallback, the immediate
+keepalive, and `TunnelStats::address_updates` += 1. There is no separate rebind-and-announce routine to drift out of
+step with the real one. RFC 4555 §3.5 lets the initiator move whenever it likes; from the gateway's side a new source
+port on the same address is an ordinary NAT rebinding, which it has to survive anyway.
+
+The flag is latched by the monitor rather than consumed by the tick that saw it, so a request made while there is no
+route survives until the route comes back; `rebound()` clears it, so one request produces exactly one move. It is
+latched with the instant it arrived and dropped again after `NO_ROUTE_GRACE`, because there is a third case besides
+"the route came back" and "the grace period ended the tunnel": a host whose route probe itself cannot run (EMFILE, a
+sandbox EPERM on the throwaway socket) reports `Unknown` forever, which by design neither impairs the tunnel nor lets
+the forced branch act. Without the expiry that request would sit armed for the life of the tunnel and fire a real,
+unrequested `UPDATE_SA_ADDRESSES` at the first probe that happened to succeed, hours after the caller gave up on it.
+Every rule of §17 above it still applies — the grace verdict first, then "no route means no move", then an announce
+that has not been acknowledged yet, which finishes before a second socket is bound. So does everything around it:
+`close()` cancels the pending request, and an IKE exchange that is already outstanding settles before the announce goes
+out, because the announce takes `request_lock` like every other post-establishment request. The one rule it
+deliberately bypasses is `MIN_ADDRESS_UPDATE_INTERVAL`: that damping exists for a route that flaps on its own, and a
+caller-driven one-shot must not be silently dropped because the tunnel happened to move a moment ago.
+
+Running through the production path also means inheriting its consequences, which is the point but is worth stating
+plainly: `rebound()` starts the "the gateway has not acknowledged our new address" clock, so from the moment the socket
+moves a previously healthy tunnel is impaired until the announce is answered. A gateway that stays silent is retried
+until `NO_ROUTE_GRACE` expires and then the tunnel is declared dead; one that answers with an error notify kills it at
+once (§17.2); against a non-MOBIKE peer the §17.3 escalation applies. That is exactly what a real handover risks, so it
+is the right behaviour for a knob whose job is to rehearse one — but do not call `force_address_update()` on a
+registration you are not prepared to lose.
+
+`epdg-connect --rebind-after SECS` drives it that far into `--hold` and prints one machine-checkable line per fact —
+`ADDRESS-UPDATE old=<ip:port> new=<ip:port> updates=<n> ok`, `POST-MOVE DPD rtt=<ms>` and `POST-MOVE ESP rx delta=<n>`
+(ESP received *after* the update, from a DNS resolve over the tunnel: proof that the gateway moved the child SA's
+destination port too, which is the half a NAT rebinding can break). It exits non-zero if the update did not happen,
+the port did not change, DPD failed or the ESP delta is zero, and says why on an `ADDRESS-UPDATE-FAILED <reason>` line
+— a prefix of its own, because the move can land and a post-move check still fail, and neither marker may ever be
+mistaken for the other. `tests/live_tmobile.rs::live_tmobile_address_update` parses those three lines (and rejects a
+duplicate marker). The pure `tick` logic is unit-tested on its own (`a_forced_move_*`).
+
 ## 15. Amendment log
 - 2026-09-15 (round-7 review of the rewrite below — no new mechanisms, seven behaviour fixes): (a)
   `abort_request(transmitted)`: a request whose send the host refused put nothing on the wire, yet its id was flagged

@@ -4,9 +4,12 @@
 //! etc.) can be granted once: `cargo test` binaries get a new hash-suffixed path on
 //! every build, `target/debug/epdg-connect` does not.
 //!
-//! Usage: epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] [--hold SECS] [--no-dns]
+//! Usage: epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] [--hold SECS]
+//!                      [--rebind-after SECS] [--no-dns]
 //! `--activation` (or env EPDG_ACTIVATION_CONFIG) loads the app-side activation config, which
 //! carries the bundle, the credentials and the DER client certificate/key in one plist.
+//! `--rebind-after SECS` forces one address update that far into the hold and then proves the
+//! moved tunnel still works (DESIGN §17.9); off by default.
 //! Defaults point at tests/fixtures/. Set RUST_LOG=debug for hex dumps.
 
 use std::net::IpAddr;
@@ -17,6 +20,15 @@ use epdg::{Config, EpdgTunnel, Error, NetStack};
 
 const TARGET_HOST: &str = "ueb2bprod.pc.t-mobile.com";
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `--rebind-after` waits for the path thread to complete the forced address
+/// update. The announce runs the normal retransmit schedule (~15.5 s), and a schedule
+/// that times out once is retried by the path thread rather than being fatal (the
+/// library's tolerance is `NO_ROUTE_GRACE`, 30 s), so a budget of one schedule would
+/// report a move that really lands at ~16-18 s as a failure. 25 s covers a full schedule
+/// plus the start of the retry and still fits inside `--hold 30 --rebind-after 8`.
+const ADDRESS_UPDATE_TIMEOUT: Duration = Duration::from_secs(25);
+/// Poll spacing while waiting for `TunnelStats::address_updates` to move.
+const ADDRESS_UPDATE_POLL: Duration = Duration::from_millis(100);
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join(name)
@@ -35,6 +47,7 @@ fn main() {
     let mut key = fixture("client.key");
     let mut activation = std::env::var_os("EPDG_ACTIVATION_CONFIG").map(PathBuf::from);
     let mut hold = Duration::from_secs(25);
+    let mut rebind_after: Option<Duration> = None;
     let mut do_dns = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -46,9 +59,25 @@ fn main() {
             "--key" => key = PathBuf::from(val()),
             "--activation" => activation = Some(PathBuf::from(val())),
             "--hold" => hold = Duration::from_secs(val().parse().expect("--hold seconds")),
+            "--rebind-after" => {
+                rebind_after = Some(Duration::from_secs(val().parse().expect("--rebind-after seconds")))
+            }
             "--no-dns" => do_dns = false,
             "-h" | "--help" => {
-                println!("epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] [--hold SECS] [--no-dns]");
+                println!(
+                    "epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] \
+                     [--hold SECS] [--rebind-after SECS] [--no-dns]"
+                );
+                println!("  --hold SECS          keep the tunnel open this long after the checks (default 25)");
+                println!(
+                    "  --rebind-after SECS  this far into the hold, force one address update \
+                     (a fresh source port announced with UPDATE_SA_ADDRESSES) and prove the moved"
+                );
+                println!(
+                    "                       tunnel still carries IKE and ESP; prints ADDRESS-UPDATE / \
+                     POST-MOVE lines and exits non-zero if any of it fails. Off by default"
+                );
+                println!("  --no-dns             skip the pre-hold DNS check over the tunnel");
                 return;
             }
             other => panic!("unknown argument {other}"),
@@ -115,7 +144,28 @@ fn main() {
     }
 
     println!("holding tunnel for {hold:?} (keepalives every {}s)...", cfg.ike.natt.keepalive_interval_secs);
-    std::thread::sleep(hold);
+    // `--rebind-after`: part way into the hold, move the tunnel to a fresh source port
+    // through the production path monitor and prove the gateway followed it.
+    let move_ok = match rebind_after {
+        None => {
+            std::thread::sleep(hold);
+            true
+        }
+        Some(offset) => {
+            let started = Instant::now();
+            std::thread::sleep(offset.min(hold));
+            let ok = forced_address_update(&tunnel);
+            // The rest of the hold shows that the moved tunnel keeps living (keepalives on
+            // the new port, no late death); a move that already failed is reported now
+            // instead of after another half minute of sleeping. The remainder is measured
+            // from the start of the hold, so the run spends `--hold` in total however long
+            // the move itself took.
+            if ok {
+                std::thread::sleep(hold.saturating_sub(started.elapsed()));
+            }
+            ok
+        }
+    };
     let alive = tunnel.is_alive();
     let stats = tunnel.stats();
     println!("alive={alive} stats: {stats:?}");
@@ -125,8 +175,13 @@ fn main() {
         Err(e) => println!("close: {e} (best effort)"),
     }
 
+    let verdict = match (alive, move_ok) {
+        (true, true) => "PASS",
+        (false, _) => "FAIL (tunnel died while idle)",
+        (true, false) => "FAIL (the forced address update did not hold up)",
+    };
     println!();
-    println!("{}: T-Mobile ePDG tunnel", if alive { "PASS" } else { "FAIL (tunnel died while idle)" });
+    println!("{verdict}: T-Mobile ePDG tunnel");
     println!("  gateway     {} ({})", info.remote_addr, cfg.gateway.hostname);
     println!("  handshake   {:?}", info.handshake_duration);
     println!("  suites      IKE {} / child {} / TLS {}", info.ike_suite, info.child_suite, info.tls_version);
@@ -138,9 +193,95 @@ fn main() {
         println!("  {TARGET_HOST} -> {:?}", answers);
     }
     println!("  ESP tx/rx   {}/{} packets, keepalives {}", stats.esp_tx_packets, stats.esp_rx_packets, stats.keepalives_sent);
-    if !alive {
+    println!("  addr updates {}", stats.address_updates);
+    if !alive || !move_ok {
         std::process::exit(1);
     }
+}
+
+/// `--rebind-after`: exercise the real address-update path without touching the network
+/// (`EpdgTunnel::force_address_update`, DESIGN §17.9) and check what it produced.
+///
+/// The path thread rebinds the outer socket to a fresh ephemeral port on the address it
+/// is already using and announces it — `UPDATE_SA_ADDRESSES` + NAT-D over the new port
+/// with a MOBIKE peer (RFC 4555 §3.5), which the gateway sees as a NAT rebinding. Every
+/// fact gets one machine-checkable line so the live test can parse it:
+///
+/// - `ADDRESS-UPDATE old=<ip:port> new=<ip:port> updates=<n> ok` — the announce completed
+///   and the source port really moved;
+/// - `POST-MOVE DPD rtt=<ms>` — the gateway still answers IKE at the new 5-tuple;
+/// - `POST-MOVE ESP rx delta=<n>` — ESP datagrams received AFTER the update (the DNS
+///   answers below travel as ESP), i.e. proof that the gateway sends ESP to the new port.
+///
+/// Returns false — and prints `ADDRESS-UPDATE-FAILED <reason>` — if any of that did not
+/// happen; the caller exits non-zero. The failure marker deliberately does NOT start with
+/// `ADDRESS-UPDATE ` (note the hyphen): the move itself can succeed and a post-move check
+/// still fail, and a scraper asking for either prefix must never be handed the other
+/// verdict.
+fn forced_address_update(tunnel: &EpdgTunnel) -> bool {
+    let old = tunnel.local_addr();
+    let before = tunnel.stats();
+    println!(
+        "forcing an address update: local {old}, address_updates={} esp_rx={}",
+        before.address_updates, before.esp_rx_packets
+    );
+    if let Err(e) = tunnel.force_address_update() {
+        println!("ADDRESS-UPDATE-FAILED force_address_update refused: {e}");
+        return false;
+    }
+
+    // Poll for the announce the path thread runs. `address_updates` is bumped only after
+    // the gateway has answered, so seeing it move is the acknowledgement itself.
+    let deadline = Instant::now() + ADDRESS_UPDATE_TIMEOUT;
+    let after = loop {
+        let s = tunnel.stats();
+        if s.address_updates > before.address_updates {
+            break s;
+        }
+        if !tunnel.is_alive() {
+            println!("ADDRESS-UPDATE-FAILED the tunnel died during the move");
+            return false;
+        }
+        if Instant::now() >= deadline {
+            println!(
+                "ADDRESS-UPDATE-FAILED no address update within {ADDRESS_UPDATE_TIMEOUT:?} \
+                 (updates still {})",
+                s.address_updates
+            );
+            return false;
+        }
+        std::thread::sleep(ADDRESS_UPDATE_POLL);
+    };
+    let new = tunnel.local_addr();
+    if new.port() == old.port() {
+        println!("ADDRESS-UPDATE-FAILED the source port did not change (old={old} new={new})");
+        return false;
+    }
+    println!("ADDRESS-UPDATE old={old} new={new} updates={} ok", after.address_updates);
+
+    // IKE over the new 5-tuple.
+    let rtt = match tunnel.dpd() {
+        Ok(rtt) => rtt,
+        Err(e) => {
+            println!("ADDRESS-UPDATE-FAILED DPD after the move: {e}");
+            return false;
+        }
+    };
+    println!("POST-MOVE DPD rtt={}", rtt.as_millis());
+
+    // ESP over the new 5-tuple: the resolver's queries go out as ESP and the answers come
+    // back as ESP, so a non-zero delta against the counter read at the moment of the
+    // update is proof that the gateway moved the child SA's destination port too. Run
+    // whatever `--no-dns` says: this resolve is the ESP probe, not the P-CSCF lookup.
+    let stack: &dyn NetStack = tunnel;
+    let answers = lookup_pcscf(stack, TARGET_HOST, "post-move");
+    let delta = tunnel.stats().esp_rx_packets.saturating_sub(after.esp_rx_packets);
+    println!("POST-MOVE ESP rx delta={delta}");
+    if delta == 0 {
+        println!("ADDRESS-UPDATE-FAILED no ESP received after the move (resolve answers {answers:?})");
+        return false;
+    }
+    true
 }
 
 /// Resolve the P-CSCF host name with the stack's own resolver (two attempts): the
