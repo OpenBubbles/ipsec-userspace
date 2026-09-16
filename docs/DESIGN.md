@@ -401,8 +401,8 @@ impl IkeTransport {
     pub fn remote_addr(&self) -> SocketAddr;               // current (500 or 4500)
     pub fn switch_to_natt(&mut self, natt_port: u16);
     pub fn using_natt(&self) -> bool;
-    pub fn send_ike(&self, datagram: &[u8]) -> Result<()>;  // adds marker if using_natt
-    pub fn send_esp(&self, esp: &[u8]) -> Result<()>;       // raw, must be using_natt
+    pub fn send_ike(&self, datagram: &[u8]) -> Result<bool>; // adds marker if using_natt; false = held and dropped, not sent
+    pub fn send_esp(&self, esp: &[u8]) -> Result<bool>;      // raw, must be using_natt; false as above (§17.5)
     pub fn send_keepalive(&self) -> Result<()>;
     pub fn recv(&self, timeout: Duration) -> Result<Option<Incoming>>;   // None on timeout; re-samples the current socket each
                                                             // iteration (200 ms slices) so a rebind is picked up promptly;
@@ -429,8 +429,9 @@ schedule: `initial_timeout_ms * backoff^n`, `max_attempts` sends total; then `Er
 macOS/iOS and Linux, for platforms and libc paths where std still reports `Uncategorized`. `discover_egress` names
 the gateway in its error (`no route to gateway 203.0.113.9:500: …`), which is what a caller sees for the commonest
 connect failure; re-wrapping with `io::Error::new(e.kind(), …)` keeps `kind()`, which `is_path_error` checks first,
-so the classification the path monitor depends on is unaffected. Note `send_raw` still swallows `WouldBlock`/`TimedOut` as a lost datagram: send errors
-only *accelerate* the path monitor, they are never its authority (§17.1).
+so the classification the path monitor depends on is unaffected. Note `send_raw` still swallows `WouldBlock`/`TimedOut` as a lost datagram rather than breaking the retransmit schedule
+off on a local verdict: send errors only *accelerate* the path monitor, they are never its authority (§17.1). It
+returns `false` for such a datagram, so a caller can tell a real transmission from one the kernel never took (§17.5).
 
 ## 8. Initiator state machine (`ike/session.rs`) — sans-I/O
 Owns all IKE state; never touches sockets. The tunnel (§12) drives it: build → (encode) → send/recv → decode → handle.
@@ -468,6 +469,8 @@ impl IkeInitiator {
     pub fn handle_rekey_child_response(&mut self, msg: &IkeMessage) -> Result<ChildSaInfo>;   // new keys via §5.2 with this exchange's nonces; old child kept until deleted
     pub fn build_rekey_ike(&mut self) -> Result<IkeMessage>;                            // CREATE_CHILD_SA: SA(IKE, new SPIi 8 bytes), Ni, KE
     pub fn handle_rekey_ike_response(&mut self, msg: &IkeMessage) -> Result<()>;        // derives keys per §5.1 rekey; swaps to new SA (msgid restarts at 0); caller then deletes old IKE SA
+    pub fn forget_old_ike(&mut self);                                                   // drop the old IKE SA whether or not its DELETE was acknowledged (§14)
+    pub fn abort_request(&mut self, transmitted: bool);                                 // free the request slot; flag the id as abandoned ONLY if a datagram of it was sent (§17.2)
     // --- accessors ---
     pub fn spi_i(&self) -> u64; pub fn spi_r(&self) -> u64; pub fn next_message_id(&self) -> u32;
     pub fn nat(&self) -> Option<NatStatus>; pub fn suite(&self) -> &Suite; pub fn keys(&self) -> &IkeKeys; pub fn child(&self) -> Option<&ChildSaInfo>;
@@ -760,14 +763,22 @@ Timer thread (1 s tick): NAT-T keepalive `0xFF` every `keepalive_interval_secs` 
 the switch to 4500, regardless of traffic (AOSP behaviour; RFC 3948 §4);
 DPD if enabled and no IKE/ESP rx for `interval_secs` → `dpd()` with `max_retries`×`retry_interval_secs` → mark dead on
 failure (torn down WITHOUT sending DELETE, like AOSP); rekey child at the soft lifetime `lifetime*(1-margin)` (no jitter) via `build_rekey_child`, then `build_delete_child(old)`;
-rekey IKE at its lifetime similarly (`build_rekey_ike`, then delete old IKE SA). All post-establishment IKE requests go
+rekey IKE at its lifetime similarly (`build_rekey_ike`, then delete old IKE SA — best effort, and **terminal for the
+old SA either way**: acknowledged or not, `forget_old_ike()` drops it, because `build_delete_ike` prefers the old SA
+while it is held, so a wedged one would send `close()`'s DELETE to an SA that is already gone while the live IKE SA and
+its child stayed up on the gateway, and `build_rekey_ike` refuses outright while it is held, which disabled every
+future IKE rekey. The gateway expires the old SA on its own). All post-establishment IKE requests go
 through one `request()` helper that serialises on a mutex (one outstanding request), uses the transport's retransmit
 policy, and routes the response via the rx thread's pending slot. Fragmented responses are collected there too; that
 helper re-reads the transport's *current* socket for every send, so a rebind moves the remaining retransmissions to the
 new source address without disturbing the request; the only thing that abandons one in flight is `close()`, within one
 200 ms slice (§17.4).
 Threads, spawned in this order and joined rx → keepalive → timer → path → stack: `epdg-stack`, `epdg-rx`,
-`epdg-keepalive`, `epdg-timer`, `epdg-path` (§17.1). The timer thread also runs the one-way-traffic probe (§17.5).
+`epdg-keepalive`, `epdg-timer`, `epdg-path` (§17.1). A spawn that fails part-way through (EAGAIN under thread or fd
+pressure) unwinds the ones already started — `mark_dead` + `stop`/`closing`, then join — because `Drop`/`shutdown` live
+on `EpdgTunnel`, which does not exist yet, and every loop runs until `stop`: returning the error without that would
+leave threads, the outer socket and the inner stack running for the life of the process while `connect` moves on to the
+next candidate. The timer thread also runs the one-way-traffic probe (§17.5).
 Lock order, never taken in any other: `request_lock` → the transport's socket lock (brief) → `ike` → `pending`;
 `path.inner` is a leaf. `stats()` takes `last_rx` and the inner stack's `state`, and never `ike` — it may be called
 from a thread that already holds it. Inside the inner stack the order is `state` → `wakers`; `InnerStack::close` takes
@@ -1027,7 +1038,8 @@ every branch below is a unit test:
 | probe | state | action |
 |---|---|---|
 | any | impaired for ≥ `NO_ROUTE_GRACE` | `Dead(reason)` |
-| `Unknown` (the probe itself failed: EMFILE, sandbox EPERM…) | not yet impaired | `Idle`, **no clock started or advanced** — a denied probe socket must never tear down a working registration |
+| `Unknown` (the probe itself failed: EMFILE, sandbox EPERM…) | every send failing **and** nothing received, both for ≥ `NO_ROUTE_GRACE` | `Dead("the outer socket has been unusable for …")` — the wedge rule reads neither the probe nor a clock, and its two inputs already say nothing works. No rebind first: that needs the very socket the probe could not make |
+| `Unknown` | anything else | `Idle`, **no clock started or advanced** — a denied probe socket must never tear down a working registration |
 | `NoRoute` (a path-kind `Io` from the probe) | — | start/keep the impairment clock ("no route to the gateway") → `Idle` |
 | `Egress(ip)` | rebound but not acknowledged | `Announce`, or `Rebind(ip)` if the route moved again meanwhile |
 | `Egress(ip)`, `ip != bound` | — | `Rebind(ip)`, unless the previous move was < `MIN_ADDRESS_UPDATE_INTERVAL` ago (flap damping), in which case `Idle`. A first move after a quiet period is never delayed — that is the handover this feature exists for |
@@ -1035,10 +1047,13 @@ every branch below is a unit test:
 | `Egress(ip)`, `ip == bound` | every send failing **and** nothing received, both for ≥ `NO_ROUTE_GRACE` | one `Rebind(ip)`, then `Dead("the outer socket has been unusable for …")` |
 | otherwise | — | `Idle` |
 
-Row order is load-bearing: the grace is checked **before** the `Unknown` shortcut. A probe that cannot run is usually
-persistent (an fd limit, a sandbox policy), and letting it short-circuit an already-running clock froze that clock
-forever, so nothing was left that could declare the tunnel dead while it carried nothing. `Unknown` now only refuses to
-*start or advance* a clock, which is all its rationale ever justified.
+Row order is load-bearing: the grace **and the wedge rule** are evaluated before the `Unknown` shortcut. A probe that
+cannot run is usually persistent (an fd limit, a sandbox policy), and letting it short-circuit an already-running clock
+froze that clock forever, so nothing was left that could declare the tunnel dead while it carried nothing. The same
+went for the wedge rule, which used to sit inside the `Egress` branch: a host that could never probe while every send
+failed with a path errno had no route to death at all, since both liveness probes fail their *first send* and so return
+`Io`, never the `Timeout` that `request_verdict` needs. `Unknown` now only refuses to *start or advance* a clock, which
+is all its rationale ever justified.
 
 One clock covers every kind of impairment (no route, a rebind that keeps failing, an address the gateway will not
 acknowledge, a wedged socket); `impaired_reason` only relabels it, so the grace covers the whole outage rather than
@@ -1110,10 +1125,11 @@ two sentences of mechanism:
   no message id to spend. Waiting is always affordable — the full retransmit schedule is 15.5 s, `NO_ROUTE_GRACE` is
   30 s — and if the grace expires anyway, §17.4's grace death applies unchanged.
 
-**What a move does not fix: an id whose schedule ran out.** A move never abandons a request, but two things still do —
-teardown, and a retransmit schedule that is exhausted (§17.4 makes the latter *survivable*, which is precisely what
-keeps it reachable on a live tunnel). `abort_request()` frees the session's single request slot and leaves `our_msgid`
-alone, because the window is one message wide and skipping an id would stall the responder. So the **next** request,
+**What a move does not fix: an id whose schedule ran out.** A move never abandons a request, but three things still do —
+teardown, a send the host refused, and a retransmit schedule that is exhausted (§17.4 makes the latter *survivable*,
+which is precisely what keeps it reachable on a live tunnel). `abort_request(transmitted)` frees the session's single
+request slot and leaves `our_msgid` alone, because the window is one message wide and skipping an id would stall the
+responder. So the **next** request,
 possibly a different exchange, is built on that id, and RFC 7296 §2.1 then obliges a responder that *did* process the
 abandoned one to replay its cached response for it **without processing the new request**. Nothing in the header tells
 the replay from a genuine answer: same SPIs, same id, and — for an announce landing on a DPD's id, or a second
@@ -1121,8 +1137,15 @@ CREATE_CHILD_SA landing on the first's — the same exchange type.
 
 §2.1's protection is therefore free only for the **same** request. The guard is one field and one check:
 
-- `IkeInitiator::abandoned_msgid` remembers the id `abort_request()` gave up on, and `consume_message_id()` clears it
-  (an accepted response spends the id, so nothing can be replayed onto a later one);
+- `IkeInitiator::abandoned_msgid` remembers the id `abort_request(transmitted)` gave up on — **only when at least one
+  datagram of it actually reached the kernel**, because only then can the gateway be holding a cached response. A
+  request the host refused outright (`EACCES` from a local filter, `ENOBUFS`; the send loop breaks on the first
+  failure, so on attempt 0 nothing was transmitted), a fragment set the loop never finished (an incomplete RFC 7383 set
+  is never processed either) and a build whose `encode` failed all leave the id clean. Flagging one of those made the
+  retry on that id refuse the gateway's *genuine* answer: one wasted exchange, an orphaned child SA behind a rekey,
+  and — since the refusal is an `Error::Protocol`, which §17.3's catch-all charges — one of the two
+  `ESP_MIGRATION_REKEY_ATTEMPTS` spent on our own bookkeeping. `consume_message_id()` clears the flag (an accepted
+  response spends the id, so nothing can be replayed onto a later one);
 - `accept_response()` refuses a response on such an id **for the exchanges that commit state on a bare
   acknowledgement** — `UPDATE_SA_ADDRESSES` / the §2.23 announce, and both rekeys. Committing a replayed acknowledgement
   would move the SA the gateway never moved (and RFC 4555 §3.8 forbids it to re-learn our address from ESP, so ESP
@@ -1187,10 +1210,12 @@ encapsulation port that **nothing** could see: the IKE SA did move, so it answer
 every other caller uses, and refines it into four cases:
 
 - **Fatal** — `RequestVerdict::GatewayGone`: retransmissions exhausted with the socket holding still. `mark_dead`, as
-  for any other rekey.
-- **Done** — the exchange completed, *or* it failed after `rekey_child` had already committed the new SAs (`installed`
-  — only the DELETE of the old child SA failed, so the migration itself happened and blaming the gateway for it would
-  be wrong). **A completed rekey is not proof that ESP came back.** The gateway this escalation exists for answers the
+  for any other rekey. This is decided **before** `installed` is consulted: a gateway that went silent over a settled
+  path is gone whichever half of the rekey it went silent under, and a tunnel whose gateway is gone is dead even if its
+  child SA was migrated a moment earlier — exactly as for a DPD.
+- **Done** — the exchange completed, *or* it failed **non-fatally** after `rekey_child` had already committed the new
+  SAs (`installed` — only the DELETE of the old child SA failed, so the migration itself happened and blaming the
+  gateway for it would be wrong; `installed` only ever refines a non-fatal outcome). **A completed rekey is not proof that ESP came back.** The gateway this escalation exists for answers the
   CREATE_CHILD_SA on the IKE SA, which did move, and may still derive the new child SA's encapsulation from the same
   stale state. So the path thread restarts `moved_at` at the completion instant and re-arms the check: if ESP is still
   one-way `ONE_WAY_PROBE_SILENCE` after the next ESP transmission, the escalation runs again. Treating `Ok(())` as a
@@ -1252,7 +1277,7 @@ nominal deadline, by the sum of
 - the announce's own schedule, up to a further 15.5 s;
 - one `PATH_PROBE_INTERVAL`.
 
-So the worst case is `NO_ROUTE_GRACE` + ~46.5 s, not + 15.5 s. That is deliberate. `NO_ROUTE_GRACE` is the instant from
+So the worst case is `NO_ROUTE_GRACE` + ~48.5 s (31 + 15.5 + 2), not + 15.5 s. That is deliberate. `NO_ROUTE_GRACE` is the instant from
 which tearing the registration down is *allowed*, not a promise to tear it down to the millisecond, and buying
 punctuality with a cutoff would mean abandoning the very `UPDATE_SA_ADDRESSES` the outage needs — which is what the
 previous design did, at the cost of an abandoned message id and everything that had to be built to make one safe. Only
@@ -1331,6 +1356,13 @@ Exhaustion is `mark_dead("gateway stopped answering")` — unless the path was u
 acknowledged yet, whether it started before the probe or under it), in which case `request_verdict` (§17.4) calls it
 transient, because the silence may be ours. It does not re-fire without new one-way evidence: any inbound IKE/ESP (a successful probe's response
 included) clears `first_tx_since_rx`, and the previous probe must in any case be `ONE_WAY_PROBE_SILENCE` old.
+
+The evidence has to be a *real* transmission. `send_raw` deliberately swallows a `WouldBlock`/`TimedOut` from
+`send_to` (a host firewall holding the flow pending a verdict) rather than breaking the retransmit schedule off on a
+local verdict, so it reports which of the two happened: `Ok(true)` took the datagram, `Ok(false)` dropped it, and only
+`true` reaches `note_data_tx` / `note_esp_tx`. Arming the window with a datagram that never left the host made the
+probe fire over sends the kernel never made and `mark_dead("gateway stopped answering")` land ~37 s into a filter hold
+that `NO_ROUTE_GRACE` was supposed to be the only authority over.
 
 `sends_failing_since` — the wedge rule's only input — is started **only** by a send that failed with a path-kind error
 (`is_path_failure`), and by any such send: the ESP sink, an IKE request *and* the NAT-T keepalive, which on an idle
@@ -1432,7 +1464,7 @@ embedders, so a new field there is a breaking change.
 | `MIN_ADDRESS_UPDATE_INTERVAL` | 5 s | flap damping: a move within this window of the previous one waits it out — a move to a new address *and* the rebind that recovers from an impairment on the address we are already bound to (§17.1), which is the other half of a flap. The first move after a quiet period passes immediately, so a handover is never delayed |
 | `ESP_SEND_ERROR_LOG_INTERVAL` | 5 s | the ESP sink logs per datagram; the keepalive and IKE-request error sites are rare enough to log unconditionally |
 | `PROBE_ERROR_LOG_INTERVAL` | 60 s | a probe that cannot *run* (EMFILE, a sandbox/MDM EPERM on the throwaway socket) is usually permanent and deliberately never impairs the tunnel, so the warning would otherwise repeat every `PATH_PROBE_INTERVAL` for the life of the registration |
-| `ESP_MIGRATION_REKEY_ATTEMPTS` | 2 | child rekeys per move for the non-MOBIKE ESP escalation (§17.3) before `mark_dead`. `N(TEMPORARY_FAILURE)` is worth one retry; a child SA still black-holed after that is invisible to every liveness check, so it must end in death. Only a rekey that reached the gateway spends an attempt — a completed one included, since completing is not the same as repairing |
+| `ESP_MIGRATION_REKEY_ATTEMPTS` | 2 | child rekeys per move for the non-MOBIKE ESP escalation (§17.3) before `mark_dead`. `N(TEMPORARY_FAILURE)` is worth one retry; a child SA still black-holed after that is invisible to every liveness check, so it must end in death. An attempt is spent unless the failure proves nothing (a broken route, a crossing teardown, silence over a path still being repaired); a completed rekey spends one, since completing is not the same as repairing, and so does a deterministic local refusal, which would otherwise re-arm forever |
 | `OUTER_SEND_TIMEOUT` (`epdg::ike::transport`) | 250 ms | write timeout on every outer socket. The ESP sink runs the send synchronously under the inner stack's `state` mutex (§17.6), so it caps how long one held datagram stalls the stack; it is well inside the 500 ms first retransmit interval |
 
 ### 17.8 Known limits
@@ -1445,11 +1477,12 @@ embedders, so a new field there is a breaking change.
   keeps running throughout.
 - Death inherits that wait. The grace is evaluated at the top of a tick and a tick cannot run while the path thread is
   blocked in `announce()`, so death lands at `NO_ROUTE_GRACE` + the lock wait (up to ~31 s behind a rekey) + the
-  announce's own schedule (up to 15.5 s) + one `PATH_PROBE_INTERVAL` — ~46.5 s of overshoot in the worst case, not
-  15.5 s (§17.4). Only the pure `PathMonitor` deadline is unit-tested.
-- An announce that lands on a message id an abandoned request already spent costs one extra round trip: its response
-  is refused unconditionally (§17.2), because a gateway that processed the abandoned request is obliged to replay its
-  cached answer instead of processing this one, and the two are indistinguishable. The refusal spends the id, so the
+  announce's own schedule (up to 15.5 s) + one `PATH_PROBE_INTERVAL` — ~48.5 s of overshoot in the worst case
+  (31 + 15.5 + 2), not 15.5 s (§17.4). Only the pure `PathMonitor` deadline is unit-tested.
+- An announce that lands on a message id an abandoned request already **transmitted** costs one extra round trip: its
+  response is refused unconditionally (§17.2), because a gateway that processed the abandoned request is obliged to
+  replay its cached answer instead of processing this one, and the two are indistinguishable. An id no datagram ever
+  left the host on is not flagged, so it costs nothing. The refusal spends the id, so the
   retry — the next tick's, at most `PATH_PROBE_INTERVAL` later — runs clean.
 - Every liveness signal runs over the IKE SA, so a black-holed child SA under a working IKE SA is invisible to all of
   them. The §17.3 escalation is the only thing that sees it, and only on a non-MOBIKE peer after a move it observed:
@@ -1469,6 +1502,21 @@ embedders, so a new field there is a breaking change.
   observes the close, so the very next `recv_timeout` after `mark_dead` is not necessarily the one that reports it.
 
 ## 15. Amendment log
+- 2026-09-15 (round-7 review of the rewrite below — no new mechanisms, seven behaviour fixes): (a)
+  `abort_request(transmitted)`: a request whose send the host refused put nothing on the wire, yet its id was flagged
+  as abandoned, so the retry on that id refused the gateway's *genuine* answer — a wasted exchange, an orphaned child
+  SA behind a rekey, and one of the two `ESP_MIGRATION_REKEY_ATTEMPTS` spent on our own bookkeeping (§17.2). (b)
+  `send_raw` now reports whether the kernel took the datagram; a held send no longer arms the one-way probe, which was
+  calling `mark_dead("gateway stopped answering")` ~37 s into a local filter hold with nothing ever having left the
+  host (§17.5). (c) The old IKE SA is dropped whether or not its DELETE is acknowledged (`forget_old_ike`): a wedged
+  `old_ike` sent `close()`'s DELETE to a dead SA while the live one stayed up on the gateway, and blocked every future
+  IKE rekey (§14). (d) The five tunnel threads unwind if one spawn fails, instead of leaking the started ones, the
+  outer socket and the inner stack for the life of the process (§12). (e) `ike_request_locked` brackets build **and**
+  encode, so an encode failure no longer leaves the session's request slot set for good (§17.2). (f) The wedge rule is
+  evaluated before the `Unknown` probe shortcut, so a host that can never probe while every send fails has a route to
+  death again (§17.1). (g) Doc corrections: `installed` only refines non-fatal escalation outcomes (§17.3), an attempt
+  is spent unless the failure proves nothing (§17.7), the grace overshoot is ~48.5 s not ~46.5 s (§17.4/§17.8), and
+  `tunnel.rs`'s death-reason list names the peer child DELETE, the rejected address update and the escalation death.
 - 2026-09-15 (§17.2/§17.4 rewritten — a move never interrupts a request): the first §17 landed with a mechanism for
   *cancelling* an exchange the path had moved under (a `suspended` flag, a `path_abort` predicate on every request, an
   abandoned-message-id record, a reused-id refusal in three response handlers, and a spend-DPD with its own attempt

@@ -1416,16 +1416,36 @@ impl IkeInitiator {
     /// is dropped with it.
     ///
     /// `our_msgid` is left unchanged — the window is one message wide, so skipping the id
-    /// would stall the responder — and the id is remembered in `abandoned_msgid`, because
-    /// the request it carried may well have been processed and its response cached. A
-    /// move never reaches this path (a rebind does not interrupt a request: the remaining
-    /// retransmissions simply leave the new socket), but an exhausted schedule and a
-    /// teardown both do (DESIGN §17.2).
-    pub fn abort_request(&mut self) {
+    /// would stall the responder. A move never reaches this path (a rebind does not
+    /// interrupt a request: the remaining retransmissions simply leave the new socket),
+    /// but an exhausted schedule, a send failure and a teardown all do (DESIGN §17.2).
+    ///
+    /// `transmitted` says whether at least one datagram of this request actually reached
+    /// the kernel. Only then is the id remembered in `abandoned_msgid`, because only then
+    /// may the gateway have processed the request and cached a response for it. A request
+    /// the host refused outright (EACCES from a local filter, ENOBUFS, a fragment set the
+    /// send loop never finished — an incomplete RFC 7383 set is never processed either)
+    /// left nothing behind, so flagging its id would make the next address update or
+    /// rekey refuse a genuine response and pay a needless extra exchange.
+    pub fn abort_request(&mut self, transmitted: bool) {
         if !matches!(self.pending, Pending::None) {
-            warn!("abandoning the outstanding request (msgid {})", self.our_msgid);
+            warn!("abandoning the outstanding request (msgid {}, transmitted={transmitted})", self.our_msgid);
             self.pending = Pending::None;
-            self.abandoned_msgid = Some(self.our_msgid);
+            if transmitted {
+                self.abandoned_msgid = Some(self.our_msgid);
+            }
+        }
+    }
+
+    /// Forget the old IKE SA kept for its post-rekey `DELETE`, acknowledged or not.
+    ///
+    /// The DELETE is best effort: the gateway expires the old SA on its own. Keeping it
+    /// would redirect the next [`IkeInitiator::build_delete_ike`] (i.e. `close()`) to an
+    /// SA that is already gone while the live one is never deleted, and would block every
+    /// future IKE rekey with "previous IKE SA not yet deleted" (DESIGN §14).
+    pub fn forget_old_ike(&mut self) {
+        if let Some(old) = self.old_ike.take() {
+            debug!("old IKE SA {:#018x}/{:#018x} dropped locally", old.spi_i, old.spi_r);
         }
     }
 
@@ -3409,7 +3429,7 @@ mod tests {
         let (mut init, resp, _) = establish(false);
         let _ = init.build_rekey_child().unwrap();
         let msgid = init.next_message_id();
-        init.abort_request();
+        init.abort_request(true);
         // The next request reuses the unanswered id (RFC 7296 §2.1).
         let dpd = init.build_dpd().unwrap();
         assert_eq!(dpd.header.message_id, msgid);
@@ -3421,7 +3441,7 @@ mod tests {
         assert_eq!(init.next_message_id(), msgid + 1, "the id is spent either way");
         assert!(!init.has_pending_request(), "and the request slot is released with it");
         // What `settle` does on a handler error must be a no-op here.
-        init.abort_request();
+        init.abort_request(true);
         let m = init.build_address_update(new_local(), natt_remote()).unwrap();
         assert_eq!(m.header.message_id, msgid + 1);
         let r2 = resp.seal_response(EXCH_INFORMATIONAL, msgid + 1, nat_d_response_for(&resp, new_local()));
@@ -3463,7 +3483,7 @@ mod tests {
         let dpd = init.build_dpd().unwrap();
         let msgid = dpd.header.message_id;
         // The retransmit schedule ran out: the id was on the wire and was never answered.
-        init.abort_request();
+        init.abort_request(true);
         let m = init.build_address_update(new_local(), natt_remote()).unwrap();
         assert_eq!(m.header.message_id, msgid, "the window is one wide; the id is reused");
 
@@ -3498,7 +3518,7 @@ mod tests {
             let (mut init, resp, _) = establish(false);
             let first = init.build_rekey_child().unwrap();
             let msgid = first.header.message_id;
-            init.abort_request();
+            init.abort_request(true);
             let second =
                 if ike_rekey { init.build_rekey_ike().unwrap() } else { init.build_rekey_child().unwrap() };
             assert_eq!(second.header.message_id, msgid, "the id is reused (ike_rekey={ike_rekey})");
@@ -3526,7 +3546,7 @@ mod tests {
         let (mut init, resp, _) = establish(false);
         let _ = init.build_address_update(new_local(), natt_remote()).unwrap();
         let msgid = init.next_message_id();
-        init.abort_request();
+        init.abort_request(true);
         let dpd = init.build_dpd().unwrap();
         assert_eq!(dpd.header.message_id, msgid);
         let r = resp.seal_response(EXCH_INFORMATIONAL, msgid, Vec::new());
@@ -3824,6 +3844,50 @@ mod tests {
         drop(old_keys);
     }
 
+    /// Regression (round-7 findings 3/5): the old IKE SA's DELETE is best effort, and the
+    /// old SA must be dropped whether or not it is acknowledged.
+    ///
+    /// While `old_ike` is set, `build_delete_ike` targets the OLD SA — so `close()` would
+    /// delete an SA that is already gone and leave the live IKE SA and its child up on the
+    /// gateway — and `build_rekey_ike` refuses outright, so a single unanswered DELETE
+    /// disabled IKE rekey for the rest of the session.
+    #[test]
+    fn an_unacknowledged_old_ike_delete_is_forgotten() {
+        let (mut init, resp, _) = establish(false);
+        let (old_spi_i, old_spi_r) = (init.spi_i(), init.spi_r());
+        let m = init.build_rekey_ike().unwrap();
+        let prop = m.sa().unwrap().proposals[0].clone();
+        let new_spi_i = u64::from_be_bytes(prop.spi.clone().try_into().unwrap());
+        let new_spi_r: u64 = 0x0badcafe_44556677;
+        let pair = registry::dh(14).unwrap().generate().unwrap();
+        let r = resp.seal_response(
+            EXCH_CREATE_CHILD_SA,
+            m.header.message_id,
+            vec![
+                Payload::Sa(SaPayload { proposals: vec![Proposal { spi: new_spi_r.to_be_bytes().to_vec(), ..prop }] }),
+                Payload::Ke(KePayload { group: DH_MODP_2048, public: pair.public_value() }),
+                Payload::Nonce(random_bytes(32)),
+            ],
+        );
+        let rm = init.decode(&r).unwrap();
+        init.handle_rekey_ike_response(&rm).unwrap();
+        assert_eq!(init.spi_i(), new_spi_i);
+
+        // The DELETE of the old SA goes out and is never answered.
+        let d = init.build_delete_ike().unwrap();
+        assert_eq!((d.header.spi_i, d.header.spi_r), (old_spi_i, old_spi_r));
+        init.abort_request(true);
+        assert!(matches!(init.build_rekey_ike(), Err(Error::Protocol(_))), "blocked while the old SA is pinned");
+
+        // Dropping it locally (what `rekey_ike` now does unconditionally) restores both.
+        init.forget_old_ike();
+        let d = init.build_delete_ike().unwrap();
+        assert_eq!((d.header.spi_i, d.header.spi_r), (new_spi_i, new_spi_r), "close() deletes the LIVE IKE SA");
+        init.abort_request(true);
+        init.build_rekey_ike().expect("the next lifetime rekey can run");
+        init.forget_old_ike(); // idempotent
+    }
+
     #[test]
     fn state_misuse_is_protocol_error() {
         let cfg = test_config();
@@ -3870,13 +3934,13 @@ mod tests {
         let _ = init.encode(&dpd).unwrap();
         assert!(init.has_pending_request());
         assert!(matches!(init.build_rekey_child(), Err(Error::Protocol(_))));
-        init.abort_request();
+        init.abort_request(true);
         assert!(!init.has_pending_request());
         assert_eq!(init.next_message_id(), 4, "an abandoned request does not consume its message id");
         // A rekey can now be started, on the same message id.
         let rk = init.build_rekey_child().unwrap();
         assert_eq!(rk.header.message_id, 4);
-        init.abort_request();
+        init.abort_request(true);
         // And a DPD again, which completes normally.
         let dpd2 = init.build_dpd().unwrap();
         assert_eq!(dpd2.header.message_id, 4);
@@ -3885,7 +3949,7 @@ mod tests {
         let rm = init.decode(&r).unwrap();
         init.handle_informational_response(&rm).unwrap();
         assert_eq!(init.next_message_id(), 5);
-        init.abort_request(); // no-op when idle
+        init.abort_request(true); // no-op when idle
         assert!(init.build_dpd().is_ok());
     }
 

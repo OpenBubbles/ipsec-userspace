@@ -223,7 +223,11 @@ impl IkeTransport {
     }
 
     /// Send one IKE datagram, prepending the 4-byte non-ESP marker when on NAT-T.
-    pub fn send_ike(&self, datagram: &[u8]) -> Result<()> {
+    ///
+    /// `Ok(false)` means the kernel never took the datagram (see [`IkeTransport::send_raw`]):
+    /// nothing left the host, so it is neither evidence of transmission nor of an
+    /// abandoned message id.
+    pub fn send_ike(&self, datagram: &[u8]) -> Result<bool> {
         let dst = self.remote_addr();
         trace!("ike tx {} bytes -> {}: {}", datagram.len(), dst, hex::encode(datagram));
         if self.use_marker {
@@ -237,7 +241,10 @@ impl IkeTransport {
     }
 
     /// Send a raw UDP-encapsulated ESP packet (starts at the SPI). Requires NAT-T.
-    pub fn send_esp(&self, esp: &[u8]) -> Result<()> {
+    ///
+    /// `Ok(false)` as in [`IkeTransport::send_ike`]: the datagram was dropped rather than
+    /// transmitted.
+    pub fn send_esp(&self, esp: &[u8]) -> Result<bool> {
         if !self.use_marker {
             return Err(Error::Protocol("send_esp before NAT-T port switch".into()));
         }
@@ -256,19 +263,25 @@ impl IkeTransport {
         }
         let dst = self.remote_addr();
         trace!("natt keepalive -> {}", dst);
-        self.send_raw(&NATT_KEEPALIVE, dst)
+        // A keepalive is not our traffic, so the caller has no use for the flag.
+        self.send_raw(&NATT_KEEPALIVE, dst).map(|_| ())
     }
 
-    fn send_raw(&self, bytes: &[u8], dst: SocketAddr) -> Result<()> {
+    /// `Ok(true)` when the kernel took the datagram, `Ok(false)` when it was held and
+    /// dropped instead. The distinction matters to the liveness logic: a datagram that
+    /// never left the host is no evidence that the tunnel transmitted anything (DESIGN
+    /// §17.5), and no evidence that the gateway could have cached a response (§17.2).
+    fn send_raw(&self, bytes: &[u8], dst: SocketAddr) -> Result<bool> {
         let (socket, _) = self.current();
         let n = match socket.send_to(bytes, dst) {
             Ok(n) => n,
             Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {
                 // A send that is held/blocked (e.g. a host firewall pausing the flow pending a
                 // verdict) must never stall the state machine: count the datagram as lost and let
-                // the retransmission schedule cover it.
+                // the retransmission schedule cover it. It is NOT turned into an error, because
+                // that would break the whole retransmit schedule off on a transient local verdict.
                 warn!("UDP send to {} did not complete ({}); treating datagram as lost", dst, e);
-                return Ok(());
+                return Ok(false);
             }
             Err(e) => return Err(e.into()),
         };
@@ -278,7 +291,7 @@ impl IkeTransport {
                 format!("short UDP send: {} of {} bytes", n, bytes.len()),
             )));
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Wait up to `timeout` for a datagram from the gateway and classify it.
@@ -697,7 +710,10 @@ mod tests {
         let mut t = transport(&p);
         let msg = request_dgram(3);
 
-        t.send_ike(&msg).unwrap();
+        // `true` = the kernel took the datagram. Only that arms the liveness clocks and
+        // can leave a cached response behind (round-7 finding 2); a held send returns
+        // `Ok(false)` instead, which no caller may read as a transmission.
+        assert!(t.send_ike(&msg).unwrap(), "the datagram left the host");
         let (got, src) = peer_recv(&p);
         assert_eq!(got, msg);
         assert_eq!(src, t.local_addr());
@@ -721,7 +737,7 @@ mod tests {
         assert_eq!(got, NATT_KEEPALIVE.to_vec());
 
         let esp = [0x00, 0x00, 0x10, 0x01, 0x00, 0x00, 0x00, 0x01, 0xde, 0xad];
-        t.send_esp(&esp).unwrap();
+        assert!(t.send_esp(&esp).unwrap(), "the datagram left the host");
         let (got, _) = peer_recv(&natt_peer);
         assert_eq!(got, esp.to_vec());
 
