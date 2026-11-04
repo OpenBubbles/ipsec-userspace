@@ -120,7 +120,7 @@ TCP call at once — even while the stack thread is stuck in a slow send. The `N
 exercise and one generic TCP exercise (plus the write-timeout contract TLS relies on) over both backends (loopback
 `StdNetStack`s and the two-stack loopback), and the libc resolver against `localhost` only.
 
-`tests/live_tmobile.rs` drives `target/debug/epdg-connect` (stable path, so one firewall rule keeps working across rebuilds; set `EPDG_LIVE_INPROCESS=1` to run the tunnel inside the test process instead). It connects to the T-Mobile PROD ePDG with the fixture credentials, asserts an inner address,
+`tests/live_tmobile.rs` drives `target/debug/epdg-connect` (stable path, so one firewall rule keeps working across rebuilds; set `EPDG_LIVE_INPROCESS=1` to run the tunnel inside the test process instead). It connects to the T-Mobile PROD ePDG with the credentials of the activation config named by `EPDG_ACTIVATION_CONFIG` (without it, the revoked fixture credentials in `tests/fixtures/`, which fail with AUTHENTICATION_FAILED at IKE_AUTH #1; `scripts/pull-activation-config.sh` pulls a current config off a debuggable device over adb — the certificate is reissued monthly), asserts an inner address,
 resolves `ueb2bprod.pc.t-mobile.com` through `&dyn NetStack` (smoltcp DNS over ESP — proves ESP in both directions and covers the tunnel's `NetStack` implementation),
 runs a DPD, observes NAT-T keepalives, and tears down cleanly. It also passes `--tcp-probe`, which opens one inner TCP
 connection to the resolved P-CSCF on the port of the config's `pcscf-address` and prints `TCP-PROBE ok local=… peer=…
