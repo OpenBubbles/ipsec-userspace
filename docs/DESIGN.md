@@ -23,8 +23,8 @@ Implemented (exactly what the T-Mobile PROD ePDG profile negotiates):
 - EAP: Identity + EAP-TLS (rustls). No EAP-AKA.
 - Crypto: ENCR_AES_CBC-256, AUTH_HMAC_SHA2_256_128, PRF_HMAC_SHA2_256, DH group 14.
   All behind traits + a registry so more can be added.
-- ESP tunnel mode over UDP/4500, anti-replay, NAT-T keepalive, inner IPv4/IPv6+UDP stack,
-  a tiny DNS client for the live test.
+- ESP tunnel mode over UDP/4500, anti-replay, NAT-T keepalive, inner IPv4/IPv6 stack (smoltcp)
+  with UDP, TCP (connections and listeners, §11.2) and a DNS client.
 - Config: carrier-bundle plist model (`Config::from_plist_bundle`, or one `Config::from_activation_plist` file).
 
 - Mobility and liveness (§17): a path monitor that rebinds the outer socket when the host's
@@ -32,7 +32,7 @@ Implemented (exactly what the T-Mobile PROD ePDG profile negotiates):
   RFC 7296 §2.23 fallback; a one-way-traffic probe independent of the bundle's DPD flag.
 
 Not implemented: responder role, PSK/cert auth, EAP-AKA, IPComp, transport mode, ESN,
-3GPP notifies (constants present), inner TCP; on the mobility side, responder-initiated
+3GPP notifies (constants present); on the mobility side, responder-initiated
 address changes and peer address lists (`ADDITIONAL_IP4/IP6_ADDRESS` are logged and
 ignored), and AOSP's `migrateAllChildSAs` child rekey on a non-MOBIKE move, which is done
 only as an escalation when ESP demonstrably stalls after the move — we transmitted from the new address and nothing
@@ -51,7 +51,7 @@ came back (§17.3).
 | `src/ike/session.rs` | agent:session | §8, §17.2 |
 | `src/eap/{packet,tls}.rs` | agent:eap | §9 |
 | `src/esp/{codec,replay}.rs` | agent:esp | §10 |
-| `src/ipstack/{device,frag,stack}.rs` | agent:ipstack | §11, §11.1 |
+| `src/ipstack/{device,frag,stack}.rs` | agent:ipstack | §11, §11.1, §11.2 |
 | `src/tunnel.rs` + `tests/live_tmobile.rs` | agent:tunnel | §12, §13, §17 |
 
 Fixed already (do not change signatures): `src/lib.rs`, `src/error.rs`, `src/crypto/mod.rs`
@@ -639,7 +639,7 @@ features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "proto-ipv4-f
 "socket-udp", "socket-tcp", "socket-dns", "socket-icmp", "auto-icmp-echo-reply"] }` (drop any feature name that 0.14 lacks;
 verify on docs.rs). `auto-icmp-echo-reply` is in smoltcp's default set but NOT implied by `socket-icmp`: without it every ICMP
 echo request to the inner address is silently ignored (a P-CSCF/ePDG liveness ping got no reply until 2026-09-11). `socket-tcp`
-and `socket-icmp` are pre-enabled for the TCP seam below; `proto-ipv6-fragmentation` is inert on `Medium::Ip` (6LoWPAN only).
+backs the inner TCP connections and listeners of §11.2; `proto-ipv6-fragmentation` is inert on `Medium::Ip` (6LoWPAN only).
 
 ```rust
 // ipstack/device.rs
@@ -676,7 +676,8 @@ pub struct UdpDatagram { pub src: SocketAddr, pub dst: SocketAddr, pub payload: 
 // one (NXDOMAIN / SERVFAIL / empty answer) as Error::Protocol. Non-unicast assigned DNS servers (0.0.0.0, ::, multicast) are skipped
 // with a warning — smoltcp fails every query sent to one.
 // Stack thread: InnerStack::spawn wraps run() in catch_unwind and close()s the stack on a panic (waiters get Error::Closed, not silence).
-// TCP: not exposed yet — the seam is `socket::tcp::Socket` in the same SocketSet (one method away; do NOT implement now).
+// TCP (§11.2): `socket::tcp::Socket`s in the same SocketSet, driven by the same thread; InnerStack::connect_tcp / listen_tcp hand
+// out blocking adapters (InnerTcpStream / InnerTcpListener) that park on the TCP event counter, never on the stack lock.
 ```
 MTU: the wire MTU defaults to 1280 (config `child.inner_mtu`, clamped to `[1280, 65535]`); the MTU smoltcp sees is
 `child.inner_mtu_stack` (§11.1). **Verified smoltcp 0.14 behaviour (amendment 2026-09-11, see §15):** outbound IPv4 larger than the
@@ -724,6 +725,110 @@ wraps the device:
   3000-byte (and 8000-byte) **IPv6** UDP datagram both ways with the wire MTU 1280 (each device sink asserts every packet it emits
   is ≤ 1280).
 
+### 11.2 Inner TCP (`InnerStack::connect_tcp` / `listen_tcp`, decision 2026-11-03)
+SIP has to be able to run over TCP inside the tunnel — RFC 3261 §18.1.1: a request within 200 bytes of the path MTU (or
+above 1300 bytes when it is unknown) MUST go over a congestion-controlled transport, and IMS registrations and NOTIFYs
+easily get there — so the seam §11 left open is used: smoltcp `socket::tcp::Socket`s live in the same `SocketSet`,
+driven by the same stack thread, and callers get blocking adapters.
+```rust
+impl InnerStack {
+    pub fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> Result<InnerTcpStream>; // ephemeral port; Timeout / Io(ConnectionRefused) / Config
+    pub fn listen_tcp(&self, port: u16) -> Result<InnerTcpListener>;                          // 0 = ephemeral; Io(AddrInUse) when taken
+}
+impl InnerTcpStream {   // &self throughout, Send + Sync: a reader thread and a writer thread may share one stream
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize>;  pub fn write(&self, data: &[u8]) -> Result<usize>;
+    pub fn set_read_timeout(&self, t: Option<Duration>) -> Result<()>;  pub fn set_write_timeout(&self, t: Option<Duration>) -> Result<()>;
+    pub fn set_nodelay(&self, nodelay: bool) -> Result<()>;  pub fn shutdown(&self) -> Result<()>;
+    pub fn local_addr(&self) -> SocketAddr;  pub fn peer_addr(&self) -> SocketAddr;
+}
+impl InnerTcpListener {
+    pub fn accept_timeout(&self, timeout: Duration) -> Result<Option<(InnerTcpStream, SocketAddr)>>;
+    pub fn local_addr(&self) -> SocketAddr;  pub fn local_port(&self) -> u16;
+}
+// EpdgTunnel::connect_tcp / listen_tcp forward to the stack (a dead tunnel is Error::Closed first); both are NetStack backends (§16).
+```
+- **Waiting.** A call takes `state` only to look at its socket or move bytes through its buffers (`recv_slice`,
+  `send_slice`, a state check) and otherwise parks on `StackShared::tcp_events`: a generation counter with its own
+  mutex/condvar, read *before* the socket is examined so that no event can slip in between. The stack thread bumps it
+  after every poll that processed or sent a packet while TCP sockets exist; `close` bumps it right after publishing the
+  reason; `shutdown` bumps it for a reader or writer blocked on the same stream. It is deliberately not a condvar on
+  `state`: that mutex is held across a poll which can block in a slow outer send, and a call woken by a close must return
+  `Error::Closed` without waiting for that poll (§17.6) — the guarantee a parked UDP receiver already has. Every call
+  re-reads `StackShared::closed` before and after taking `state`, so it never touches a socket a close removed.
+- **Connect.** A free ephemeral port (TCP ports are counted per local port — connections, backlog slots, orphans —
+  independently of UDP's), `Socket::connect` (smoltcp chooses the source address of the destination's family; a family
+  without an inner address is `Config`), wake the stack thread, wait for ESTABLISHED. A socket that went CLOSED first
+  was refused (`Io(ConnectionRefused)`: the peer's RST, or smoltcp's own when nothing listens); the deadline is
+  `Error::Timeout`. A failed or timed-out attempt is removed at once without sending anything, as an OS socket's is.
+- **Listener = backlog emulation.** smoltcp has no accept queue: a socket in LISTEN takes exactly one connection, and a
+  SYN that finds none is answered with RST. A listener therefore owns `TCP_LISTEN_BACKLOG` (2) listening sockets;
+  `accept_timeout` hands out the first one that reached ESTABLISHED (or CLOSE-WAIT, when the peer already sent
+  everything and its FIN) and puts a fresh LISTEN socket into its slot at once — so one connection can be pending while
+  the next SYN still finds a listener; a SYN arriving while both slots are taken is refused, like one meeting a full
+  accept queue. Slots carry smoltcp's socket timeout (`TCP_BACKLOG_TIMEOUT`, 30 s, cleared on accept): a handshake whose
+  final ACK never comes, or a connection nobody accepts while its peer stays silent, is reset and the slot listens again,
+  so neither occupies the backlog for good. A second listener on a port — or one on an outbound connection's local port
+  — is `Io(AddrInUse)`; dropping a listener resets the connections nobody accepted (an OS listener does the same with
+  its accept queue).
+- **Duplicate SYNs.** smoltcp gives a segment to the FIRST socket in `SocketSet` order that accepts it, and a LISTEN
+  socket accepts any SYN for its port. When our SYN-ACK is lost the peer retransmits its SYN; were the spare listening
+  slot to sit before the half-open socket, it would answer with a second SYN-ACK (another ISN), and the peer's ACK —
+  matching both sockets' 4-tuple — could be answered with RST, killing the connection. `push_rx` therefore drops a
+  connection request whose 4-tuple already belongs to one of our sockets past SYN-SENT (`tcp_dup_syn_drops`): exactly
+  what that socket does with it when it comes first (a SYN in a synchronized state is ignored; its own SYN-ACK
+  retransmission completes the handshake). Only consulted while a listener exists.
+- **MSS clamping.** smoltcp derives the MSS it announces — and the segment size it sends, `min(own, peer's)` — from the
+  MTU it sees, which is the 16384-byte *stack* MTU of §11.1. Unclamped, every full segment would be ~16 KB and leave as
+  a train of wire-MTU fragments, and an IPv4 one could not even be reassembled (smoltcp's IPv4 reassembly buffer is
+  8 KiB). The device rewrites the MSS option of every SYN in both directions (`frag::clamp_tcp_mss`; checksum
+  recomputed; only on a segment whose checksum verifies, so a corrupt one is not laundered) to `wire MTU − 40/20 − 20`
+  (RFC 6691 §2: fixed headers only) — 1220 (IPv6) / 1240 (IPv4) at 1280. Ours tells the peer what to send; the peer's,
+  lowered on the way in, caps what smoltcp sends. TCP never relies on IP fragmentation (RFC 8900), the MSS clamping any
+  tunnel endpoint does (RFC 4459 §3.2); counted in `tcp_mss_clamped`.
+- **Stream semantics** mirror `std::net::TcpStream` (§16): `read` → `Ok(n)`; `Ok(0)` at EOF, i.e. smoltcp's
+  `RecvError::Finished` (the peer's FIN after everything before it); `Io(ConnectionReset)` for a socket closed without
+  a FIN (`RecvError::InvalidState`); `Error::Timeout` per the read timeout. `write` → the bytes the send buffer took,
+  waiting while it is full; on every error nothing was queued (the `io::Write` contract TLS relies on): `Timeout`,
+  `Io(BrokenPipe)` after `shutdown`, `Io(ConnectionReset)` after a RST. `shutdown` = FIN (`Socket::close`), after which
+  our reads are EOF and writes `BrokenPipe` (as after `shutdown(Both)`); idempotent, and `Ok` on a connection or stack
+  that is already down. `set_nodelay` = `set_nagle_enabled(false)` (Nagle is on by default, as on the OS); a zero
+  timeout is `InvalidInput`, as in std.
+- **Buffers.** `TCP_BUFFER_BYTES` = 32 KiB each way: the advertised window stays below 64 KiB (no window scaling) and
+  one `write` queues at most that much — a 64 KiB SIP message goes out in pieces as the peer acknowledges. No
+  congestion controller is compiled in (smoltcp's `NoControl`), so the peer's window is the only limit and the 32 KiB
+  buffer bounds a burst.
+- **Reaper.** Dropping a stream closes it gracefully (FIN; queued data still goes out first) and marks its socket
+  orphaned. The stack thread's per-poll TCP housekeeping frees an orphan once it is CLOSED with no 4-tuple left
+  (TIME-WAIT expired — smoltcp's lasts 10 s — LAST-ACK acknowledged, reset, or its abort RST sent) and resets one still
+  lingering after `TCP_ORPHAN_LINGER` (60 s): smoltcp never times out FIN-WAIT-2 or LAST-ACK on its own. The same pass
+  puts a backlog slot that smoltcp closed back into LISTEN.
+- **Close.** `State::shutdown` removes every TCP socket (nothing can be sent any more); the parked calls were already
+  failed by `tcp_wake` (§17.6), and later ones fail from `StackShared::closed` before they look for their socket.
+- **No retransmission give-up.** smoltcp retransmits unacknowledged data for ever (there is no RFC 1122 §4.2.3.5 R2)
+  and no keep-alive is set, so a connection whose peer vanished without a FIN or RST — a middlebox that forgot the
+  flow, say — stays ESTABLISHED: reads time out, writes go on filling the send buffer. Callers bound that themselves;
+  the SIP transport over these streams (rsipstack `transport/custom_tcp.rs`) closes a connection nothing has arrived on
+  for five minutes. Likewise a connection request from a 4-tuple that one of our sockets still holds (TIME-WAIT, or a
+  half-open connection whose peer restarted on the same source port) is dropped until that socket is gone — smoltcp
+  sends no RFC 5961 challenge ACK that would let the peer reset it.
+- **Counters** (`StackStats`): `tcp_connections_opened`, `tcp_accepted`, `tcp_tx_bytes`, `tcp_rx_bytes`, `tcp_sockets`
+  (gauge: streams, backlog slots, orphans), `tcp_dup_syn_drops`, `tcp_mss_clamped`.
+- **A smoltcp 0.14 quirk met on the way:** `has_solicited_node` compares only the low 16 bits of a destination with each
+  inner address and never checks the `ff02::1:ff00:0/104` prefix, so an IPv6 packet for ANY address ending in the same
+  16 bits as one of ours is taken as ours (a SYN to it is answered with a RST from that foreign address). Harmless behind
+  an ePDG, which routes only our own addresses to us; the tests avoid such addresses.
+- **Tests** (two-stack loopback, `ipstack::stack::tests::tcp_*`): connect/accept and echo both ways over IPv6 and IPv4
+  with exact endpoints; 100 KiB each way with every segment exactly wire-sized, no fragmentation, the clamped MSS in
+  both SYNs and the writer blocked at exactly 64 KiB until the peer reads; EOF after the peer's shutdown, EOF/BrokenPipe
+  after our own; the read timeout and a timeout-less read woken by data; a refused connect within a second; a connect
+  timing out over a blackholed path and working once it is back; `accept_timeout` → `None`; the backlog (two pending,
+  the third refused, refilled on accept); `AddrInUse`; a lost SYN-ACK recovered by retransmission with exactly one
+  connection, and a retransmitted SYN injected by hand dropped with one ISN; the reaper (LAST-ACK at once, TIME-WAIT
+  after 10 s); a dropped listener resetting its pending connection; a close failing a blocked read, write, accept and
+  connect within a second, also while the stack thread sits in a 1.5 s sink stall. `frag`: the MSS clamp both families,
+  idempotence, corrupt / non-SYN / fragment / malformed-option segments untouched. Plus the shared `exercise_tcp` and
+  `exercise_tcp_write_timeout` of §16 on both backends.
+
 ## 12. Tunnel facade (`tunnel.rs`)
 ```rust
 pub struct TunnelInfo { pub local_addr: SocketAddr, /* at establishment; see local_addr() */ pub remote_addr: SocketAddr,
@@ -736,6 +841,8 @@ impl EpdgTunnel {
     pub fn info(&self) -> &TunnelInfo;
     pub fn bind_udp(&self, local_port: u16) -> Result<InnerUdpSocket>;   // 0 = pick free (49152..65535); smoltcp picks the source address by route
     pub fn resolve(&self, name: &str, timeout: Duration) -> Result<Vec<IpAddr>>; // smoltcp DNS socket over the assigned servers
+    pub fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> Result<InnerTcpStream>; // inner TCP (§11.2)
+    pub fn listen_tcp(&self, local_port: u16) -> Result<InnerTcpListener>;                    // 0 = ephemeral (§11.2)
     pub fn is_alive(&self) -> bool;
     pub fn local_addr(&self) -> SocketAddr;                             // the outer socket's CURRENT address (moves with §17.1)
     pub fn peer_mobike(&self) -> bool;                                  // the responder announced MOBIKE_SUPPORTED (RFC 4555 §3.1)
@@ -781,8 +888,9 @@ leave threads, the outer socket and the inner stack running for the life of the 
 next candidate. The timer thread also runs the one-way-traffic probe (§17.5).
 Lock order, never taken in any other: `request_lock` → the transport's socket lock (brief) → `ike` → `pending`;
 `path.inner` is a leaf. `stats()` takes `last_rx` and the inner stack's `state`, and never `ike` — it may be called
-from a thread that already holds it. Inside the inner stack the order is `state` → `wakers`; `InnerStack::close` takes
-`closed`, then `wakers`, then `state`, never two of them at once across the boundary (§17.6).
+from a thread that already holds it. Inside the inner stack the order is `state` → `wakers`, and `tcp_events` is a leaf
+(the stack thread bumps it holding `state`; a TCP call never holds it and `state` at once); `InnerStack::close` takes
+`closed`, then `wakers`, then `tcp_events`, then `state`, never two of them at once across the boundary (§17.6).
 Teardown: `close()` sets `closing` (not `stop`) and wakes the path thread *before* its DELETE(IKE), so closing never
 waits out a retransmit schedule while the rx thread stays alive to deliver the DELETE's response; then `stop`, then
 the stack is closed with the reason `"tunnel closed by request"` — see §17.6 for the whole death chain.
@@ -800,7 +908,8 @@ v4+v6 with exact endpoints, off-prefix routing, IPv4 and IPv6 3000-byte datagram
 delivered in full, send_to-then-drop still transmitted, send-buffer-full counted, `InnerUdpSocket` shared between a receiver
 thread and senders (Send + Sync), bind_udp(0) allocation/duplicates/unbind-on-drop, queue bounds, resolve AAAA+A / family skip /
 NXDOMAIN / caller timeout / silent server beyond smoltcp's 10 s give-up (Timeout, not Protocol) / non-unicast servers skipped /
-input errors, stop semantics, stack-thread panic closes the stack;
+input errors, stop semantics, stack-thread panic closes the stack; inner TCP (§11.2: connect/accept/echo, 100 KiB without
+fragmentation, backlog, duplicate SYNs, reaper, timeouts, close semantics) and the MSS clamp;
 config parsing of `tests/fixtures/tmobile_prod_bundle.plist` + `tmobile_creds.plist` (assert every mapped field);
 mobility and liveness (§17, all offline): the MOBIKE notify constants and their status-vs-error range (including that
 16403/16404 are *not* MOBIKE), NAT-D hashed with the real SPIr, `build_address_update` payload order and hashes (with
@@ -905,18 +1014,17 @@ CP(40):   00 00 00 28 | 01 00 00 00 | 00 01 00 00 | 00 08 00 00 | 00 03 00 00 | 
 ## 16. `NetStack` — one socket/DNS abstraction over the OS stack and the tunnel (2026-09-11)
 
 Purpose: application code (the SIP client) is written once against `epdg::netstack::NetStack` and runs unchanged over the host
-OS stack or inside the ePDG tunnel. Object-safe (consumers hold `Arc<dyn NetStack>`), synchronous. UDP + DNS on both backends;
-TCP is real on the OS backend and **not yet supported on the tunnel** (smoltcp has `socket::tcp`, wiring it to the stack thread
-is deferred).
+OS stack or inside the ePDG tunnel. Object-safe (consumers hold `Arc<dyn NetStack>`), synchronous. UDP, TCP (connections and
+listeners) and DNS on both backends: the OS sockets, or the inner stack's smoltcp sockets (TCP since 2026-11-03, §11.2).
 
 ```rust
 // src/netstack/mod.rs
 pub trait NetStack: Send + Sync {
     /// Bind a UDP socket on `local_port` (0 = ephemeral).
     fn bind_udp(&self, local_port: u16) -> io::Result<Box<dyn UdpSocketLike>>;
-    /// Open a TCP connection to `remote` within `timeout`. Tunnel backend: `Err(ErrorKind::Unsupported)` for now.
+    /// Open a TCP connection to `remote` within `timeout` (v4-mapped = IPv4): `TimedOut` unanswered, `ConnectionRefused` on a RST.
     fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> io::Result<Box<dyn TcpStreamLike>>;
-    /// Listen for TCP connections on `local_port` (0 = ephemeral). Tunnel backend: `Err(ErrorKind::Unsupported)` for now.
+    /// Listen for TCP connections on `local_port` (0 = ephemeral); a port with a listener already is `AddrInUse`.
     fn listen_tcp(&self, local_port: u16) -> io::Result<Box<dyn TcpListenerLike>>;
     /// Resolve `host` to A/AAAA addresses with THIS stack's resolver, within `timeout`. IP literals return immediately.
     fn resolve(&self, host: &str, timeout: Duration) -> io::Result<Vec<IpAddr>>;
@@ -978,33 +1086,43 @@ Implementations:
   clamps a zero timeout to 1 ms (std rejects 0 with `InvalidInput`). `shutdown` maps `ENOTCONN` to `Ok(())`. `local_addrs` also
   omits a link-local egress address (`fe80::/10`, `169.254/16`: unusable as Via/Contact without its zone). The OS's maximum
   datagram size applies to `send_to` (macOS default 9216 bytes, `EMSGSIZE` beyond) whereas the tunnel fragments up to ~64 KiB.
-- **`EpdgTunnel: NetStack`** — `bind_udp` / `resolve` / `local_addrs` delegate to the tunnel (DNS = smoltcp's DNS socket over the
-  assigned tunnel servers; the libc resolver cannot reach tunnel-internal servers); `connect_tcp` / `listen_tcp` return
-  `Err(io::ErrorKind::Unsupported, "TCP over the ePDG tunnel is not implemented yet")`. `InnerUdpSocket: UdpSocketLike`.
-  **`InnerStack: NetStack`** too (same delegation) so the trait is testable offline over the two-stack loopback harness.
+- **`EpdgTunnel: NetStack`** — `bind_udp` / `resolve` / `local_addrs` / `connect_tcp` / `listen_tcp` delegate to the tunnel (DNS
+  = smoltcp's DNS socket over the assigned tunnel servers — the libc resolver cannot reach tunnel-internal servers; TCP = the
+  inner stack's smoltcp TCP sockets, §11.2; a v4-mapped `connect_tcp` destination is IPv4, as for `send_to`).
+  `InnerUdpSocket: UdpSocketLike`, `InnerTcpStream: TcpStreamLike` (a read timeout expires as `TimedOut`),
+  `InnerTcpListener: TcpListenerLike` (`local_addr` = the first inner address + port). **`InnerStack: NetStack`** too (same
+  delegation) so the trait is testable offline over the two-stack loopback harness.
 - Error mapping `epdg::Error → io::Error` (`netstack::to_io`): `Io(e)` → `e`; `Timeout` → `TimedOut`; `Closed` → `NotConnected`;
   `Config`/`Unsupported` → `InvalidInput`; everything else → `Other`; the crate error is kept as the payload
   (`io::Error::new(kind, e)`: `io::Error::get_ref()` / `into_inner()` downcast to `epdg::Error`; `Display` is the crate error's —
   note `std::error::Error::source()` on the `io::Error` is `None`). Conditions a caller branches on have the same kind on both
-  backends: a taken port in `bind_udp` is `AddrInUse` (`InnerStack::bind_udp` returns `Error::Io(AddrInUse)` for it), a name that
-  does not exist is `NotFound` (the tunnel's `Error::Protocol("DNS query failed …" | "… returned no addresses")` is mapped to
+  backends: a taken port in `bind_udp` / `listen_tcp` is `AddrInUse` (`InnerStack::bind_udp` / `listen_tcp` return
+  `Error::Io(AddrInUse)` for it), a refused connect `ConnectionRefused`, an unanswered one `TimedOut`, a reset connection
+  `ConnectionReset`, a write after `shutdown` `BrokenPipe` (the inner stack returns those as `Error::Io` / `Error::Timeout`), a name
+  that does not exist is `NotFound` (the tunnel's `Error::Protocol("DNS query failed …" | "… returned no addresses")` is mapped to
   `NotFound` by the `resolve` impls; other `Protocol` errors stay `Other`). Scoped IPv6 literals (`fe80::1%lo0`) are rejected with
   `InvalidInput` ("scoped IPv6 literal … not supported": an `IpAddr` cannot carry the zone).
 - Exports: `epdg::netstack::{NetStack, UdpSocketLike, TcpStreamLike, TcpListenerLike, StreamIo, StdNetStack}` and the same from `epdg::`.
 
 Tests: one generic `fn exercise_udp<S: NetStack + ?Sized>(a: &S, b: &S)` run over BOTH backends (bind two sockets, send both ways,
 echo, `recv_timeout` → `None` on silence, `local_addr` port matches, `local_addrs` non-empty, ephemeral ports distinct, usable through
-`Arc<dyn NetStack>`), plus `exercise_tcp` on std: listen on loopback, connect with timeout, write/read both ways through
-`Arc<dyn TcpStreamLike>` from two threads, read timeout → `WouldBlock|TimedOut`, EOF after peer shutdown, `accept_timeout` → `None`
-on silence, `StreamIo` wraps a stream as `Read + Write`, connect to a closed port → error within the timeout. std resolve:
+`Arc<dyn NetStack>`), and likewise a generic `exercise_tcp(a, b)` over BOTH backends (loopback `StdNetStack`s, the two-stack
+loopback in both directions and through `Arc<dyn NetStack>`): `b` listens, `a` connects to `b`'s first local address while the
+acceptor waits, `AddrInUse` on a second listener, the addresses on both ends, write/read both ways through `Arc<dyn TcpStreamLike>`
+from two threads, read timeout → `WouldBlock|TimedOut`, a zero timeout → `InvalidInput`, EOF after peer shutdown, idempotent
+shutdown, write after shutdown fails, `accept_timeout` → `None` on silence, `StreamIo` wraps a stream as `Read + Write`, connect
+to a closed port → error within the timeout, a zero connect budget is not `InvalidInput`; and `exercise_tcp_write_timeout(a, b)`
+(the `io::Write` contract under a write timeout, then a 1 MiB `write_all` to a draining peer) on both. std resolve:
 `resolve("localhost")` contains a loopback; IP literal without the resolver; invalid label errors; a too-short timeout returns
-promptly (`TimedOut` or a fast error). Tunnel: `resolve` over the fake DNS server returns the fake answer; `connect_tcp` /
-`listen_tcp` → `Err(Unsupported)`; after close `recv_timeout` → `Err(NotConnected)`; NXDOMAIN → `NotFound`; a v4-mapped `send_to`
-destination is delivered as IPv4. std extras: `Duration::MAX` `recv_timeout`/`accept_timeout` woken by a send/connect (no panic);
+promptly (`TimedOut` or a fast error). Tunnel: `resolve` over the fake DNS server returns the fake answer; after close
+`recv_timeout`, TCP read/write/accept and new `connect_tcp` / `listen_tcp` → `Err(NotConnected)` (shutdown stays `Ok`);
+NXDOMAIN → `NotFound`; a v4-mapped `send_to` destination is delivered as IPv4 and a v4-mapped `connect_tcp` connects over IPv4. std extras: `Duration::MAX` `recv_timeout`/`accept_timeout` woken by a send/connect (no panic);
 a write under a write timeout never loses or duplicates bytes (delivered == reported); `shutdown` after peer EOF is `Ok`;
 `connect_tcp(_, ZERO)` is not `InvalidInput`; `HandshakeError<StreamIo>: Error`. `epdg-connect` performs its P-CSCF lookup and the
 DNS round trip through `&dyn NetStack` and asserts `name() == "epdg-tunnel"`, `local_addrs()` == the assigned inner addresses and
-`bind_udp` (incl. `AddrInUse` on a taken port) so the live run covers the `EpdgTunnel` implementation.
+`bind_udp` (incl. `AddrInUse` on a taken port) so the live run covers the `EpdgTunnel` implementation; `--tcp-probe` (passed by
+`live_tmobile_tunnel`) also opens one `connect_tcp` to the resolved P-CSCF on the `pcscf-address` port and prints `TCP-PROBE ok
+local=… peer=… in=<ms>` or `TCP-PROBE-FAILED <reason>` — reported, never asserted, since whether the P-CSCF takes TCP is unknown.
 
 ## 17. Mobility and liveness (`tunnel.rs`, `ike/transport.rs`, `ike/session.rs`)
 
@@ -1393,14 +1511,17 @@ mark_dead(reason)
        → every UDP sender dropped
           → a blocked InnerUdpSocket::recv_timeout returns RecvTimeoutError::Disconnected AT ONCE
             (not at its own timeout) → Error::Closed(reason)
+       → the TCP event counter moved (§11.2)
+          → a TCP read / write / accept / connect parked on it re-reads `closed` AT ONCE → Error::Closed(reason)
        → State::shutdown  (cancels the smoltcp queries / sockets; may wait for the poll in progress)
   → netstack::to_io → io::ErrorKind::NotConnected, the reason still in the error's Display
   → CustomUdpConnection::serve_loop logs it and returns Ok(())
   → TransportLayer::serve_connection emits TransportEvent::Closed
 ```
 
-Afterwards `InnerUdpSocket::send_to`, `InnerStack::bind_udp` / `resolve` and `EpdgTunnel::bind_udp` / `resolve` all
-fail with the same `Error::Closed(reason)`; `push_rx` is a no-op. The sender-drop wake-up is load-bearing: any
+Afterwards `InnerUdpSocket::send_to`, `InnerStack::bind_udp` / `resolve` / `connect_tcp` / `listen_tcp`, every call on an
+`InnerTcpStream` / `InnerTcpListener` (but `shutdown`, which stays `Ok`) and `EpdgTunnel::bind_udp` / `resolve` /
+`connect_tcp` / `listen_tcp` all fail with the same `Error::Closed(reason)`; `push_rx` is a no-op. The sender-drop wake-up is load-bearing: any
 refactor that keeps a clone of a binding's `SyncSender` alive (stashing it for stats, say) silently turns an immediate
 close into one that waits out the caller's timeout.
 
@@ -1408,7 +1529,8 @@ The reason and the wake-ups live **outside** the stack's `State` mutex (`StackSh
 `StackShared::wakers`) for a second load-bearing reason: the stack thread holds `State` across a whole `poll`, and a
 poll drives the TX sink — a blocking outer ESP send, up to the socket's write timeout *per packet*. A close that had to
 take that mutex first could not publish the death, let alone wake a parked receiver, for seconds. `recv_timeout` reads
-the reason from the same place, so it never blocks behind the poll either.
+the reason from the same place, so it never blocks behind the poll either — and so does a parked TCP call, which is why
+those park on their own counter (`StackShared::tcp_events`) rather than on a condvar tied to `state` (§11.2).
 
 That hold is bounded at both ends, because everything else on the stack — `push_rx` (the thread that also delivers IKE
 responses, so a long hold eats into the 15.5 s retransmit budget of an outstanding DPD or address update), `bind_udp`,
@@ -1442,12 +1564,13 @@ cancellation token for the send path would only pre-empt a poll the receive side
 truncate the buffered-datagram drain noted in §17.8.) The connection keeps
 reporting `Transport::Udp` and `is_reliable() == false`, so retransmission stays the transaction layer's job.
 
-**The chain currently ends there.** In the embedder (`rustpush/src/ims.rs`, out of scope for this crate) the event
-reaches `take_down_closed_connection`, whose first statement returns early for `Transport::Udp` — which is what a
-tunnelled connection reports. So `TransportEvent::Closed` is emitted and dropped: no `del_connection`, no transaction
-termination, no reconnect. Even with that filter lifted, the reconnect path re-binds on the *same* `Arc<EpdgTunnel>`,
-which is dead and answers `Closed` forever; a dead tunnel needs a fresh `EpdgTunnel::connect`, which no code path
-performs today. Until both are addressed on that side, everything above is correct but inert end to end.
+In the embedder (`rustpush/src/ims.rs`, out of scope for this crate) the event reaches `take_down_closed_connection`,
+which treats the tunnel's `CustomUdp` connection like a dropped TCP/TLS flow: it is removed from the transport layer,
+every pending transaction is ended (a client one with a synthesized 503), and `reconnect()` asks the line's connector
+for a new connection — which replaces the dead tunnel with a fresh `EpdgTunnel::connect` — then moves the media sockets'
+network and the SIP TCP listener (§11.2) onto it and re-registers. The SIP TCP connections of §11.2 die with the tunnel
+as well; the embedder ignores their `Closed` events (rsipstack forgets each closed one itself), so the UDP socket's
+death is the one signal that rebuilds the line.
 
 ### 17.7 Tunables
 
@@ -1546,6 +1669,18 @@ mistaken for the other. `tests/live_tmobile.rs::live_tmobile_address_update` par
 duplicate marker). The pure `tick` logic is unit-tested on its own (`a_forced_move_*`).
 
 ## 15. Amendment log
+- 2026-11-03 (§11.2 added — inner TCP): `InnerStack::connect_tcp` / `listen_tcp` with `InnerTcpStream` / `InnerTcpListener`
+  (blocking adapters over smoltcp TCP sockets in the stack's `SocketSet`, parked on a TCP event counter outside `state` so a
+  close wakes them at once, §17.6), `EpdgTunnel::connect_tcp` / `listen_tcp`, and both `NetStack` impls now real for TCP
+  (`TUNNEL_TCP_UNSUPPORTED` and the `Unsupported` path are gone). Listener = a 2-socket backlog refilled on accept; a reaper
+  frees dropped streams after their close handshake (RST after 60 s). Two packet-path additions it needed: the device clamps
+  the MSS of every TCP SYN, both directions, to the wire MTU (smoltcp sized TCP segments from the 16 KB stack MTU of §11.1,
+  so every full IPv4 segment exceeded its own 8 KiB reassembly buffer), and `push_rx` drops a retransmitted SYN for a
+  connection already held (smoltcp's first-match socket dispatch would otherwise let a spare listening slot answer it).
+  `StackStats` gained seven `tcp_*` counters and `DeviceStats` `tcp_mss_clamped` (additive; both remain `Copy + Default`).
+  `epdg-connect --tcp-probe` (used by `live_tmobile_tunnel`, reported only). The §0 "not implemented: inner TCP" is struck.
+  Review: §11.2 now states smoltcp's missing retransmission give-up and challenge ACK (callers bound idle/dead streams;
+  the SIP transport closes one nothing arrived on for five minutes); §17.6's account of the embedder brought up to date.
 - 2026-09-15 (round-7 review of the rewrite below — no new mechanisms, seven behaviour fixes): (a)
   `abort_request(transmitted)`: a request whose send the host refused put nothing on the wire, yet its id was flagged
   as abandoned, so the retry on that id refused the gateway's *genuine* answer — a wasted exchange, an orphaned child

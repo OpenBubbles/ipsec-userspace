@@ -4,7 +4,8 @@
 //! authentication (RFC 5998) carrying EAP-TLS (RFC 5216 / RFC 9190), tunnel-mode
 //! ESP (RFC 4303) encapsulated in UDP (RFC 3948), and an inner IPv4/IPv6 stack
 //! (smoltcp over the ESP data plane) so callers can talk to hosts inside the tunnel
-//! (UDP sockets, DNS). No raw sockets, no kernel IPsec, no privileges.
+//! (UDP sockets, TCP connections and listeners, DNS). No raw sockets, no kernel IPsec,
+//! no privileges.
 //!
 //! Driven entirely by a carrier-bundle style [`Config`] (see `docs/DESIGN.md`); the
 //! algorithm set is a registry (`crypto::registry`) so new transforms can be added
@@ -16,7 +17,7 @@
 //! - [`ike`]     — IKEv2 wire codec, key derivation, initiator state machine, transport
 //! - [`eap`]     — EAP framing and the EAP-TLS method (OpenSSL-backed)
 //! - [`esp`]     — ESP codec, anti-replay, UDP encapsulation
-//! - [`ipstack`] — inner IP stack: smoltcp `Medium::Ip` device over ESP + stack thread (UDP, DNS)
+//! - [`ipstack`] — inner IP stack: smoltcp `Medium::Ip` device over ESP + stack thread (UDP, TCP, DNS)
 //! - [`tunnel`]  — the public facade: `EpdgTunnel::connect(&Config)`, MOBIKE / RFC 7296 §2.23
 //!   address updates, path monitoring and liveness (DESIGN §17)
 //! - [`netstack`] — `NetStack`: one UDP/TCP/DNS abstraction over the OS stack (`StdNetStack`) and the tunnel
@@ -36,4 +37,4 @@ pub mod tunnel;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use netstack::{NetStack, StdNetStack, StreamIo, TcpListenerLike, TcpStreamLike, UdpSocketLike};
-pub use tunnel::{EpdgTunnel, InnerUdpSocket, TunnelInfo};
+pub use tunnel::{EpdgTunnel, InnerTcpListener, InnerTcpStream, InnerUdpSocket, TunnelInfo};

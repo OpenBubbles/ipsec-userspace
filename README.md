@@ -10,17 +10,21 @@ carrier-bundle style configuration. Verified live against T-Mobile's production 
   rustls cannot offer (see `docs/DESIGN.md` §9.3), so the TLS engine is the `openssl` crate.
 - Tunnel-mode **ESP** (RFC 4303) encapsulated in UDP/4500, anti-replay window, AES-256-CBC + HMAC-SHA2-256-128.
 - Inner IP stack = **smoltcp 0.14** over the ESP data plane (a `Medium::Ip` device: the tunnel-mode ESP payload *is* the IP
-  packet): IPv4/IPv6, inner UDP sockets (`EpdgTunnel::bind_udp`), a DNS resolver over the assigned servers
-  (`EpdgTunnel::resolve`), IPv4 fragmentation/reassembly, ICMP echo replies; a small shim (`ipstack::frag`) fragments and
-  reassembles IPv6 for the wire MTU, which smoltcp 0.14 cannot do on `Medium::Ip`; TCP sockets are one method away in the same `SocketSet`.
+  packet): IPv4/IPv6, inner UDP sockets (`EpdgTunnel::bind_udp`), inner **TCP** connections and listeners
+  (`EpdgTunnel::connect_tcp` / `listen_tcp`: blocking `InnerTcpStream` / `InnerTcpListener` over smoltcp TCP sockets, a
+  small listen backlog, graceful close with a reaper, and the MSS of every SYN clamped to the wire MTU so no segment is
+  ever fragmented — `docs/DESIGN.md` §11.2), a DNS resolver over the assigned servers (`EpdgTunnel::resolve`), IPv4
+  fragmentation/reassembly, ICMP echo replies; a small shim (`ipstack::frag`) fragments and reassembles IPv6 for the wire
+  MTU, which smoltcp 0.14 cannot do on `Medium::Ip`.
 - **Mobility and liveness** (`docs/DESIGN.md` §17): the egress route is watched (or reported by the caller through
   `EpdgTunnel::network_changed()`); an address change rebinds the outer socket — same SAs, same keys, new 5-tuple — and
   announces it with MOBIKE `UPDATE_SA_ADDRESSES` (RFC 4555) or, against a gateway without MOBIKE, with the RFC 7296
   §2.23 dynamic address update, tolerating a 30 s outage — retransmission exhaustion included — before giving up. A
   DPD-independent one-way-traffic probe notices a gateway that stopped answering, even when nothing was ever received,
   a slower idle probe covers a registration that never transmits at all, and an unrecoverable tunnel fails every inner
-  socket with `NotConnected` at once, so the SIP transport above closes its connection instead of hanging. (Acting on that close — rebuilding the tunnel — is the embedder's job; see
-  `docs/DESIGN.md` §17.6 for where the chain currently ends.)
+  socket — UDP receivers and blocked TCP reads, writes, accepts and connects alike — with `NotConnected` at once, so the
+  SIP transport above closes its connection instead of hanging. (Acting on that close — rebuilding the tunnel — is the embedder's job; see
+  `docs/DESIGN.md` §17.6 for how the chain continues there.)
 - Crypto for IKE/ESP via RustCrypto (`aes`/`cbc`/`hmac`/`sha2`) and `num-bigint` MODP DH, behind a transform registry
   (`crypto::registry`) so more algorithms can be added without touching protocol code.
 
@@ -57,8 +61,8 @@ tunnel.close()?;                                         // INFORMATIONAL DELETE
 ## NetStack
 
 `epdg::NetStack` (DESIGN.md §16) is one synchronous, object-safe socket/DNS abstraction implemented by both the host
-OS stack (`StdNetStack`: `std::net` sockets + the libc resolver) and the tunnel (`EpdgTunnel`: inner UDP sockets + the
-smoltcp DNS socket over the gateway-assigned servers). Application code — a SIP client, say — is written once against
+OS stack (`StdNetStack`: `std::net` sockets + the libc resolver) and the tunnel (`EpdgTunnel`: inner UDP and TCP sockets +
+the smoltcp DNS socket over the gateway-assigned servers). Application code — a SIP client, say — is written once against
 `&dyn NetStack` / `Arc<dyn NetStack>` and runs unchanged on either:
 
 ```rust
@@ -82,9 +86,10 @@ ping(&tunnel, "ueb2bprod.pc.t-mobile.com", 5060, b"OPTIONS ...")?;   // same cod
 
 `local_addrs()` gives the addresses the stack sources traffic from (SIP Via/Contact): the tunnel's inner addresses, or
 for the OS stack the bind address / the route-selected egress address per family. TCP (`connect_tcp`, `listen_tcp`,
-`TcpStreamLike` shared between a reader and a writer thread, `StreamIo` as `Read + Write` for TLS) is **std-only for
-now**: the tunnel returns `ErrorKind::Unsupported` until smoltcp's TCP socket is wired to the stack thread. Crate errors
-are mapped to `io::Error` by `netstack::to_io` (`Timeout` → `TimedOut`, `Closed` → `NotConnected`).
+`TcpStreamLike` shared between a reader and a writer thread, `StreamIo` as `Read + Write` for TLS) works on both: over
+the tunnel it is smoltcp's TCP driven by the inner stack's thread (DESIGN.md §11.2), with the same error kinds as the
+OS (`TimedOut`, `ConnectionRefused`, `ConnectionReset`, `BrokenPipe`, `AddrInUse`). Crate errors are mapped to
+`io::Error` by `netstack::to_io` (`Timeout` → `TimedOut`, `Closed` → `NotConnected`).
 
 CLI (stable path — handy for per-application firewall rules):
 
@@ -92,6 +97,7 @@ CLI (stable path — handy for per-application firewall rules):
 cargo build --bin epdg-connect
 RUST_LOG=info ./target/debug/epdg-connect            # connect, resolve the P-CSCF over the tunnel, DPD, hold, DELETE
 ./target/debug/epdg-connect --hold 30 --rebind-after 8    # force one address update 8 s into the hold and prove it landed
+./target/debug/epdg-connect --tcp-probe                   # also open one inner TCP connection to the P-CSCF (TCP-PROBE line)
 ./target/debug/epdg-connect probe-tls <ClientHello hex>   # diagnostic: see which TLS suite the EAP server picks
 ```
 
@@ -107,14 +113,20 @@ The inner stack is tested offline with an in-process **two-stack loopback** (`ip
 on different IPv6 /64s (+ a v4 /32 each) whose device sinks feed each other — UDP both ways with exact endpoints,
 off-prefix routing, 3000-byte IPv4 and IPv6 datagrams fragmented at the wire MTU 1280 and reassembled, ICMP echo,
 bursts and fire-and-forget sends, `resolve()` against a tiny in-process DNS server on the far stack's port 53, timeouts,
-port allocation, queue bounds, shutdown semantics. The `NetStack` abstraction runs one generic UDP exercise over both
-backends (loopback `StdNetStack`s and the two-stack loopback), the TCP exercise on `StdNetStack` over loopback, and the
-libc resolver against `localhost` only.
+port allocation, queue bounds, shutdown semantics, and inner TCP: connect/accept and echo over both families, 100 KiB
+each way with every segment exactly wire-sized (MSS clamped, nothing fragmented) and the writer held back by the
+window, the listen backlog, lost SYN-ACKs and duplicate SYNs, the reaper, timeouts, and a close failing every blocked
+TCP call at once — even while the stack thread is stuck in a slow send. The `NetStack` abstraction runs one generic UDP
+exercise and one generic TCP exercise (plus the write-timeout contract TLS relies on) over both backends (loopback
+`StdNetStack`s and the two-stack loopback), and the libc resolver against `localhost` only.
 
 `tests/live_tmobile.rs` drives `target/debug/epdg-connect` (stable path, so one firewall rule keeps working across rebuilds; set `EPDG_LIVE_INPROCESS=1` to run the tunnel inside the test process instead). It connects to the T-Mobile PROD ePDG with the fixture credentials, asserts an inner address,
 resolves `ueb2bprod.pc.t-mobile.com` through `&dyn NetStack` (smoltcp DNS over ESP — proves ESP in both directions and covers the tunnel's `NetStack` implementation),
-runs a DPD, observes NAT-T keepalives, and tears down cleanly. It needs UDP egress on 500/4500; a per-application
-firewall (e.g. Little Snitch) must allow the test binary or `target/debug/epdg-connect`.
+runs a DPD, observes NAT-T keepalives, and tears down cleanly. It also passes `--tcp-probe`, which opens one inner TCP
+connection to the resolved P-CSCF on the port of the config's `pcscf-address` and prints `TCP-PROBE ok local=… peer=…
+in=<ms>` or `TCP-PROBE-FAILED <reason>` — printed by the test, never asserted, since whether the P-CSCF accepts TCP
+there is not known. It needs UDP egress on 500/4500; a per-application firewall (e.g. Little Snitch) must allow the
+test binary or `target/debug/epdg-connect`.
 
 `--rebind-after SECS` (off by default) exercises the mobility path without touching the network: that far into the
 hold it calls `EpdgTunnel::force_address_update()`, which makes the path monitor rebind the outer socket to a fresh
@@ -131,7 +143,7 @@ is a diagnostic knob rather than something to run under a registration you need.
 `config` · `crypto` (traits, AES-CBC, HMAC-SHA2, MODP DH, registry) · `ike` (header/payload/message/fragment codecs,
 keys, auth, nat, transport, `session::IkeInitiator` sans-I/O state machine) · `eap` (packet, tls) · `esp` (codec, replay)
 · `ipstack` (`device::EspDevice` — smoltcp `Medium::Ip` device over ESP; `stack::InnerStack` — `Interface` + `SocketSet`
-+ the single stack thread, `InnerUdpSocket`, `resolve`) · `tunnel` (threads: rx demux, stack, keepalive, DPD/rekey
++ the single stack thread, `InnerUdpSocket`, `InnerTcpStream` / `InnerTcpListener`, `resolve`) · `tunnel` (threads: rx demux, stack, keepalive, DPD/rekey
 timers; `EpdgTunnel` facade) · `netstack` (`NetStack` / `UdpSocketLike` / `TcpStreamLike` / `TcpListenerLike` traits,
 `StdNetStack`, the tunnel implementations). Design contract and the byte-level facts mirrored from the AOSP client: `docs/DESIGN.md`,
 `docs/AOSP_FACTS*.md`.
@@ -139,7 +151,8 @@ timers; `EpdgTunnel` facade) · `netstack` (`NetStack` / `UdpSocketLike` / `TcpS
 Threading of the inner stack (DESIGN.md §11): only the `epdg-stack` thread drives smoltcp (`Interface::poll`), behind
 one mutex + condvar. The ESP rx thread decapsulates and pushes the inner IP packet (`push_rx`, bounded queue,
 drop-oldest); `send_to` / `bind_udp` / `resolve` hold the lock only to enqueue and then notify; received datagrams
-reach `InnerUdpSocket::recv_timeout` through a bounded channel without touching the lock. smoltcp's compile-time
+reach `InnerUdpSocket::recv_timeout` through a bounded channel without touching the lock, and a blocked TCP call parks on
+a separate event counter the stack thread bumps after each poll that moved packets (so a close wakes it at once). smoltcp's compile-time
 limits are raised through Cargo features (8 addresses, 4 routes, 4 DNS servers, 8 DNS results, 8 KiB
 fragmentation/reassembly buffers); `child.inner_mtu` (default 1280) is the wire MTU, `child.inner_mtu_stack` (default
 16384) the MTU smoltcp sees — the device fragments outbound packets to the wire MTU and `push_rx` reassembles inbound

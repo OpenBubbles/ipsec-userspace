@@ -15,10 +15,21 @@
 //! - **RX** [`Ipv6Reassembler`]: IPv6 fragment sets are reassembled before the packet
 //!   reaches smoltcp (keyed by source, destination and Identification; bounded; timed
 //!   out). IPv4 fragments pass straight through — smoltcp reassembles those itself.
+//! - **TCP** [`clamp_tcp_mss`] (DESIGN.md §11.2): smoltcp derives the MSS it announces —
+//!   and the largest segment it sends — from the *stack* MTU, so left alone every full
+//!   TCP segment would leave as a set of IP fragments (and an IPv4 one larger than
+//!   smoltcp's 8 KiB reassembly buffer could never be put back together). The device
+//!   clamps the MSS option of every SYN, in both directions, to what fits the *wire* MTU,
+//!   so TCP never relies on fragmentation (RFC 8900). [`tcp_connection_request`] tells
+//!   the stack which inbound packets are connection requests.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::net::SocketAddr;
+use std::ops::Range;
 use std::time::{Duration, Instant};
+
+use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Packet, Ipv6Packet, TCP_HEADER_LEN, TcpPacket};
 
 /// Bytes of the IPv6 base header.
 pub const IPV6_HEADER_LEN: usize = 40;
@@ -174,6 +185,105 @@ fn fragment_ipv4(pkt: &[u8], wire_mtu: usize, ident: u16) -> Result<Vec<Vec<u8>>
         offset = end;
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// TCP: MSS clamping and connection requests (DESIGN.md §11.2)
+// ---------------------------------------------------------------------------
+
+/// TCP option kind of the Maximum Segment Size option (RFC 9293 §3.2), and its length.
+const TCP_OPTION_MSS: u8 = 2;
+const TCP_OPTION_MSS_LEN: usize = 4;
+
+/// The largest MSS that keeps a full TCP segment within `wire_mtu` without IP
+/// fragmentation: the MTU minus the *fixed* IP and TCP headers (RFC 6691 §2 — options are
+/// accounted for by the sender), i.e. 1220 (IPv6) / 1240 (IPv4) at the default 1280.
+pub fn tcp_mss_for_wire(wire_mtu: usize, ipv6: bool) -> u16 {
+    let ip = if ipv6 { IPV6_HEADER_LEN } else { IPV4_MIN_HEADER_LEN };
+    u16::try_from(wire_mtu.saturating_sub(ip + TCP_HEADER_LEN)).unwrap_or(u16::MAX)
+}
+
+/// Locate the TCP segment of `pkt`: `(source, destination, byte range, IPv6?)`. Only an
+/// IPv4 packet that is not a fragment and an IPv6 packet whose Next Header is TCP (no
+/// extension headers: smoltcp emits none, and a SYN that carries them is left alone).
+fn tcp_segment(pkt: &[u8]) -> Option<(IpAddress, IpAddress, Range<usize>, bool)> {
+    match pkt.first()? >> 4 {
+        4 => {
+            let ip = Ipv4Packet::new_checked(pkt).ok()?;
+            if ip.next_header() != IpProtocol::Tcp || ip.more_frags() || ip.frag_offset() != 0 {
+                return None;
+            }
+            let range = usize::from(ip.header_len())..usize::from(ip.total_len());
+            Some((IpAddress::Ipv4(ip.src_addr()), IpAddress::Ipv4(ip.dst_addr()), range, false))
+        }
+        6 => {
+            let ip = Ipv6Packet::new_checked(pkt).ok()?;
+            if ip.next_header() != IpProtocol::Tcp {
+                return None;
+            }
+            let range = IPV6_HEADER_LEN..IPV6_HEADER_LEN + usize::from(ip.payload_len());
+            Some((IpAddress::Ipv6(ip.src_addr()), IpAddress::Ipv6(ip.dst_addr()), range, true))
+        }
+        _ => None,
+    }
+}
+
+/// Offset of the 2-byte value of the MSS option in a TCP options block; `None` when the
+/// option is absent or the block is malformed (left for smoltcp to judge).
+fn mss_option_value_at(opts: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < opts.len() {
+        match opts[i] {
+            0 => return None, // End of Option List
+            1 => i += 1,      // No-Operation
+            kind => {
+                let len = usize::from(*opts.get(i + 1)?);
+                if len < 2 || i + len > opts.len() {
+                    return None;
+                }
+                if kind == TCP_OPTION_MSS {
+                    return (len == TCP_OPTION_MSS_LEN).then_some(i + 2);
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
+/// Lower the MSS option of a TCP SYN (or SYN-ACK) in `pkt` to [`tcp_mss_for_wire`] and
+/// fix the TCP checksum; returns the MSS it replaced, `None` when nothing changed (not
+/// TCP, not a SYN, no MSS option, already small enough, or a segment whose checksum does
+/// not verify — rewriting that would launder a corrupt packet past smoltcp's own check).
+///
+/// Applied to every packet the device transmits AND receives (§11.2): ours, so the peer
+/// never sends a segment that needs fragmenting on the way in; the peer's, so smoltcp —
+/// whose sending MSS is `min(stack MTU - 40/20 - 20, peer's MSS)` — never builds one on
+/// the way out. This is the MSS clamping every tunnel endpoint does (RFC 4459 §3.2).
+pub fn clamp_tcp_mss(pkt: &mut [u8], wire_mtu: usize) -> Option<u16> {
+    let (src, dst, range, ipv6) = tcp_segment(pkt)?;
+    let limit = tcp_mss_for_wire(wire_mtu, ipv6);
+    let mut tcp = TcpPacket::new_checked(pkt.get_mut(range)?).ok()?;
+    if !tcp.syn() || !tcp.verify_checksum(&src, &dst) {
+        return None;
+    }
+    let opts = tcp.options_mut();
+    let at = mss_option_value_at(opts)?;
+    let mss = u16::from_be_bytes([opts[at], opts[at + 1]]);
+    if mss <= limit {
+        return None;
+    }
+    opts[at..at + 2].copy_from_slice(&limit.to_be_bytes());
+    tcp.fill_checksum(&src, &dst);
+    Some(mss)
+}
+
+/// `(source, destination)` of a TCP connection request in `pkt` — SYN set, ACK clear
+/// (RFC 9293 §3.5) — or `None` for anything else.
+pub fn tcp_connection_request(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr)> {
+    let (src, dst, range, _) = tcp_segment(pkt)?;
+    let tcp = TcpPacket::new_checked(pkt.get(range)?).ok()?;
+    (tcp.syn() && !tcp.ack()).then(|| (SocketAddr::new(src.into(), tcp.src_port()), SocketAddr::new(dst.into(), tcp.dst_port())))
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +539,145 @@ mod tests {
 
     fn frag6(pkt: &[u8], ident: u32) -> Vec<Vec<u8>> {
         fragment_for_wire(pkt, MTU, ident).unwrap().expect("needs fragmentation")
+    }
+
+    const SRC4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 1);
+    const DST4: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 0, 0, 2);
+
+    /// An IPv6 or IPv4 TCP segment `src:40000 -> dst:5060` built by smoltcp (valid
+    /// checksums) with the given control, ACK, MSS option and payload.
+    fn tcp_packet(v6: bool, control: smoltcp::wire::TcpControl, ack: bool, mss: Option<u16>, payload: &[u8]) -> Vec<u8> {
+        use smoltcp::wire::{Ipv4Repr, Ipv6Repr, TcpRepr, TcpSeqNumber};
+        let caps = smoltcp::phy::ChecksumCapabilities::default();
+        let tcp = TcpRepr {
+            src_port: 40000,
+            dst_port: 5060,
+            control,
+            seq_number: TcpSeqNumber(1000),
+            ack_number: ack.then_some(TcpSeqNumber(77)),
+            window_len: 8192,
+            window_scale: Some(0),
+            max_seg_size: mss,
+            sack_permitted: true,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload,
+        };
+        let (src, dst) = if v6 { (IpAddress::Ipv6(SRC6), IpAddress::Ipv6(DST6)) } else { (IpAddress::Ipv4(SRC4), IpAddress::Ipv4(DST4)) };
+        let ip_len = if v6 { IPV6_HEADER_LEN } else { 20 };
+        let mut buf = vec![0u8; ip_len + tcp.buffer_len()];
+        if v6 {
+            let ip = Ipv6Repr { src_addr: SRC6, dst_addr: DST6, next_header: IpProtocol::Tcp, payload_len: tcp.buffer_len(), hop_limit: 64 };
+            ip.emit(&mut Ipv6Packet::new_unchecked(&mut buf));
+        } else {
+            let ip = Ipv4Repr { src_addr: SRC4, dst_addr: DST4, next_header: IpProtocol::Tcp, payload_len: tcp.buffer_len(), hop_limit: 64 };
+            ip.emit(&mut Ipv4Packet::new_unchecked(&mut buf), &caps);
+        }
+        tcp.emit(&mut TcpPacket::new_unchecked(&mut buf[ip_len..]), &src, &dst, &caps);
+        buf
+    }
+
+    /// The MSS option of the TCP segment in `pkt`, parsed back by smoltcp (which also
+    /// verifies the checksum).
+    fn parsed_mss(pkt: &[u8]) -> Option<u16> {
+        let caps = smoltcp::phy::ChecksumCapabilities::default();
+        let (src, dst, range, _) = tcp_segment(pkt).expect("a TCP segment");
+        let tcp = TcpPacket::new_checked(&pkt[range]).unwrap();
+        smoltcp::wire::TcpRepr::parse(&tcp, &src, &dst, &caps).expect("valid TCP segment (checksum included)").max_seg_size
+    }
+
+    #[test]
+    fn mss_for_the_wire_is_the_mtu_minus_the_fixed_headers() {
+        assert_eq!(tcp_mss_for_wire(1280, true), 1220);
+        assert_eq!(tcp_mss_for_wire(1280, false), 1240);
+        assert_eq!(tcp_mss_for_wire(1500, true), 1440);
+        assert_eq!(tcp_mss_for_wire(10, false), 0);
+        assert_eq!(tcp_mss_for_wire(1 << 20, true), u16::MAX);
+    }
+
+    #[test]
+    fn syn_mss_above_the_wire_limit_is_clamped_with_a_valid_checksum() {
+        use smoltcp::wire::TcpControl;
+        // smoltcp's own SYN at the 16384-byte stack MTU, both families, SYN and SYN-ACK.
+        for (v6, ack) in [(true, false), (true, true), (false, false), (false, true)] {
+            let mut pkt = tcp_packet(v6, TcpControl::Syn, ack, Some(16324), &[]);
+            assert_eq!(clamp_tcp_mss(&mut pkt, MTU), Some(16324), "v6={v6} ack={ack}");
+            assert_eq!(parsed_mss(&pkt), Some(if v6 { 1220 } else { 1240 }), "v6={v6} ack={ack}");
+            // Idempotent: a clamped SYN is left alone.
+            let before = pkt.clone();
+            assert_eq!(clamp_tcp_mss(&mut pkt, MTU), None);
+            assert_eq!(pkt, before);
+        }
+        // A peer's 1460 (IPv4 over Ethernet) is lowered too; an MSS that fits is kept.
+        let mut pkt = tcp_packet(false, TcpControl::Syn, true, Some(1460), &[]);
+        assert_eq!(clamp_tcp_mss(&mut pkt, MTU), Some(1460));
+        assert_eq!(parsed_mss(&pkt), Some(1240));
+        let mut small = tcp_packet(true, TcpControl::Syn, false, Some(536), &[]);
+        let before = small.clone();
+        assert_eq!(clamp_tcp_mss(&mut small, MTU), None);
+        assert_eq!(small, before);
+        // A larger wire MTU leaves more room.
+        let mut pkt = tcp_packet(true, TcpControl::Syn, false, Some(16324), &[]);
+        assert_eq!(clamp_tcp_mss(&mut pkt, 1400), Some(16324));
+        assert_eq!(parsed_mss(&pkt), Some(1340));
+    }
+
+    #[test]
+    fn mss_clamping_leaves_everything_else_untouched() {
+        use smoltcp::wire::TcpControl;
+        let check = |mut pkt: Vec<u8>, what: &str| {
+            let before = pkt.clone();
+            assert_eq!(clamp_tcp_mss(&mut pkt, MTU), None, "{what}");
+            assert_eq!(pkt, before, "{what}");
+        };
+        check(tcp_packet(true, TcpControl::None, true, None, b"data"), "a data segment");
+        check(tcp_packet(true, TcpControl::Syn, false, None, &[]), "a SYN without the MSS option");
+        check(ipv6_packet(100), "UDP");
+        check(ipv4_packet(100, 0), "UDP over IPv4");
+        check(vec![], "nothing");
+        check(vec![0x60; 10], "a runt");
+        // A corrupt SYN keeps its bad checksum (smoltcp drops it), it is not "repaired".
+        let mut corrupt = tcp_packet(true, TcpControl::Syn, false, Some(16324), &[]);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+        check(corrupt, "a SYN with a bad checksum");
+        // IPv4 fragments are not TCP headers.
+        let mut frag = tcp_packet(false, TcpControl::Syn, false, Some(16324), &[]);
+        frag[6] = 0x20; // MF
+        check(frag, "an IPv4 fragment");
+        // Malformed options (an MSS option claiming length 0, checksum recomputed so
+        // only the options are wrong) are left for smoltcp to judge.
+        let mut bad = tcp_packet(true, TcpControl::Syn, false, Some(16324), &[]);
+        bad[IPV6_HEADER_LEN + 21] = 0;
+        TcpPacket::new_unchecked(&mut bad[IPV6_HEADER_LEN..]).fill_checksum(&IpAddress::Ipv6(SRC6), &IpAddress::Ipv6(DST6));
+        check(bad, "malformed options");
+    }
+
+    #[test]
+    fn mss_option_scan_skips_padding_and_other_options() {
+        assert_eq!(mss_option_value_at(&[2, 4, 0x05, 0xb4]), Some(2));
+        assert_eq!(mss_option_value_at(&[1, 1, 3, 3, 7, 2, 4, 0x05, 0xb4, 0]), Some(7), "NOPs and window scale first");
+        assert_eq!(mss_option_value_at(&[0, 2, 4, 0x05, 0xb4]), None, "after End of Option List");
+        assert_eq!(mss_option_value_at(&[2, 3, 0x05]), None, "wrong length");
+        assert_eq!(mss_option_value_at(&[8, 10, 0, 0]), None, "option runs past the block");
+        assert_eq!(mss_option_value_at(&[4]), None, "truncated");
+        assert_eq!(mss_option_value_at(&[]), None);
+    }
+
+    #[test]
+    fn connection_requests_are_syns_without_ack() {
+        use smoltcp::wire::TcpControl;
+        let syn6 = tcp_packet(true, TcpControl::Syn, false, Some(1220), &[]);
+        assert_eq!(
+            tcp_connection_request(&syn6),
+            Some((SocketAddr::new(SRC6.into(), 40000), SocketAddr::new(DST6.into(), 5060)))
+        );
+        let syn4 = tcp_packet(false, TcpControl::Syn, false, None, &[]);
+        assert_eq!(tcp_connection_request(&syn4), Some((SocketAddr::new(SRC4.into(), 40000), SocketAddr::new(DST4.into(), 5060))));
+        assert_eq!(tcp_connection_request(&tcp_packet(true, TcpControl::Syn, true, None, &[])), None, "SYN-ACK");
+        assert_eq!(tcp_connection_request(&tcp_packet(true, TcpControl::None, true, None, b"x")), None, "data");
+        assert_eq!(tcp_connection_request(&tcp_packet(false, TcpControl::Rst, false, None, &[])), None, "RST");
+        assert_eq!(tcp_connection_request(&ipv6_packet(40)), None, "UDP");
     }
 
     #[test]

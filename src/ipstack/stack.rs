@@ -23,6 +23,15 @@
 //! Receives never touch the stack lock: each binding has a bounded `sync_channel`
 //! filled by the stack thread. All queues are bounded and every drop is counted.
 //!
+//! TCP (DESIGN.md §11.2): [`InnerStack::connect_tcp`], [`InnerStack::listen_tcp`],
+//! [`InnerTcpStream`] and [`InnerTcpListener`] are blocking adapters over smoltcp TCP
+//! sockets in the same `SocketSet`. A call takes the stack lock only to move bytes in or
+//! out of its socket's buffers (or to look at its state) and otherwise parks on the
+//! stack's TCP event counter — its own mutex/condvar, bumped by the stack thread after
+//! every poll that moved packets while TCP sockets exist, and by `close`. A listener is a
+//! small backlog of listening sockets (smoltcp has no accept queue); the stack thread
+//! frees the sockets of dropped streams once their close handshake is over.
+//!
 //! Lock rule for the TX sink: it runs on the stack thread *with the stack lock held*
 //! (inside `Interface::poll`), so it must only do things that never wait on the ESP rx
 //! thread — a UDP send is fine, taking another stack's lock is not (see the loopback
@@ -59,17 +68,19 @@ use std::time::{Duration, Instant};
 
 use log::{debug, info, trace, warn};
 use smoltcp::iface::{Config as IfaceConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet};
+use smoltcp::socket::tcp::{self, State as TcpState};
 use smoltcp::socket::{dns, udp};
 use smoltcp::wire::{DnsQueryType, HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
 use super::device::{DEFAULT_RX_QUEUE_DEPTH, DeviceStats, EspDevice, TxSink};
-use super::frag::{Ipv6Reassembler, ReassemblyStats};
+use super::frag::{Ipv6Reassembler, ReassemblyStats, tcp_connection_request};
 use crate::ike::session::AssignedConfig;
 use crate::{Error, Result};
 
-/// Lowest port handed out by `bind_udp(0)` (IANA dynamic range).
+/// Lowest port handed out by `bind_udp(0)`, `listen_tcp(0)` and to outbound TCP
+/// connections (IANA dynamic range; UDP and TCP ports are allocated independently).
 pub const EPHEMERAL_PORT_LO: u16 = 49152;
-/// Highest port handed out by `bind_udp(0)`.
+/// Highest ephemeral port.
 pub const EPHEMERAL_PORT_HI: u16 = 65535;
 /// Smallest accepted inner MTU (the IPv6 minimum link MTU, RFC 8200 §5).
 pub const MIN_INNER_MTU: usize = 1280;
@@ -93,6 +104,25 @@ const MAX_IDLE_WAIT: Duration = Duration::from_millis(500);
 const MAX_IMMEDIATE_POLLS: u32 = 64;
 const IPV4_UDP_OVERHEAD: usize = 20 + 8;
 const IPV6_UDP_OVERHEAD: usize = 40 + 8;
+/// smoltcp receive and transmit buffer of every inner TCP socket, per direction (§11.2).
+/// It bounds the advertised window (below 64 KiB, so no window scaling is needed) and
+/// what one `write` can queue: a larger message — a 64 KiB SIP NOTIFY, say — goes out in
+/// pieces as the peer acknowledges.
+pub const TCP_BUFFER_BYTES: usize = 32 * 1024;
+/// Listening sockets per inner TCP listener (§11.2). smoltcp has no accept queue — a
+/// socket in LISTEN takes exactly one connection — so a listener keeps this many, each
+/// either listening or holding a connection `accept_timeout` has not handed out yet; a
+/// SYN that arrives while all of them are taken is answered with RST.
+pub const TCP_LISTEN_BACKLOG: usize = 2;
+/// How long the socket of a dropped [`InnerTcpStream`] may take to finish its close
+/// handshake — FIN-WAIT-2 on a peer that never sends its FIN, LAST-ACK on one that never
+/// acknowledges ours, neither of which smoltcp times out — before it is reset and freed.
+pub const TCP_ORPHAN_LINGER: Duration = Duration::from_secs(60);
+/// smoltcp socket timeout of a listener's backlog slots (§11.2): a slot resets (RST) a
+/// connection whose peer has been silent this long before `accept_timeout` took it — a
+/// handshake whose final ACK never came, or a connection nobody accepts — and goes back
+/// to LISTEN, so neither can occupy the backlog for good. Cleared on accept.
+const TCP_BACKLOG_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Lock a mutex, recovering from poisoning (a panicked thread must not take the
 /// whole stack down with it).
@@ -112,7 +142,7 @@ pub struct UdpDatagram {
     pub payload: Vec<u8>,
 }
 
-/// Counters of the inner stack (device queue, UDP delivery, DNS).
+/// Counters of the inner stack (device queue, UDP delivery, DNS, TCP).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StackStats {
     /// Inner IP packets pushed into the device by the ESP rx thread.
@@ -148,6 +178,23 @@ pub struct StackStats {
     pub dns_queries: u64,
     /// Currently bound inner UDP ports.
     pub udp_bindings: u64,
+    /// Outbound TCP connections established by `connect_tcp`.
+    pub tcp_connections_opened: u64,
+    /// TCP connections handed out by `accept_timeout`.
+    pub tcp_accepted: u64,
+    /// Bytes TCP `write`s queued for transmission.
+    pub tcp_tx_bytes: u64,
+    /// Bytes TCP `read`s returned.
+    pub tcp_rx_bytes: u64,
+    /// smoltcp TCP sockets currently allocated: streams, listener backlog slots, and the
+    /// sockets of dropped streams still finishing their close handshake.
+    pub tcp_sockets: u64,
+    /// Retransmitted SYNs for a connection the stack already holds, dropped before a
+    /// listening socket could take them for a new one (§11.2).
+    pub tcp_dup_syn_drops: u64,
+    /// TCP SYNs (ours or the peer's) whose MSS option was lowered to fit the wire MTU
+    /// (§11.2).
+    pub tcp_mss_clamped: u64,
 }
 
 /// A UDP "socket" inside the tunnel, bound to one inner port on every inner address.
@@ -160,6 +207,39 @@ pub struct InnerUdpSocket {
     /// Locked only inside `recv_timeout` (the receiver itself is `!Sync`).
     rx: Mutex<Receiver<UdpDatagram>>,
     stack: InnerStack,
+}
+
+/// A TCP connection inside the tunnel (§11.2): opened by [`InnerStack::connect_tcp`] or
+/// handed out by [`InnerTcpListener::accept_timeout`]. Its smoltcp socket lives in the
+/// stack's `SocketSet` and is driven by the stack thread; the methods here only move bytes
+/// in and out of the socket's buffers under the stack lock and park on the stack's TCP
+/// event counter in between (never on the stack lock, so a close wakes them at once —
+/// DESIGN §17.6). `Send + Sync` and `&self` throughout: one thread may block in `read`
+/// while another writes. Dropping it closes the connection gracefully (FIN); the stack
+/// thread frees the socket once the close handshake is over.
+pub struct InnerTcpStream {
+    stack: InnerStack,
+    /// Key of the connection in `State::tcp`.
+    id: u64,
+    local: SocketAddr,
+    peer: SocketAddr,
+    read_timeout: Mutex<Option<Duration>>,
+    write_timeout: Mutex<Option<Duration>>,
+    /// `shutdown` was called: reads return EOF and writes fail with `BrokenPipe`, as
+    /// after `shutdown(Both)` on an OS socket.
+    shut: AtomicBool,
+}
+
+/// A TCP listener inside the tunnel on one inner port, every inner address (§11.2):
+/// [`TCP_LISTEN_BACKLOG`] smoltcp listening sockets, refilled as connections are
+/// accepted. Dropping it removes the listening sockets and resets the connections nobody
+/// accepted.
+pub struct InnerTcpListener {
+    stack: InnerStack,
+    port: u16,
+    /// Tells this listener apart from a later one on the same port.
+    id: u64,
+    local: SocketAddr,
 }
 
 /// Handle to the inner stack; cheap to clone (`Arc`). See the module docs.
@@ -188,6 +268,14 @@ struct StackShared {
     /// drop wakes a blocked [`InnerUdpSocket::recv_timeout`], and the completion slots of
     /// in-flight DNS queries.
     wakers: Mutex<Wakers>,
+    /// TCP wake-ups (§11.2): a generation counter, bumped by the stack thread after every
+    /// poll that moved packets while TCP sockets exist, by `close` and by a stream's
+    /// `shutdown`. A blocked TCP call parks on `tcp_cv` with THIS lock and never with
+    /// `state`, for the reason `closed` lives outside `state`: a close must wake it while
+    /// the stack thread sits in a slow outer send, and the woken call must be able to
+    /// return without waiting for that poll to finish.
+    tcp_events: Mutex<u64>,
+    tcp_cv: Condvar,
     /// Monotonic origin of smoltcp's clock.
     epoch: Instant,
 }
@@ -209,6 +297,40 @@ impl StackShared {
 
     fn closed_error(&self) -> Option<Error> {
         lock(&self.closed).as_ref().map(|r| Error::Closed(r.clone()))
+    }
+
+    /// The current TCP event generation. A TCP call reads it BEFORE it looks at its
+    /// socket, so an event that lands in between moves it and the park returns at once.
+    fn tcp_generation(&self) -> u64 {
+        *lock(&self.tcp_events)
+    }
+
+    /// Wake every parked TCP call: something may have changed for its socket.
+    fn tcp_wake(&self) {
+        {
+            let mut generation = lock(&self.tcp_events);
+            *generation = generation.wrapping_add(1);
+        }
+        self.tcp_cv.notify_all();
+    }
+
+    /// Park until the TCP event generation moves past `seen`; `false` once `deadline`
+    /// (`None` = never) passes first.
+    fn tcp_park(&self, seen: u64, deadline: Option<Instant>) -> bool {
+        let mut generation = lock(&self.tcp_events);
+        while *generation == seen {
+            generation = match deadline {
+                None => self.tcp_cv.wait(generation).unwrap_or_else(|e| e.into_inner()),
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    self.tcp_cv.wait_timeout(generation, left).unwrap_or_else(|e| e.into_inner()).0
+                }
+            };
+        }
+        true
     }
 }
 
@@ -269,6 +391,27 @@ struct DnsWaiter {
     started: smoltcp::time::Instant,
 }
 
+/// The smoltcp socket behind one [`InnerTcpStream`] (§11.2).
+struct TcpConn {
+    handle: SocketHandle,
+    /// Local port (an accepted connection shares its listener's).
+    port: u16,
+    /// Opened by `connect_tcp`: its ephemeral port is not available to `listen_tcp`.
+    outbound: bool,
+    /// When the stream was dropped. The stack thread frees the socket once its close
+    /// handshake is over, and resets it after [`TCP_ORPHAN_LINGER`].
+    orphaned: Option<Instant>,
+}
+
+/// The listening sockets of one [`InnerTcpListener`] (§11.2).
+struct TcpListen {
+    /// Tells the listener apart from a later one on the same port.
+    id: u64,
+    /// [`TCP_LISTEN_BACKLOG`] sockets, each in LISTEN or holding a connection that has
+    /// not been accepted yet.
+    slots: Vec<SocketHandle>,
+}
+
 struct State {
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -286,23 +429,192 @@ struct State {
     udp_send_full: u64,
     udp_tx_drops: u64,
     dns_queries: u64,
+    /// Inner TCP connections by stream id (§11.2).
+    tcp: HashMap<u64, TcpConn>,
+    /// Inner TCP listeners by local port.
+    listeners: HashMap<u16, TcpListen>,
+    /// Allocated smoltcp TCP sockets per local port — connections, backlog slots and
+    /// orphans alike: the ephemeral port picker's view of the TCP port space.
+    tcp_ports: HashMap<u16, usize>,
+    /// Last id handed to a TCP stream or listener.
+    tcp_ids: u64,
+    tcp_connections_opened: u64,
+    tcp_accepted: u64,
+    tcp_tx_bytes: u64,
+    tcp_rx_bytes: u64,
+    tcp_dup_syn_drops: u64,
 }
 
 impl State {
     /// One stack-thread iteration: ingest the queued packets one at a time, moving what
     /// each one produced out to the waiting callers before the next (a smoltcp UDP
-    /// socket only buffers `UDP_SOCKET_PACKETS` datagrams), then transmit.
-    fn poll(&mut self, now: smoltcp::time::Instant, wakers: &Mutex<Wakers>) {
+    /// socket only buffers `UDP_SOCKET_PACKETS` datagrams), then transmit, then the TCP
+    /// housekeeping. Returns whether any packet was processed or sent — i.e. whether a TCP
+    /// socket's state or buffers may have changed (§11.2).
+    fn poll(&mut self, now: smoltcp::time::Instant, wakers: &Mutex<Wakers>) -> bool {
         self.iface.poll_maintenance(now);
+        let mut moved = false;
         loop {
             match self.iface.poll_ingress_single(now, &mut self.device, &mut self.sockets) {
                 PollIngressSingleResult::None => break,
                 PollIngressSingleResult::PacketProcessed => {}
-                PollIngressSingleResult::SocketStateChanged => self.drain(now, wakers),
+                PollIngressSingleResult::SocketStateChanged => {
+                    moved = true;
+                    self.drain(now, wakers);
+                }
             }
         }
-        while self.iface.poll_egress(now, &mut self.device, &mut self.sockets) == PollResult::SocketStateChanged {}
+        while self.iface.poll_egress(now, &mut self.device, &mut self.sockets) == PollResult::SocketStateChanged {
+            moved = true;
+        }
         self.drain(now, wakers);
+        if self.has_tcp() {
+            self.tcp_housekeeping();
+        }
+        moved
+    }
+
+    fn has_tcp(&self) -> bool {
+        !self.tcp.is_empty() || !self.listeners.is_empty()
+    }
+
+    fn next_tcp_id(&mut self) -> u64 {
+        self.tcp_ids += 1;
+        self.tcp_ids
+    }
+
+    /// The socket of stream `id`; `Error::Closed` once it is gone (after a close).
+    fn tcp_socket(&mut self, id: u64) -> Result<&mut tcp::Socket<'static>> {
+        let handle = self.tcp.get(&id).map(|c| c.handle).ok_or_else(|| Error::Closed("inner TCP connection is gone".into()))?;
+        Ok(self.sockets.get_mut::<tcp::Socket>(handle))
+    }
+
+    /// Add one listening backlog slot on `port`.
+    fn add_listen_slot(&mut self, port: u16) -> Result<SocketHandle> {
+        let mut sock = new_tcp_socket();
+        sock.set_timeout(Some(TCP_BACKLOG_TIMEOUT.into()));
+        sock.listen(port).map_err(|e| Error::Config(format!("inner TCP listen on port {port}: {e}")))?;
+        *self.tcp_ports.entry(port).or_default() += 1;
+        Ok(self.sockets.add(sock))
+    }
+
+    /// Remove a TCP socket from the set and release its port.
+    fn free_tcp_socket(&mut self, handle: SocketHandle, port: u16) {
+        self.sockets.remove(handle);
+        if let Some(n) = self.tcp_ports.get_mut(&port) {
+            *n -= 1;
+            if *n == 0 {
+                self.tcp_ports.remove(&port);
+            }
+        }
+    }
+
+    /// Forget stream `id` and free its socket at once, sending nothing (a connect that
+    /// failed or timed out: like an OS socket, the abandoned SYN gets no RST).
+    fn abandon_tcp(&mut self, id: u64) {
+        if let Some(c) = self.tcp.remove(&id) {
+            self.free_tcp_socket(c.handle, c.port);
+        }
+    }
+
+    /// The TCP half of every poll (§11.2): free the sockets of dropped streams whose
+    /// close handshake is over — a socket is done once it is CLOSED with no 4-tuple left
+    /// (TIME-WAIT expired, LAST-ACK acknowledged, reset, or its abort RST sent) — and
+    /// reset the ones still lingering after [`TCP_ORPHAN_LINGER`]; put a backlog slot
+    /// that smoltcp closed (its handshake timed out, or the connection was reset before
+    /// anyone accepted it) back into LISTEN.
+    fn tcp_housekeeping(&mut self) {
+        let mut done = Vec::new();
+        for (id, c) in &self.tcp {
+            let Some(since) = c.orphaned else { continue };
+            let s = self.sockets.get_mut::<tcp::Socket>(c.handle);
+            if s.state() == TcpState::Closed && s.remote_endpoint().is_none() {
+                done.push(*id);
+            } else if s.state() != TcpState::Closed && since.elapsed() >= TCP_ORPHAN_LINGER {
+                debug!(
+                    "inner TCP {:?} -> {:?}: close handshake unfinished after {TCP_ORPHAN_LINGER:?} ({}); resetting",
+                    s.local_endpoint(),
+                    s.remote_endpoint(),
+                    s.state()
+                );
+                s.abort();
+            }
+        }
+        for id in done {
+            self.abandon_tcp(id);
+        }
+        for (port, l) in &self.listeners {
+            for h in &l.slots {
+                let s = self.sockets.get_mut::<tcp::Socket>(*h);
+                if s.state() == TcpState::Closed && s.remote_endpoint().is_none() {
+                    // A reset forgets the listen endpoint: listen again.
+                    let _ = s.listen(*port);
+                }
+            }
+        }
+    }
+
+    /// Take the first connection of listener `(port, id)` that completed its handshake
+    /// (ESTABLISHED, or CLOSE-WAIT when the peer already sent everything and its FIN) and
+    /// refill its backlog slot with a fresh listening socket. `None` while there is none.
+    fn accept_pending(&mut self, port: u16, id: u64) -> Option<Result<(u64, SocketAddr, SocketAddr)>> {
+        let Some(l) = self.listeners.get(&port).filter(|l| l.id == id) else {
+            return Some(Err(Error::Closed(format!("inner TCP listener on port {port} is gone"))));
+        };
+        let (slot, handle) = l
+            .slots
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, h)| matches!(self.sockets.get::<tcp::Socket>(*h).state(), TcpState::Established | TcpState::CloseWait))?;
+        let fresh = match self.add_listen_slot(port) {
+            Ok(h) => h,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Some(l) = self.listeners.get_mut(&port) {
+            l.slots[slot] = fresh;
+        }
+        let s = self.sockets.get_mut::<tcp::Socket>(handle);
+        // The backlog's bound is not the connection's.
+        s.set_timeout(None);
+        let Some((local, peer)) = s.local_endpoint().zip(s.remote_endpoint()) else {
+            // Unreachable in these states; reset it and let the reaper have the socket.
+            s.abort();
+            let stream = self.next_tcp_id();
+            self.tcp.insert(stream, TcpConn { handle, port, outbound: false, orphaned: Some(Instant::now()) });
+            return Some(Err(Error::Protocol(format!("inner TCP port {port}: accepted socket has no endpoints"))));
+        };
+        let stream = self.next_tcp_id();
+        self.tcp.insert(stream, TcpConn { handle, port, outbound: false, orphaned: None });
+        self.tcp_accepted += 1;
+        Some(Ok((stream, SocketAddr::from(local), SocketAddr::from(peer))))
+    }
+
+    /// Is `packet` a retransmitted SYN for a connection the stack already holds (§11.2)?
+    /// smoltcp gives each segment to the FIRST socket that accepts it, and a socket in
+    /// LISTEN accepts any SYN to its port. Were a listening backlog slot to come before
+    /// the connection's own socket in the `SocketSet`, it would answer the duplicate with
+    /// a second SYN-ACK (another ISN), and the peer's next ACK — matching both sockets'
+    /// 4-tuple — could be answered with RST. The connection's socket ignores a SYN in a
+    /// synchronized state (its SYN-ACK is retransmitted on its own timer), so dropping the
+    /// duplicate here is what would happen in the right order anyway. Only consulted while
+    /// a listener exists.
+    fn is_duplicate_syn(&self, packet: &[u8]) -> bool {
+        if self.listeners.is_empty() {
+            return false;
+        }
+        let Some((src, dst)) = tcp_connection_request(packet) else {
+            return false;
+        };
+        let (local, remote) = (IpEndpoint::from(dst), IpEndpoint::from(src));
+        let mut handles = self.tcp.values().map(|c| c.handle).chain(self.listeners.values().flat_map(|l| l.slots.iter().copied()));
+        handles.any(|h| {
+            let s = self.sockets.get::<tcp::Socket>(h);
+            // A SYN-SENT socket takes a SYN as a simultaneous open.
+            !matches!(s.state(), TcpState::Listen | TcpState::Closed | TcpState::SynSent)
+                && s.local_endpoint() == Some(local)
+                && s.remote_endpoint() == Some(remote)
+        })
     }
 
     /// Move everything smoltcp's sockets hold out to the callers. `wakers` holds the
@@ -374,7 +686,7 @@ impl State {
     /// already been failed by [`InnerStack::close`], which does not need this mutex.
     /// Idempotent.
     fn shutdown(&mut self, reason: &str) {
-        let State { sockets, dns, udp, dns_waiters, .. } = self;
+        let State { sockets, dns, udp, dns_waiters, tcp: conns, listeners, tcp_ports, .. } = self;
         let dns_sock = sockets.get_mut::<dns::Socket>(*dns);
         for w in dns_waiters.drain(..) {
             dns_sock.cancel_query(w.handle);
@@ -383,6 +695,17 @@ impl State {
         for (_, b) in udp.drain() {
             sockets.remove(b.handle);
         }
+        // Nothing can be sent any more: the TCP sockets just go. Their adapters fail with
+        // `Error::Closed` from `StackShared::closed`, never touching a removed handle.
+        for (_, c) in conns.drain() {
+            sockets.remove(c.handle);
+        }
+        for (_, l) in listeners.drain() {
+            for h in l.slots {
+                sockets.remove(h);
+            }
+        }
+        tcp_ports.clear();
     }
 }
 
@@ -391,8 +714,9 @@ impl State {
 // ---------------------------------------------------------------------------
 
 /// Pick a free inner port in `49152..=65535`, scanning upward from `start` and
-/// wrapping around; `None` when every port is in use.
-fn pick_free_port(used: &HashMap<u16, UdpBinding>, start: u16) -> Option<u16> {
+/// wrapping around; `None` when every port is in use. (UDP bindings and TCP sockets
+/// keep separate maps: the two port spaces are independent.)
+fn pick_free_port<V>(used: &HashMap<u16, V>, start: u16) -> Option<u16> {
     let range = u32::from(EPHEMERAL_PORT_HI - EPHEMERAL_PORT_LO) + 1;
     let start = start.clamp(EPHEMERAL_PORT_LO, EPHEMERAL_PORT_HI);
     let offset = u32::from(start - EPHEMERAL_PORT_LO);
@@ -413,6 +737,11 @@ pub fn max_udp_payload(mtu: usize, ipv4: bool) -> usize {
     }
 }
 
+/// A random starting point for [`pick_free_port`] (RFC 6056: no predictable ports).
+fn random_ephemeral_start() -> u16 {
+    EPHEMERAL_PORT_LO + (rand::random::<u16>() % (EPHEMERAL_PORT_HI - EPHEMERAL_PORT_LO + 1))
+}
+
 /// Clamp a configured inner MTU into `[MIN_INNER_MTU, MAX_INNER_MTU]`.
 fn effective_mtu(inner_mtu: usize) -> usize {
     inner_mtu.clamp(MIN_INNER_MTU, MAX_INNER_MTU)
@@ -420,6 +749,13 @@ fn effective_mtu(inner_mtu: usize) -> usize {
 
 fn udp_buffer() -> udp::PacketBuffer<'static> {
     udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_SOCKET_PACKETS], vec![0u8; UDP_SOCKET_BYTES])
+}
+
+/// A fresh smoltcp TCP socket with [`TCP_BUFFER_BYTES`] each way. smoltcp's defaults
+/// otherwise: Nagle on (like an OS socket; `set_nodelay` turns it off), 10 ms delayed
+/// ACK, no keep-alive, no timeout.
+fn new_tcp_socket() -> tcp::Socket<'static> {
+    tcp::Socket::new(tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]), tcp::SocketBuffer::new(vec![0u8; TCP_BUFFER_BYTES]))
 }
 
 // ---------------------------------------------------------------------------
@@ -557,8 +893,19 @@ impl InnerStack {
                     udp_send_full: 0,
                     udp_tx_drops: 0,
                     dns_queries: 0,
+                    tcp: HashMap::new(),
+                    listeners: HashMap::new(),
+                    tcp_ports: HashMap::new(),
+                    tcp_ids: 0,
+                    tcp_connections_opened: 0,
+                    tcp_accepted: 0,
+                    tcp_tx_bytes: 0,
+                    tcp_rx_bytes: 0,
+                    tcp_dup_syn_drops: 0,
                 }),
                 cv: Condvar::new(),
+                tcp_events: Mutex::new(0),
+                tcp_cv: Condvar::new(),
                 stop: AtomicBool::new(false),
                 epoch,
             }),
@@ -594,7 +941,11 @@ impl InnerStack {
         let mut immediate = 0u32;
         while !sh.stop.load(Ordering::SeqCst) {
             let now = sh.now();
-            st.poll(now, &sh.wakers);
+            if st.poll(now, &sh.wakers) && st.has_tcp() {
+                // TCP calls park on their own event counter, not on this lock (§11.2):
+                // tell them their socket may have changed.
+                sh.tcp_wake();
+            }
             let delay = {
                 let s = &mut *st;
                 s.iface.poll_delay(now, &s.sockets)
@@ -642,9 +993,10 @@ impl InnerStack {
     /// across a whole poll, which can block in an outer ESP send for the socket's write
     /// timeout, and the promise `mark_dead` makes is that a blocked receiver fails
     /// IMMEDIATELY (DESIGN §17.6). So the reason is published, the UDP senders are dropped
-    /// (which is what wakes a parked `recv_timeout`) and the DNS waiters are completed —
-    /// all under their own short-lived locks — and only then does the smoltcp-side cleanup
-    /// take `state` and wait for the poll in progress.
+    /// (which is what wakes a parked `recv_timeout`), the DNS waiters are completed and the
+    /// TCP event counter is moved (which wakes a parked TCP read / write / accept /
+    /// connect) — all under their own short-lived locks — and only then does the
+    /// smoltcp-side cleanup take `state` and wait for the poll in progress.
     ///
     /// The reason is published BEFORE `stop`: setting `stop` first is a race in which the
     /// stack thread leaves its loop and closes with its own generic reason, losing the
@@ -665,6 +1017,9 @@ impl InnerStack {
                 slot.complete(Err(Error::Closed(reason.clone())));
             }
         }
+        // A blocked TCP call parks on the TCP event counter (§11.2): moving it makes the
+        // call look at `closed` again, which it reads without `state` either.
+        self.shared.tcp_wake();
         self.shared.stop.store(true, Ordering::SeqCst);
         self.shared.notify();
         lock(&self.shared.state).shutdown(&reason);
@@ -676,7 +1031,9 @@ impl InnerStack {
 
     /// Queue one decapsulated inner IP packet (from the ESP rx thread) and wake the
     /// stack thread. IPv6 fragments are held by the reassembler until their set is
-    /// complete (§11.1). Never blocks for long: the device queue is bounded (drop-oldest).
+    /// complete (§11.1); a retransmitted SYN for a TCP connection the stack already holds
+    /// is dropped (§11.2). Never blocks for long: the device queue is bounded
+    /// (drop-oldest).
     pub fn push_rx(&self, packet: Vec<u8>) {
         {
             if self.shared.closed_error().is_some() {
@@ -686,6 +1043,11 @@ impl InnerStack {
             let Some(packet) = st.reassembler.push(packet, Instant::now()) else {
                 return;
             };
+            if st.is_duplicate_syn(&packet) {
+                st.tcp_dup_syn_drops += 1;
+                debug!("inner TCP: retransmitted SYN for an existing connection dropped");
+                return;
+            }
             st.device.push_rx(packet);
         }
         self.shared.notify();
@@ -703,8 +1065,7 @@ impl InnerStack {
             return Err(e);
         }
         let port = if port == 0 {
-            let start = EPHEMERAL_PORT_LO + (rand::random::<u16>() % (EPHEMERAL_PORT_HI - EPHEMERAL_PORT_LO + 1));
-            pick_free_port(&st.udp, start).ok_or_else(|| Error::Config("no free inner UDP port".into()))?
+            pick_free_port(&st.udp, random_ephemeral_start()).ok_or_else(|| Error::Config("no free inner UDP port".into()))?
         } else {
             if st.udp.contains_key(&port) {
                 // `Io(AddrInUse)`, so the NetStack mapping (§16) yields the same kind
@@ -838,6 +1199,160 @@ impl InnerStack {
         slot.take()
     }
 
+    /// Open a TCP connection to `remote` from an ephemeral inner port (§11.2), waiting
+    /// at most `timeout` for the handshake (`Duration::MAX`: until it completes or
+    /// fails). smoltcp picks the source address among the inner addresses of `remote`'s
+    /// family. `Error::Timeout` when nothing answered in time, `Io(ConnectionRefused)`
+    /// when the peer answered with RST, `Config` when there is no inner address of that
+    /// family (or `remote` is not a destination), `Error::Closed` once the stack is closed
+    /// — at once, also for a call already waiting.
+    pub fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> Result<InnerTcpStream> {
+        let deadline = Instant::now().checked_add(timeout);
+        let (id, local) = self.start_connect(remote)?;
+        self.shared.notify();
+        let established = self.tcp_wait_for(deadline, |st| {
+            let state = match st.tcp_socket(id) {
+                Ok(s) => s.state(),
+                Err(e) => return Some(Err(e)),
+            };
+            match state {
+                TcpState::SynSent | TcpState::SynReceived => None,
+                // A RST (or anything else that closed it) before the handshake completed.
+                TcpState::Closed | TcpState::TimeWait | TcpState::Listen => Some(Err(Error::Io(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("inner TCP connection to {remote} refused"),
+                )))),
+                // ESTABLISHED — or already past it when the peer closed right away.
+                _ => {
+                    st.tcp_connections_opened += 1;
+                    Some(Ok(()))
+                }
+            }
+        });
+        match established {
+            Ok(Some(())) => {
+                debug!("inner TCP connected {local} -> {remote}");
+                Ok(InnerTcpStream::new(self.clone(), id, local, remote))
+            }
+            outcome => {
+                let e = outcome.err().unwrap_or(Error::Timeout("inner TCP handshake"));
+                // After a close the socket is gone already, and taking `state` here could
+                // wait out the poll in progress — the wait a close must not impose (§17.6).
+                if !matches!(e, Error::Closed(_)) {
+                    lock(&self.shared.state).abandon_tcp(id);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Register a SYN-SENT socket for `remote`: `(stream id, local address)`.
+    fn start_connect(&self, remote: SocketAddr) -> Result<(u64, SocketAddr)> {
+        if let Some(e) = self.shared.closed_error() {
+            return Err(e);
+        }
+        let mut st = lock(&self.shared.state);
+        if let Some(e) = self.shared.closed_error() {
+            return Err(e);
+        }
+        let (has_family, family) = match remote {
+            SocketAddr::V4(_) => (st.has_v4, "IPv4"),
+            SocketAddr::V6(_) => (st.has_v6, "IPv6"),
+        };
+        if !has_family {
+            return Err(Error::Config(format!("no assigned inner {family} address to reach {remote}")));
+        }
+        let port = pick_free_port(&st.tcp_ports, random_ephemeral_start())
+            .ok_or_else(|| Error::Io(io::Error::new(io::ErrorKind::AddrNotAvailable, "no free inner TCP port")))?;
+        let mut sock = new_tcp_socket();
+        sock.connect(st.iface.context(), IpEndpoint::from(remote), port).map_err(|e| match e {
+            tcp::ConnectError::Unaddressable => Error::Config(format!("inner TCP: {remote} is not addressable")),
+            tcp::ConnectError::InvalidState => Error::Protocol(format!("inner TCP connect to {remote}: fresh socket in an {e}")),
+        })?;
+        let local = sock
+            .local_endpoint()
+            .map(SocketAddr::from)
+            .ok_or_else(|| Error::Protocol(format!("inner TCP connect to {remote}: no source address chosen")))?;
+        let handle = st.sockets.add(sock);
+        *st.tcp_ports.entry(port).or_default() += 1;
+        let id = st.next_tcp_id();
+        st.tcp.insert(id, TcpConn { handle, port, outbound: true, orphaned: None });
+        trace!("inner TCP SYN {local} -> {remote}");
+        Ok((id, local))
+    }
+
+    /// Listen for TCP connections on inner `port` on every inner address (§11.2); `port
+    /// == 0` picks a free port in `49152..=65535`. A port that already has a listener, or
+    /// is the local port of an outbound connection, is `Io(AddrInUse)` — the kind the OS
+    /// backend reports (§16).
+    pub fn listen_tcp(&self, port: u16) -> Result<InnerTcpListener> {
+        if let Some(e) = self.shared.closed_error() {
+            return Err(e);
+        }
+        let mut st = lock(&self.shared.state);
+        if let Some(e) = self.shared.closed_error() {
+            return Err(e);
+        }
+        let port = if port == 0 {
+            pick_free_port(&st.tcp_ports, random_ephemeral_start())
+                .ok_or_else(|| Error::Io(io::Error::new(io::ErrorKind::AddrNotAvailable, "no free inner TCP port")))?
+        } else {
+            if st.listeners.contains_key(&port) || st.tcp.values().any(|c| c.outbound && c.port == port) {
+                return Err(Error::Io(io::Error::new(io::ErrorKind::AddrInUse, format!("inner TCP port {port} is already in use"))));
+            }
+            port
+        };
+        let mut slots = Vec::with_capacity(TCP_LISTEN_BACKLOG);
+        for _ in 0..TCP_LISTEN_BACKLOG {
+            match st.add_listen_slot(port) {
+                Ok(h) => slots.push(h),
+                Err(e) => {
+                    for h in slots {
+                        st.free_tcp_socket(h, port);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let id = st.next_tcp_id();
+        st.listeners.insert(port, TcpListen { id, slots });
+        let ip = st.iface.ip_addrs().first().map(|c| IpAddr::from(c.address())).unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        drop(st);
+        debug!("inner TCP listener on port {port}");
+        Ok(InnerTcpListener { stack: self.clone(), port, id, local: SocketAddr::new(ip, port) })
+    }
+
+    /// The blocking core of every TCP call (§11.2): run `attempt` under `state` until it
+    /// returns `Some`, parking on the TCP event counter — never on `state` — in between.
+    /// `Ok(None)` once `deadline` (`None` = never) passed first; `Error::Closed` as soon as
+    /// the stack is closed, before and after every attempt. A finished attempt may have
+    /// queued data or freed buffer space, so the stack thread is woken to act on it.
+    fn tcp_wait_for<T>(&self, deadline: Option<Instant>, mut attempt: impl FnMut(&mut State) -> Option<Result<T>>) -> Result<Option<T>> {
+        let sh = &*self.shared;
+        loop {
+            if let Some(e) = sh.closed_error() {
+                return Err(e);
+            }
+            let seen = sh.tcp_generation();
+            let outcome = {
+                let mut st = lock(&sh.state);
+                // Re-checked under the lock: a close's smoltcp cleanup (which needs this
+                // lock) has not run yet if `closed` is still empty here.
+                if let Some(e) = sh.closed_error() {
+                    return Err(e);
+                }
+                attempt(&mut st)
+            };
+            if let Some(r) = outcome {
+                sh.notify();
+                return r.map(Some);
+            }
+            if !sh.tcp_park(seen, deadline) {
+                return Ok(None);
+            }
+        }
+    }
+
     pub fn stats(&self) -> StackStats {
         let st = lock(&self.shared.state);
         let d: DeviceStats = st.device.stats();
@@ -860,6 +1375,13 @@ impl InnerStack {
             udp_tx_drops: st.udp_tx_drops,
             dns_queries: st.dns_queries,
             udp_bindings: st.udp.len() as u64,
+            tcp_connections_opened: st.tcp_connections_opened,
+            tcp_accepted: st.tcp_accepted,
+            tcp_tx_bytes: st.tcp_tx_bytes,
+            tcp_rx_bytes: st.tcp_rx_bytes,
+            tcp_sockets: (st.tcp.len() + st.listeners.values().map(|l| l.slots.len()).sum::<usize>()) as u64,
+            tcp_dup_syn_drops: st.tcp_dup_syn_drops,
+            tcp_mss_clamped: d.tcp_mss_clamped,
         }
     }
 
@@ -1014,6 +1536,246 @@ impl std::fmt::Debug for InnerUdpSocket {
 }
 
 // ---------------------------------------------------------------------------
+// InnerTcpStream / InnerTcpListener
+// ---------------------------------------------------------------------------
+
+/// `Some(now + timeout)`; `None` (wait forever) without a timeout or when it overflows.
+fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|t| Instant::now().checked_add(t))
+}
+
+/// std's answer to a zero timeout (`set_read_timeout(Some(ZERO))` is an error there too).
+fn zero_timeout_error() -> Error {
+    Error::Io(io::Error::new(io::ErrorKind::InvalidInput, "cannot set a 0 duration timeout"))
+}
+
+impl InnerTcpStream {
+    fn new(stack: InnerStack, id: u64, local: SocketAddr, peer: SocketAddr) -> InnerTcpStream {
+        InnerTcpStream {
+            stack,
+            id,
+            local,
+            peer,
+            read_timeout: Mutex::new(None),
+            write_timeout: Mutex::new(None),
+            shut: AtomicBool::new(false),
+        }
+    }
+
+    fn reset_error(&self) -> Error {
+        Error::Io(io::Error::new(io::ErrorKind::ConnectionReset, format!("inner TCP connection to {} was reset", self.peer)))
+    }
+
+    fn broken_pipe(&self) -> Error {
+        Error::Io(io::Error::new(io::ErrorKind::BrokenPipe, format!("inner TCP connection to {} is shut down", self.peer)))
+    }
+
+    /// Read into `buf`: `Ok(n)` with what is buffered, waiting per the read timeout while
+    /// nothing is; `Ok(0)` at EOF — the peer closed and everything it sent before its FIN
+    /// has been read — or after [`shutdown`](Self::shutdown). `Error::Timeout` when the
+    /// read timeout expired, `Io(ConnectionReset)` when the peer reset the connection,
+    /// `Error::Closed` once the stack is closed.
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let deadline = deadline_after(*lock(&self.read_timeout));
+        let read = self.stack.tcp_wait_for(deadline, |st| {
+            if self.shut.load(Ordering::SeqCst) {
+                return Some(Ok(0));
+            }
+            let s = match st.tcp_socket(self.id) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            match s.recv_slice(buf) {
+                // ESTABLISHED (or FIN-WAIT) with nothing buffered: wait.
+                Ok(0) => None,
+                Ok(n) => {
+                    st.tcp_rx_bytes += n as u64;
+                    Some(Ok(n))
+                }
+                // The peer's FIN, everything before it consumed.
+                Err(tcp::RecvError::Finished) => Some(Ok(0)),
+                // Closed without a FIN: reset.
+                Err(tcp::RecvError::InvalidState) => Some(Err(self.reset_error())),
+            }
+        })?;
+        read.ok_or(Error::Timeout("inner TCP read"))
+    }
+
+    /// Queue some of `data` for transmission: `Ok(n)` with how much the send buffer took,
+    /// waiting per the write timeout while it is full. On every error nothing was queued
+    /// (the `io::Write` contract TLS relies on): `Error::Timeout` when the write timeout
+    /// expired, `Io(BrokenPipe)` after [`shutdown`](Self::shutdown), `Io(ConnectionReset)`
+    /// when the peer reset the connection, `Error::Closed` once the stack is closed.
+    pub fn write(&self, data: &[u8]) -> Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let deadline = deadline_after(*lock(&self.write_timeout));
+        let written = self.stack.tcp_wait_for(deadline, |st| {
+            if self.shut.load(Ordering::SeqCst) {
+                return Some(Err(self.broken_pipe()));
+            }
+            let s = match st.tcp_socket(self.id) {
+                Ok(s) => s,
+                Err(e) => return Some(Err(e)),
+            };
+            match s.send_slice(data) {
+                // The send buffer is full: wait for the peer to acknowledge.
+                Ok(0) => None,
+                Ok(n) => {
+                    st.tcp_tx_bytes += n as u64;
+                    Some(Ok(n))
+                }
+                Err(tcp::SendError::InvalidState) => {
+                    Some(Err(if s.state() == TcpState::Closed { self.reset_error() } else { self.broken_pipe() }))
+                }
+            }
+        })?;
+        written.ok_or(Error::Timeout("inner TCP write"))
+    }
+
+    /// Timeout of later `read`s (`None`: wait forever). `Some(ZERO)` is an error, as in std.
+    pub fn set_read_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        if timeout == Some(Duration::ZERO) {
+            return Err(zero_timeout_error());
+        }
+        *lock(&self.read_timeout) = timeout;
+        Ok(())
+    }
+
+    /// Timeout of later `write`s (`None`: wait forever). `Some(ZERO)` is an error, as in std.
+    pub fn set_write_timeout(&self, timeout: Option<Duration>) -> Result<()> {
+        if timeout == Some(Duration::ZERO) {
+            return Err(zero_timeout_error());
+        }
+        *lock(&self.write_timeout) = timeout;
+        Ok(())
+    }
+
+    /// `true` disables Nagle's algorithm (smoltcp's `set_nagle_enabled(false)`, the
+    /// equivalent of `TCP_NODELAY`).
+    pub fn set_nodelay(&self, nodelay: bool) -> Result<()> {
+        if let Some(e) = self.stack.shared.closed_error() {
+            return Err(e);
+        }
+        let mut st = lock(&self.stack.shared.state);
+        if let Some(e) = self.stack.shared.closed_error() {
+            return Err(e);
+        }
+        st.tcp_socket(self.id)?.set_nagle_enabled(!nodelay);
+        Ok(())
+    }
+
+    /// Close both directions: a FIN to the peer (which reads EOF once it has read
+    /// everything before it); from now on our reads return EOF and our writes fail with
+    /// `BrokenPipe`. A call blocked in `read` / `write` on this stream returns. Idempotent,
+    /// and `Ok(())` also when the connection or the whole stack is already down.
+    pub fn shutdown(&self) -> Result<()> {
+        if !self.shut.swap(true, Ordering::SeqCst) && self.stack.shared.closed_error().is_none() {
+            if let Ok(s) = lock(&self.stack.shared.state).tcp_socket(self.id) {
+                s.close();
+            }
+            self.stack.shared.notify();
+        }
+        self.stack.shared.tcp_wake();
+        Ok(())
+    }
+
+    /// Our end: the inner address smoltcp chose (or the peer connected to) and the port.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer
+    }
+}
+
+impl Drop for InnerTcpStream {
+    /// Close gracefully (FIN, or nothing when the connection is already down) and leave
+    /// the socket to the stack thread, which frees it once the close handshake is over
+    /// and resets it after [`TCP_ORPHAN_LINGER`] (§11.2).
+    fn drop(&mut self) {
+        {
+            let mut st = lock(&self.stack.shared.state);
+            let State { tcp: conns, sockets, .. } = &mut *st;
+            if let Some(c) = conns.get_mut(&self.id) {
+                c.orphaned = Some(Instant::now());
+                sockets.get_mut::<tcp::Socket>(c.handle).close();
+            }
+        }
+        self.stack.shared.notify();
+    }
+}
+
+impl std::fmt::Debug for InnerTcpStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InnerTcpStream").field("local", &self.local).field("peer", &self.peer).finish()
+    }
+}
+
+impl InnerTcpListener {
+    /// Wait at most `timeout` for a connection (`Duration::MAX`: until one arrives):
+    /// `Ok(Some((stream, peer)))`, `Ok(None)` on timeout, `Error::Closed` once the stack is
+    /// closed. The backlog slot the connection arrived on gets a fresh listening socket
+    /// at once (§11.2).
+    pub fn accept_timeout(&self, timeout: Duration) -> Result<Option<(InnerTcpStream, SocketAddr)>> {
+        let deadline = Instant::now().checked_add(timeout);
+        let accepted = self.stack.tcp_wait_for(deadline, |st| st.accept_pending(self.port, self.id))?;
+        Ok(accepted.map(|(id, local, peer)| {
+            debug!("inner TCP accepted {peer} on {local}");
+            (InnerTcpStream::new(self.stack.clone(), id, local, peer), peer)
+        }))
+    }
+
+    /// The listening port with the stack's first inner address (IPv6 before IPv4, like
+    /// [`InnerUdpSocket::local_addr`]); the listener takes connections to every inner
+    /// address. `[::]:port` if the stack has no address at all.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local
+    }
+
+    pub fn local_port(&self) -> u16 {
+        self.port
+    }
+}
+
+impl Drop for InnerTcpListener {
+    /// Remove the listening sockets; a connection nobody accepted is reset (as an OS
+    /// listener does with its accept queue) and freed once the RST is out.
+    fn drop(&mut self) {
+        {
+            let mut st = lock(&self.stack.shared.state);
+            if st.listeners.get(&self.port).is_some_and(|l| l.id == self.id)
+                && let Some(l) = st.listeners.remove(&self.port)
+            {
+                for h in l.slots {
+                    let s = st.sockets.get_mut::<tcp::Socket>(h);
+                    if s.state() == TcpState::Listen || (s.state() == TcpState::Closed && s.remote_endpoint().is_none()) {
+                        st.free_tcp_socket(h, self.port);
+                    } else {
+                        s.abort();
+                        let id = st.next_tcp_id();
+                        st.tcp.insert(id, TcpConn { handle: h, port: self.port, outbound: false, orphaned: Some(Instant::now()) });
+                    }
+                }
+            }
+        }
+        self.stack.shared.notify();
+        debug!("inner TCP listener on port {} closed", self.port);
+    }
+}
+
+impl std::fmt::Debug for InnerTcpListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InnerTcpListener").field("local", &self.local).finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests: an in-process two-stack loopback (no ESP needed)
 // ---------------------------------------------------------------------------
 
@@ -1043,6 +1805,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// Test knobs of one direction of the loopback wire.
+    #[derive(Default)]
+    pub(crate) struct WireCtl {
+        /// Record every packet but deliver none (a path that eats everything).
+        blackhole: AtomicBool,
+        /// Sleep this long inside the sink — on the sending stack's thread, with its lock
+        /// held — standing in for a congested outer socket.
+        stall_ms: AtomicU64,
+        /// Set once the sink entered a stall.
+        stalled: AtomicBool,
+    }
+
     /// One direction of the loopback "wire": the sink (which runs on the sending
     /// stack's thread, with that stack's lock held) asserts the packet fits the wire
     /// MTU (§11.1), records it and queues it; a forwarder thread pushes it into the far
@@ -1055,11 +1829,20 @@ pub(crate) mod tests {
         target: Arc<OnceLock<InnerStack>>,
         tap: Arc<Mutex<Vec<Vec<u8>>>>,
         stop: Arc<AtomicBool>,
+        ctl: Arc<WireCtl>,
     ) -> (TxSink, JoinHandle<()>) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
         let sink: TxSink = Arc::new(move |pkt: &[u8]| {
             assert!(pkt.len() <= MTU, "sink handed a {} byte packet, wire MTU is {MTU}", pkt.len());
             tap.lock().unwrap().push(pkt.to_vec());
+            let stall = ctl.stall_ms.load(Ordering::SeqCst);
+            if stall > 0 {
+                ctl.stalled.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(stall));
+            }
+            if ctl.blackhole.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             tx.send(pkt.to_vec()).map_err(|_| Error::Protocol("wire down".into()))
         });
         let forwarder = thread::Builder::new()
@@ -1093,6 +1876,9 @@ pub(crate) mod tests {
         pub(crate) b: InnerStack,
         a_wire: Arc<Mutex<Vec<Vec<u8>>>>,
         b_wire: Arc<Mutex<Vec<Vec<u8>>>>,
+        /// Knobs of the A -> B and B -> A directions.
+        a_ctl: Arc<WireCtl>,
+        b_ctl: Arc<WireCtl>,
         stop_wires: Arc<AtomicBool>,
         threads: Vec<JoinHandle<()>>,
     }
@@ -1101,17 +1887,21 @@ pub(crate) mod tests {
         fn new(a_cfg: AssignedConfig, b_cfg: AssignedConfig) -> Pair {
             let a_wire = Arc::new(Mutex::new(Vec::new()));
             let b_wire = Arc::new(Mutex::new(Vec::new()));
+            let a_ctl = Arc::new(WireCtl::default());
+            let b_ctl = Arc::new(WireCtl::default());
             let stop_wires = Arc::new(AtomicBool::new(false));
             let b_slot: Arc<OnceLock<InnerStack>> = Arc::new(OnceLock::new());
             let a_slot: Arc<OnceLock<InnerStack>> = Arc::new(OnceLock::new());
-            let (sink_a, wire_ab) = wire("wire-a-to-b", Arc::clone(&b_slot), Arc::clone(&a_wire), Arc::clone(&stop_wires));
-            let (sink_b, wire_ba) = wire("wire-b-to-a", Arc::clone(&a_slot), Arc::clone(&b_wire), Arc::clone(&stop_wires));
+            let (sink_a, wire_ab) =
+                wire("wire-a-to-b", Arc::clone(&b_slot), Arc::clone(&a_wire), Arc::clone(&stop_wires), Arc::clone(&a_ctl));
+            let (sink_b, wire_ba) =
+                wire("wire-b-to-a", Arc::clone(&a_slot), Arc::clone(&b_wire), Arc::clone(&stop_wires), Arc::clone(&b_ctl));
             let a = InnerStack::new(&a_cfg, sink_a, MTU, STACK_MTU).unwrap();
             let b = InnerStack::new(&b_cfg, sink_b, MTU, STACK_MTU).unwrap();
             let _ = b_slot.set(b.clone());
             let _ = a_slot.set(a.clone());
             let threads = vec![a.spawn().unwrap(), b.spawn().unwrap(), wire_ab, wire_ba];
-            Pair { a, b, a_wire, b_wire, stop_wires, threads }
+            Pair { a, b, a_wire, b_wire, a_ctl, b_ctl, stop_wires, threads }
         }
 
         /// Sizes of the packets A transmitted so far.
@@ -1163,14 +1953,14 @@ pub(crate) mod tests {
         let used = bindings(&[50000, 50001]);
         assert_eq!(pick_free_port(&used, 50000), Some(50002));
         assert_eq!(pick_free_port(&used, 49999), Some(49999));
-        assert_eq!(pick_free_port(&HashMap::new(), 49152), Some(49152));
+        assert_eq!(pick_free_port(&bindings(&[]), 49152), Some(49152));
     }
 
     #[test]
     fn free_port_wraps_and_clamps() {
         let used = bindings(&[65535]);
         assert_eq!(pick_free_port(&used, 65535), Some(49152));
-        assert_eq!(pick_free_port(&HashMap::new(), 80), Some(49152));
+        assert_eq!(pick_free_port(&bindings(&[]), 80), Some(49152));
     }
 
     #[test]
@@ -1996,5 +2786,541 @@ pub(crate) mod tests {
         sa.send_to(SocketAddr::new(B_V6.into(), 4444), b"still alive").unwrap();
         assert_eq!(recv(&sb).payload, b"still alive");
         assert_eq!(p.b.stats().rx_packets, 5);
+    }
+
+    // ---- TCP over the loopback (§11.2) ------------------------------------------
+
+    /// Poll `cond` every 5 ms until it holds; panics with `what` after `within`.
+    fn wait_until(within: Duration, what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + within;
+        while !cond() {
+            assert!(Instant::now() < deadline, "{what}: not within {within:?}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// B listens on an ephemeral port, A connects to B's inner address of the family,
+    /// B accepts: `(A's stream, B's stream, B's listener)`.
+    fn tcp_connection(p: &Pair, v6: bool) -> (InnerTcpStream, InnerTcpStream, InnerTcpListener) {
+        let listener = p.b.listen_tcp(0).unwrap();
+        let b_ip: IpAddr = if v6 { B_V6.into() } else { B_V4.into() };
+        let client = p.a.connect_tcp(SocketAddr::new(b_ip, listener.local_port()), WAIT).unwrap();
+        let (server, peer) = listener.accept_timeout(WAIT).unwrap().expect("accepted within the wait");
+        assert_eq!(peer, client.local_addr());
+        (client, server, listener)
+    }
+
+    fn write_all(stream: &InnerTcpStream, mut data: &[u8]) {
+        while !data.is_empty() {
+            let n = stream.write(data).unwrap_or_else(|e| panic!("write with {} bytes left: {e}", data.len()));
+            assert!(n > 0);
+            data = &data[n..];
+        }
+    }
+
+    /// Read exactly `n` bytes (EOF first panics).
+    fn read_n(stream: &InnerTcpStream, n: usize) -> Vec<u8> {
+        let mut got = Vec::with_capacity(n);
+        let mut buf = vec![0u8; 16 * 1024];
+        while got.len() < n {
+            let want = (n - got.len()).min(buf.len());
+            let r = stream.read(&mut buf[..want]).unwrap_or_else(|e| panic!("read after {} of {n} bytes: {e}", got.len()));
+            assert_ne!(r, 0, "EOF after {} of {n} bytes", got.len());
+            got.extend_from_slice(&buf[..r]);
+        }
+        got
+    }
+
+    /// `(flags, seq, ack?, MSS option, payload length)` of the TCP segment in `pkt`, if it
+    /// is one (IPv6 or unfragmented IPv4), parsed and checksum-verified by smoltcp.
+    fn tcp_summary(pkt: &[u8]) -> Option<(smoltcp::wire::TcpControl, i32, bool, Option<u16>, usize)> {
+        use smoltcp::wire::{IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, TcpRepr};
+        let caps = smoltcp::phy::ChecksumCapabilities::default();
+        let (src, dst, segment) = match pkt.first()? >> 4 {
+            6 => {
+                let ip = Ipv6Packet::new_checked(pkt).ok()?;
+                (ip.next_header() == IpProtocol::Tcp).then_some(())?;
+                (IpAddress::Ipv6(ip.src_addr()), IpAddress::Ipv6(ip.dst_addr()), &pkt[40..40 + usize::from(ip.payload_len())])
+            }
+            4 => {
+                let ip = Ipv4Packet::new_checked(pkt).ok()?;
+                (ip.next_header() == IpProtocol::Tcp && !ip.more_frags() && ip.frag_offset() == 0).then_some(())?;
+                let range = usize::from(ip.header_len())..usize::from(ip.total_len());
+                (IpAddress::Ipv4(ip.src_addr()), IpAddress::Ipv4(ip.dst_addr()), &pkt[range])
+            }
+            _ => return None,
+        };
+        let tcp = TcpPacket::new_checked(segment).ok()?;
+        let r = TcpRepr::parse(&tcp, &src, &dst, &caps).ok()?;
+        Some((r.control, r.seq_number.0, r.ack_number.is_some(), r.max_seg_size, r.payload.len()))
+    }
+
+    /// Hand-built IPv6 TCP SYN `src:sport -> dst:dport` with initial sequence `seq` and
+    /// MSS 1220, valid checksums.
+    fn ipv6_tcp_syn(src: Ipv6Addr, dst: Ipv6Addr, sport: u16, dport: u16, seq: i32) -> Vec<u8> {
+        use smoltcp::wire::{IpProtocol, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
+        let caps = smoltcp::phy::ChecksumCapabilities::default();
+        let tcp = TcpRepr {
+            src_port: sport,
+            dst_port: dport,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(seq),
+            ack_number: None,
+            window_len: 8192,
+            window_scale: None,
+            max_seg_size: Some(1220),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv6Repr { src_addr: src, dst_addr: dst, next_header: IpProtocol::Tcp, payload_len: tcp.buffer_len(), hop_limit: 64 };
+        let mut buf = vec![0u8; ip.buffer_len() + tcp.buffer_len()];
+        ip.emit(&mut Ipv6Packet::new_unchecked(&mut buf));
+        tcp.emit(&mut TcpPacket::new_unchecked(&mut buf[40..]), &IpAddress::Ipv6(src), &IpAddress::Ipv6(dst), &caps);
+        buf
+    }
+
+    #[test]
+    fn tcp_connect_accept_and_echo_both_ways_ipv6_and_ipv4() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<InnerTcpStream>();
+        assert_send_sync::<InnerTcpListener>();
+
+        let p = Pair::dual();
+        for v6 in [true, false] {
+            let (client, server, listener) = tcp_connection(&p, v6);
+            let (a_ip, b_ip): (IpAddr, IpAddr) = if v6 { (A_V6.into(), B_V6.into()) } else { (A_V4.into(), B_V4.into()) };
+            // Exact endpoints on both sides: smoltcp's source address for the family, an
+            // ephemeral source port, the listener's port.
+            assert_eq!(client.local_addr().ip(), a_ip);
+            assert!((EPHEMERAL_PORT_LO..=EPHEMERAL_PORT_HI).contains(&client.local_addr().port()));
+            assert_eq!(client.peer_addr(), SocketAddr::new(b_ip, listener.local_port()));
+            assert_eq!(server.local_addr(), client.peer_addr());
+            assert_eq!(server.peer_addr(), client.local_addr());
+            assert_eq!(listener.local_addr(), SocketAddr::new(B_V6.into(), listener.local_port()), "first inner address");
+            write_all(&client, b"REGISTER sip:example.test SIP/2.0\r\n\r\n");
+            assert_eq!(read_n(&server, 37), b"REGISTER sip:example.test SIP/2.0\r\n\r\n");
+            write_all(&server, b"SIP/2.0 200 OK\r\n\r\n");
+            assert_eq!(read_n(&client, 18), b"SIP/2.0 200 OK\r\n\r\n");
+            // Echo many small messages both ways (Nagle on and off).
+            client.set_nodelay(true).unwrap();
+            for i in 0..50u32 {
+                write_all(&client, &i.to_be_bytes());
+                let got = read_n(&server, 4);
+                write_all(&server, &got);
+                assert_eq!(read_n(&client, 4), i.to_be_bytes());
+            }
+        }
+        let (a, b) = (p.a.stats(), p.b.stats());
+        assert_eq!((a.tcp_connections_opened, b.tcp_accepted), (2, 2), "{a:?} {b:?}");
+        assert_eq!(a.tcp_tx_bytes, 2 * (37 + 200), "{a:?}");
+        assert_eq!(a.tcp_rx_bytes, 2 * (18 + 200), "{a:?}");
+        assert_eq!((b.tcp_tx_bytes, b.tcp_rx_bytes), (a.tcp_rx_bytes, a.tcp_tx_bytes), "{b:?}");
+    }
+
+    #[test]
+    fn tcp_100_kib_each_way_fits_the_wire_mtu_without_fragmentation_and_with_backpressure() {
+        let p = Pair::dual();
+        for v6 in [true, false] {
+            let (client, server, _listener) = tcp_connection(&p, v6);
+            // Bounded, so a failed assertion below cannot leave the scope waiting forever.
+            client.set_write_timeout(Some(WAIT)).unwrap();
+            server.set_write_timeout(Some(WAIT)).unwrap();
+            let data: Vec<u8> = (0..100 * 1024u32).map(|i| (i % 251) as u8).collect();
+            let before = p.a.stats().tcp_tx_bytes;
+            thread::scope(|sc| {
+                let writer = sc.spawn(|| write_all(&client, &data));
+                // Nobody reads yet: the writer stalls once B's receive window and then A's
+                // send buffer (32 KiB each) are full — exactly 64 KiB accepted.
+                thread::sleep(Duration::from_millis(300));
+                assert!(!writer.is_finished(), "100 KiB cannot fit 2 x {TCP_BUFFER_BYTES} bytes of buffering");
+                let queued = p.a.stats().tcp_tx_bytes - before;
+                assert_eq!(queued, 2 * TCP_BUFFER_BYTES as u64, "v6={v6}: the write blocks on a full window");
+                assert_eq!(read_n(&server, data.len()), data, "v6={v6}: 100 KiB intact and in order");
+                writer.join().unwrap();
+            });
+            // And back the other way.
+            thread::scope(|sc| {
+                let writer = sc.spawn(|| write_all(&server, &data));
+                assert_eq!(read_n(&client, data.len()), data);
+                writer.join().unwrap();
+            });
+        }
+        // Every segment fit the wire MTU (each sink asserts it) WITHOUT IP fragmentation:
+        // both SYNs announced the wire MSS, so full segments are exactly 1280 bytes.
+        for (name, stats, wire) in [("a", p.a.stats(), p.a_wire.lock().unwrap().clone()), ("b", p.b.stats(), p.b_wire.lock().unwrap().clone())] {
+            assert_eq!((stats.tx_fragmented, stats.tx_frag_drops, stats.rx_fragments), (0, 0, 0), "{name}: {stats:?}");
+            assert_eq!(wire.iter().map(Vec::len).max(), Some(MTU), "{name}: full-sized segments are wire-sized");
+            let syns: Vec<_> = wire.iter().filter_map(|pkt| tcp_summary(pkt)).filter(|t| t.0 == smoltcp::wire::TcpControl::Syn).collect();
+            let mss: Vec<_> = syns.iter().map(|t| t.3).collect();
+            assert_eq!(mss, vec![Some(1220), Some(1240)], "{name}: one SYN (or SYN-ACK) per family, MSS clamped to the wire");
+            assert_eq!(stats.tcp_mss_clamped, 2, "{name}: our own two SYNs were clamped, the peer's arrived clamped already");
+            let biggest = wire.iter().filter_map(|pkt| tcp_summary(pkt)).map(|t| t.4).max();
+            assert_eq!(biggest, Some(1240), "{name}: the largest payload is the IPv4 MSS");
+        }
+    }
+
+    #[test]
+    fn tcp_eof_after_the_peer_shuts_down_and_writes_after_shutdown_fail() {
+        let p = Pair::dual();
+        let (client, server, _listener) = tcp_connection(&p, true);
+        write_all(&client, b"last words");
+        client.shutdown().unwrap();
+        client.shutdown().unwrap(); // idempotent
+        // The data before the FIN is read in full, then EOF — repeatedly.
+        assert_eq!(read_n(&server, 10), b"last words");
+        server.set_read_timeout(Some(WAIT)).unwrap();
+        assert_eq!(server.read(&mut [0u8; 16]).unwrap(), 0, "EOF after the peer's FIN");
+        assert_eq!(server.read(&mut [0u8; 16]).unwrap(), 0, "EOF stays EOF");
+        // The half-closed side can still write until it shuts down too...
+        write_all(&server, b"bye");
+        server.shutdown().unwrap();
+        // ...but our own reads after shutdown are EOF and writes fail with BrokenPipe.
+        assert_eq!(client.read(&mut [0u8; 16]).unwrap(), 0, "shut down: EOF");
+        let e = client.write(b"x").unwrap_err();
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe), "{e}");
+        let e = server.write(b"x").unwrap_err();
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::BrokenPipe), "{e}");
+        assert_eq!(server.read(&mut []).unwrap(), 0, "an empty buffer reads nothing");
+    }
+
+    #[test]
+    fn tcp_read_timeout_expires_and_no_timeout_waits_for_data() {
+        let p = Pair::dual();
+        let (client, server, listener) = tcp_connection(&p, true);
+        server.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let started = Instant::now();
+        let e = server.read(&mut [0u8; 8]).unwrap_err();
+        assert!(matches!(e, Error::Timeout(_)), "{e}");
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(190) && waited < Duration::from_secs(2), "{waited:?}");
+        // No timeout: the read waits as long as it takes for data to arrive.
+        server.set_read_timeout(None).unwrap();
+        thread::scope(|sc| {
+            let reader = sc.spawn(|| {
+                let mut buf = [0u8; 8];
+                let n = server.read(&mut buf).unwrap();
+                (buf[..n].to_vec(), Instant::now())
+            });
+            thread::sleep(Duration::from_millis(300));
+            let sent = Instant::now();
+            write_all(&client, b"late");
+            let (got, at) = reader.join().unwrap();
+            assert_eq!(got, b"late");
+            assert!(at >= sent);
+        });
+        // accept_timeout(Duration::MAX) is "until a connection arrives", not a panic.
+        thread::scope(|sc| {
+            let acceptor = sc.spawn(|| listener.accept_timeout(Duration::MAX));
+            thread::sleep(Duration::from_millis(50));
+            let c2 = p.a.connect_tcp(SocketAddr::new(B_V6.into(), listener.local_port()), Duration::MAX).unwrap();
+            let (_s2, peer) = acceptor.join().unwrap().unwrap().expect("accepted");
+            assert_eq!(peer, c2.local_addr());
+        });
+        // The zero timeout is refused, as by std.
+        assert!(matches!(server.set_read_timeout(Some(Duration::ZERO)), Err(Error::Io(ref e)) if e.kind() == io::ErrorKind::InvalidInput));
+    }
+
+    #[test]
+    fn tcp_connect_to_a_port_nobody_listens_on_is_refused_at_once() {
+        let p = Pair::dual();
+        for dst in [SocketAddr::new(B_V6.into(), 5999), SocketAddr::new(B_V4.into(), 5999)] {
+            let started = Instant::now();
+            let e = p.a.connect_tcp(dst, WAIT).unwrap_err();
+            assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::ConnectionRefused), "{dst}: {e}");
+            assert!(started.elapsed() < Duration::from_secs(1), "{dst}: refused only after {:?}", started.elapsed());
+        }
+        let st = p.a.stats();
+        assert_eq!((st.tcp_sockets, st.tcp_connections_opened), (0, 0), "a refused socket is freed at once: {st:?}");
+        // No family, no address: refused up front, and so is a port of 0.
+        let v6_only = Pair::new(assigned(Some(A_V6), None, None, None), assigned(Some(B_V6), Some(B_V4), None, None));
+        let e = v6_only.a.connect_tcp(SocketAddr::new(B_V4.into(), 5060), WAIT).unwrap_err();
+        assert!(matches!(e, Error::Config(ref m) if m.contains("IPv4")), "{e}");
+        let e = p.a.connect_tcp(SocketAddr::new(B_V6.into(), 0), WAIT).unwrap_err();
+        assert!(matches!(e, Error::Config(_)), "{e}");
+    }
+
+    #[test]
+    fn tcp_connect_times_out_when_the_syns_are_lost() {
+        let p = Pair::dual();
+        let listener = p.b.listen_tcp(5060).unwrap();
+        p.a_ctl.blackhole.store(true, Ordering::SeqCst);
+        let started = Instant::now();
+        let e = p.a.connect_tcp(SocketAddr::new(B_V6.into(), 5060), Duration::from_millis(300)).unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(e, Error::Timeout(_)), "{e}");
+        assert!(waited >= Duration::from_millis(290) && waited < Duration::from_secs(2), "{waited:?}");
+        let syns = p.a_wire.lock().unwrap().iter().filter_map(|pkt| tcp_summary(pkt)).filter(|t| t.0 == smoltcp::wire::TcpControl::Syn).count();
+        assert!(syns >= 1, "the SYN was sent (and eaten)");
+        assert_eq!(p.a.stats().tcp_sockets, 0, "the abandoned socket is freed");
+        // The path comes back: the next connect works and the listener saw nothing stale.
+        p.a_ctl.blackhole.store(false, Ordering::SeqCst);
+        let client = p.a.connect_tcp(SocketAddr::new(B_V6.into(), 5060), WAIT).unwrap();
+        let (server, peer) = listener.accept_timeout(WAIT).unwrap().expect("accepted");
+        assert_eq!(peer, client.local_addr());
+        write_all(&client, b"ok");
+        assert_eq!(read_n(&server, 2), b"ok");
+        assert!(listener.accept_timeout(Duration::from_millis(100)).unwrap().is_none(), "exactly one connection");
+    }
+
+    #[test]
+    fn tcp_lost_syn_ack_is_recovered_by_retransmission_with_exactly_one_connection() {
+        let p = Pair::dual();
+        let listener = p.b.listen_tcp(5060).unwrap();
+        let syn_acks = || {
+            p.b_wire.lock().unwrap().iter().filter_map(|pkt| tcp_summary(pkt)).filter(|t| t.0 == smoltcp::wire::TcpControl::Syn && t.2).count()
+        };
+        // B's answers are lost until A has retransmitted its SYN.
+        p.b_ctl.blackhole.store(true, Ordering::SeqCst);
+        thread::scope(|sc| {
+            let connector = sc.spawn(|| p.a.connect_tcp(SocketAddr::new(B_V6.into(), 5060), Duration::from_secs(15)));
+            wait_until(WAIT, "B answers the first SYN", || syn_acks() >= 1);
+            // A's retransmission (1 s RTO) reaches B while its first slot is in
+            // SYN-RECEIVED: it must not open a second half-connection on the other slot.
+            wait_until(WAIT, "A's SYN retransmission reaches B", || p.b.stats().tcp_dup_syn_drops >= 1);
+            p.b_ctl.blackhole.store(false, Ordering::SeqCst);
+            // B's own SYN-ACK retransmission completes the handshake.
+            let client = connector.join().unwrap().expect("connected after the retransmissions");
+            let (server, peer) = listener.accept_timeout(WAIT).unwrap().expect("accepted");
+            assert_eq!(peer, client.local_addr());
+            write_all(&client, b"one");
+            assert_eq!(read_n(&server, 3), b"one");
+            write_all(&server, b"two");
+            assert_eq!(read_n(&client, 3), b"two");
+        });
+        assert!(listener.accept_timeout(Duration::from_millis(200)).unwrap().is_none(), "exactly one connection");
+        let isns: Vec<i32> =
+            p.b_wire.lock().unwrap().iter().filter_map(|pkt| tcp_summary(pkt)).filter(|t| t.0 == smoltcp::wire::TcpControl::Syn).map(|t| t.1).collect();
+        assert!(isns.len() >= 2 && isns.iter().all(|isn| *isn == isns[0]), "every SYN-ACK of the one handshake: {isns:?}");
+    }
+
+    #[test]
+    fn tcp_accept_timeout_without_a_client_returns_none() {
+        let p = Pair::dual();
+        let listener = p.b.listen_tcp(0).unwrap();
+        let started = Instant::now();
+        assert!(listener.accept_timeout(Duration::from_millis(150)).unwrap().is_none());
+        assert!(started.elapsed() >= Duration::from_millis(140), "{:?}", started.elapsed());
+        assert!(listener.accept_timeout(Duration::ZERO).unwrap().is_none());
+        assert_eq!(p.b.stats().tcp_sockets, TCP_LISTEN_BACKLOG as u64);
+    }
+
+    #[test]
+    fn tcp_listener_backlog_takes_two_connections_and_is_refilled_on_accept() {
+        let p = Pair::dual();
+        let listener = p.b.listen_tcp(5060).unwrap();
+        let to = SocketAddr::new(B_V6.into(), 5060);
+        // Both backlog slots complete their handshakes before anything is accepted...
+        let c1 = p.a.connect_tcp(to, WAIT).unwrap();
+        let c2 = p.a.connect_tcp(to, WAIT).unwrap();
+        // ...and a third SYN finds no listening socket: RST, like a full accept queue.
+        let e = p.a.connect_tcp(to, WAIT).unwrap_err();
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::ConnectionRefused), "{e}");
+        // Accepting one refills its slot at once, so the next connect succeeds.
+        let (s1, peer1) = listener.accept_timeout(WAIT).unwrap().expect("first");
+        let c3 = p.a.connect_tcp(to, WAIT).unwrap();
+        let (s2, peer2) = listener.accept_timeout(WAIT).unwrap().expect("second");
+        let (s3, peer3) = listener.accept_timeout(WAIT).unwrap().expect("third");
+        assert!(listener.accept_timeout(Duration::from_millis(50)).unwrap().is_none(), "nothing else pending");
+        let mut peers = vec![peer1, peer2, peer3];
+        peers.sort();
+        let mut locals = vec![c1.local_addr(), c2.local_addr(), c3.local_addr()];
+        locals.sort();
+        assert_eq!(peers, locals, "each connection accepted exactly once");
+        // Each accepted stream talks to its own client.
+        for (client, server) in [&c1, &c2, &c3].into_iter().filter_map(|c| {
+            [&s1, &s2, &s3].into_iter().find(|s| s.peer_addr() == c.local_addr()).map(|s| (c, s))
+        }) {
+            write_all(client, &client.local_addr().port().to_be_bytes());
+            assert_eq!(read_n(server, 2), client.local_addr().port().to_be_bytes());
+        }
+        let (a, b) = (p.a.stats(), p.b.stats());
+        assert_eq!((a.tcp_connections_opened, b.tcp_accepted), (3, 3), "{a:?} {b:?}");
+        assert_eq!(b.tcp_sockets, 3 + TCP_LISTEN_BACKLOG as u64, "three streams and a full backlog: {b:?}");
+    }
+
+    #[test]
+    fn tcp_listening_on_a_taken_port_is_addr_in_use() {
+        let p = Pair::dual();
+        let l = p.b.listen_tcp(5060).unwrap();
+        let e = p.b.listen_tcp(5060).unwrap_err();
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::AddrInUse), "{e}");
+        assert!(e.to_string().contains("already in use"), "{e}");
+        // UDP and TCP port spaces are separate.
+        let _udp = p.b.bind_udp(5060).unwrap();
+        // Ephemeral listeners get distinct ports.
+        let (e1, e2) = (p.b.listen_tcp(0).unwrap(), p.b.listen_tcp(0).unwrap());
+        assert_ne!(e1.local_port(), e2.local_port());
+        assert!([e1.local_port(), e2.local_port()].iter().all(|port| (EPHEMERAL_PORT_LO..=EPHEMERAL_PORT_HI).contains(port)));
+        // The local port of an outbound connection is taken too.
+        let out_listener = p.a.listen_tcp(0).unwrap();
+        let out = p.b.connect_tcp(SocketAddr::new(A_V6.into(), out_listener.local_port()), WAIT).unwrap();
+        let e = p.b.listen_tcp(out.local_addr().port()).unwrap_err();
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::AddrInUse), "{e}");
+        // Dropping the listener frees the port.
+        drop(l);
+        let again = p.b.listen_tcp(5060).expect("port free after drop");
+        assert_eq!(again.local_port(), 5060);
+    }
+
+    #[test]
+    fn tcp_dropped_streams_are_reaped_once_the_close_handshake_is_over() {
+        let p = Pair::dual();
+        let (client, server, listener) = tcp_connection(&p, true);
+        write_all(&client, b"x");
+        assert_eq!(read_n(&server, 1), b"x");
+        assert_eq!((p.a.stats().tcp_sockets, p.b.stats().tcp_sockets), (1, 1 + TCP_LISTEN_BACKLOG as u64));
+        // A closes first (FIN-WAIT, then TIME-WAIT); B reads EOF and closes (LAST-ACK).
+        drop(client);
+        server.set_read_timeout(Some(WAIT)).unwrap();
+        assert_eq!(server.read(&mut [0u8; 4]).unwrap(), 0);
+        drop(server);
+        // B's socket is done as soon as A acknowledges its FIN.
+        wait_until(Duration::from_secs(3), "B reaps its LAST-ACK socket", || p.b.stats().tcp_sockets == TCP_LISTEN_BACKLOG as u64);
+        // A's waits out smoltcp's 10 s TIME-WAIT first.
+        wait_until(Duration::from_secs(15), "A reaps its TIME-WAIT socket", || p.a.stats().tcp_sockets == 0);
+        drop(listener);
+        assert_eq!(p.b.stats().tcp_sockets, 0, "the listener's backlog slots go with it");
+        let a = p.a.stats();
+        assert_eq!(a.tcp_connections_opened, 1, "{a:?}");
+    }
+
+    #[test]
+    fn tcp_dropping_a_listener_resets_the_connections_nobody_accepted() {
+        let p = Pair::dual();
+        let listener = p.b.listen_tcp(0).unwrap();
+        let client = p.a.connect_tcp(SocketAddr::new(B_V6.into(), listener.local_port()), WAIT).unwrap();
+        drop(listener);
+        client.set_read_timeout(Some(WAIT)).unwrap();
+        let e = client.read(&mut [0u8; 8]).unwrap_err();
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::ConnectionReset), "{e}");
+        let e = client.write(b"x").unwrap_err();
+        assert!(matches!(e, Error::Io(ref io) if io.kind() == io::ErrorKind::ConnectionReset), "{e}");
+        wait_until(Duration::from_secs(3), "B frees the reset socket", || p.b.stats().tcp_sockets == 0);
+        drop(client);
+        wait_until(Duration::from_secs(3), "A frees the dead socket", || p.a.stats().tcp_sockets == 0);
+    }
+
+    #[test]
+    fn tcp_retransmitted_syn_never_reaches_a_listening_backlog_slot() {
+        // B alone, its transmissions captured: SYNs are pushed in by hand.
+        let tap = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink: TxSink = {
+            let tap = Arc::clone(&tap);
+            Arc::new(move |pkt: &[u8]| {
+                tap.lock().unwrap().push(pkt.to_vec());
+                Ok(())
+            })
+        };
+        let b = InnerStack::new(&assigned(Some(B_V6), None, None, None), sink, MTU, STACK_MTU).unwrap();
+        let t = b.spawn().unwrap();
+        let listener = b.listen_tcp(5060).unwrap();
+        let syn_acks = |port: u16| -> Vec<i32> {
+            tap.lock()
+                .unwrap()
+                .iter()
+                .filter(|pkt| u16::from_be_bytes([pkt[42], pkt[43]]) == port)
+                .filter_map(|pkt| tcp_summary(pkt))
+                .filter(|t| t.0 == smoltcp::wire::TcpControl::Syn && t.2)
+                .map(|t| t.1)
+                .collect()
+        };
+        let syn = ipv6_tcp_syn(A_V6, B_V6, 40000, 5060, 1000);
+        b.push_rx(syn.clone());
+        wait_until(WAIT, "B answers the SYN", || !syn_acks(40000).is_empty());
+        // The peer retransmits its SYN (our SYN-ACK was lost): one slot is in SYN-RECEIVED
+        // for that 4-tuple, the other still listens. The duplicate must not open a second
+        // half-connection with another ISN.
+        b.push_rx(syn.clone());
+        b.push_rx(syn);
+        assert_eq!(b.stats().tcp_dup_syn_drops, 2);
+        // smoltcp's own SYN-ACK retransmission (1 s RTO) still comes, with the same ISN.
+        wait_until(Duration::from_secs(3), "the SYN-ACK is retransmitted", || syn_acks(40000).len() >= 2);
+        let isns = syn_acks(40000);
+        assert!(isns.iter().all(|isn| *isn == isns[0]), "one handshake, one ISN: {isns:?}");
+        // A SYN from another source port is a new connection and takes the free slot.
+        b.push_rx(ipv6_tcp_syn(A_V6, B_V6, 40001, 5060, 5000));
+        wait_until(WAIT, "B answers the second client", || !syn_acks(40001).is_empty());
+        assert_eq!(b.stats().tcp_dup_syn_drops, 2);
+        assert_ne!(syn_acks(40001)[0], isns[0]);
+        drop(listener);
+        b.stop();
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_close_fails_a_blocked_read_write_accept_and_connect_at_once() {
+        let p = Pair::dual();
+        let (reader_side, _server, _listener) = tcp_connection(&p, true);
+        let (writer_side, _silent_server, _listener2) = tcp_connection(&p, false);
+        let a_listener = p.a.listen_tcp(0).unwrap();
+        // Nobody owns that address, so the SYN goes unanswered. (Not `…:c::1`: smoltcp
+        // 0.14's `has_solicited_node` compares only the low 16 bits of a destination with
+        // its own addresses, without checking for the ff02::1:ff00:0/104 prefix, so B
+        // would take any unicast `…::1` for itself and answer with RST.)
+        let nowhere = SocketAddr::new(Ipv6Addr::new(0x2001, 0xdb8, 0xc, 0, 0, 0, 0, 0x99).into(), 5060);
+        let long = Duration::from_secs(10);
+        reader_side.set_read_timeout(Some(long)).unwrap();
+        writer_side.set_write_timeout(Some(long)).unwrap();
+        let (results, closed_at) = thread::scope(|sc| {
+            let read = sc.spawn(|| (reader_side.read(&mut [0u8; 8]).map(|_| ()), Instant::now()));
+            let write = sc.spawn(|| {
+                // The peer never reads: the buffers fill and a write parks.
+                let chunk = vec![0u8; 16 * 1024];
+                loop {
+                    if let Err(e) = writer_side.write(&chunk) {
+                        return (Err(e), Instant::now());
+                    }
+                }
+            });
+            let accept = sc.spawn(|| (a_listener.accept_timeout(long).map(|_| ()), Instant::now()));
+            let connect = sc.spawn(|| (p.a.connect_tcp(nowhere, long).map(|_| ()), Instant::now()));
+            thread::sleep(Duration::from_millis(300));
+            let closed_at = Instant::now();
+            p.a.close("tunnel torn down");
+            let results: Vec<_> = [read, write, accept, connect].into_iter().map(|h| h.join().unwrap()).collect();
+            (results, closed_at)
+        });
+        for ((r, woke_at), what) in results.into_iter().zip(["read", "write", "accept", "connect"]) {
+            assert!(matches!(r, Err(Error::Closed(ref why)) if why == "tunnel torn down"), "{what}: {r:?}");
+            assert!(woke_at.duration_since(closed_at) < Duration::from_secs(1), "{what} woke at its own timeout");
+        }
+        // Every later call fails the same way; shutdown stays idempotent.
+        assert!(matches!(reader_side.read(&mut [0u8; 8]), Err(Error::Closed(_))));
+        assert!(matches!(writer_side.write(b"x"), Err(Error::Closed(_))));
+        assert!(matches!(reader_side.set_nodelay(true), Err(Error::Closed(_))));
+        reader_side.shutdown().expect("shutdown after close is Ok");
+        assert!(matches!(a_listener.accept_timeout(Duration::ZERO), Err(Error::Closed(_))));
+        assert!(matches!(p.a.connect_tcp(nowhere, WAIT), Err(Error::Closed(_))));
+        assert!(matches!(p.a.listen_tcp(0), Err(Error::Closed(_))));
+        assert_eq!(p.a.stats().tcp_sockets, 0);
+    }
+
+    /// The TCP twin of `close_wakes_a_blocked_receiver_while_the_stack_thread_is_in_a_slow_send`:
+    /// a parked read must not wait for the poll that holds `state` (DESIGN §17.6).
+    #[test]
+    fn tcp_close_wakes_a_blocked_reader_while_the_stack_thread_is_in_a_slow_send() {
+        let p = Pair::dual();
+        let (client, _server, _listener) = tcp_connection(&p, true);
+        thread::scope(|sc| {
+            let reader = sc.spawn(|| (client.read(&mut [0u8; 8]), Instant::now()));
+            thread::sleep(Duration::from_millis(100));
+            // Get A's stack thread into the sink, holding `state`, for 1.5 s.
+            p.a_ctl.stall_ms.store(1500, Ordering::SeqCst);
+            write_all(&client, b"x");
+            wait_until(WAIT, "A's stack thread reaches the sink", || p.a_ctl.stalled.load(Ordering::SeqCst));
+            let closed_at = Instant::now();
+            let closer = sc.spawn(|| p.a.close("gateway stopped answering"));
+            let (r, woke_at) = reader.join().unwrap();
+            assert!(matches!(r, Err(Error::Closed(ref why)) if why == "gateway stopped answering"), "{r:?}");
+            assert!(
+                woke_at.duration_since(closed_at) < Duration::from_secs(1),
+                "the reader waited {:?} for the poll to finish",
+                woke_at.duration_since(closed_at)
+            );
+            p.a_ctl.stall_ms.store(0, Ordering::SeqCst);
+            closer.join().unwrap();
+        });
     }
 }

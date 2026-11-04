@@ -172,9 +172,9 @@ fn live_tmobile_tunnel() {
         return live_in_process();
     }
     let exe = env!("CARGO_BIN_EXE_epdg-connect");
-    println!("driving {exe} --hold 25 (set EPDG_LIVE_INPROCESS=1 to run in-process)");
+    println!("driving {exe} --hold 25 --tcp-probe (set EPDG_LIVE_INPROCESS=1 to run in-process)");
     let out = std::process::Command::new(exe)
-        .args(["--hold", "25"])
+        .args(["--hold", "25", "--tcp-probe"])
         .env("RUST_LOG", std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .output()
         .expect("spawn epdg-connect");
@@ -188,6 +188,12 @@ fn live_tmobile_tunnel() {
         stdout.contains("ueb2bprod.pc.t-mobile.com -> [") && !stdout.contains("ueb2bprod.pc.t-mobile.com -> []"),
         "P-CSCF did not resolve over the tunnel"
     );
+    // `--tcp-probe`: one inner TCP handshake with the P-CSCF (DESIGN §11.2). Reported, not
+    // asserted: whether the P-CSCF accepts TCP on that port is not known.
+    match stdout.lines().find(|l| l.starts_with("TCP-PROBE")) {
+        Some(line) => println!("tcp probe: {line}"),
+        None => println!("tcp probe: no TCP-PROBE line in the epdg-connect output"),
+    }
 }
 
 /// Live MOBIKE address update: drive the same stable-path CLI, force one move part way

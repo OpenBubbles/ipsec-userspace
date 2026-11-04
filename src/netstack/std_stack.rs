@@ -388,8 +388,7 @@ impl TcpListenerLike for StdTcpListener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::netstack::StreamIo;
-    use crate::netstack::tests::{SILENCE, WAIT, exercise_udp, exercise_udp_via, recv};
+    use crate::netstack::tests::{SILENCE, WAIT, exercise_tcp, exercise_tcp_write_timeout, exercise_udp, exercise_udp_via, recv};
     use std::sync::Arc;
 
     const V4_LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
@@ -579,191 +578,18 @@ mod tests {
 
     // ---- TCP ----------------------------------------------------------------
 
-    /// The TCP exercise of DESIGN.md §16 on `lo`.
-    fn exercise_tcp(stack: &dyn NetStack, lo: IpAddr) {
-        let listener = stack.listen_tcp(0).unwrap();
-        let port = listener.local_addr().port();
-        assert_ne!(port, 0, "listener reports its bound port");
-        assert_eq!(listener.local_addr().ip(), lo);
-        assert!(listener.accept_timeout(SILENCE).unwrap().is_none(), "accept_timeout -> None on silence");
-        assert!(listener.accept_timeout(Duration::ZERO).unwrap().is_none());
-
-        let remote = SocketAddr::new(lo, port);
-        let client = thread::spawn(move || {
-            let s = StdNetStack::with_bind_addr(lo);
-            s.connect_tcp(remote, WAIT)
-        });
-        let (server, peer) = listener.accept_timeout(WAIT).unwrap().expect("accepted within the wait");
-        let client = client.join().unwrap().unwrap();
-        assert_eq!(peer, client.local_addr());
-        assert_eq!(server.peer_addr(), client.local_addr());
-        assert_eq!(server.local_addr(), client.peer_addr());
-        assert_eq!(client.peer_addr(), remote);
-        client.set_nodelay(true).unwrap();
-        server.set_nodelay(true).unwrap();
-
-        // Shared by a reader thread and a writer thread through Arc<dyn TcpStreamLike>.
-        let client: Arc<dyn TcpStreamLike> = Arc::from(client);
-        let server: Arc<dyn TcpStreamLike> = Arc::from(server);
-        let reader = {
-            let client = Arc::clone(&client);
-            thread::spawn(move || {
-                let mut got = Vec::new();
-                let mut buf = [0u8; 64];
-                while got.len() < 11 {
-                    let n = client.read(&mut buf).unwrap();
-                    assert_ne!(n, 0, "unexpected EOF");
-                    got.extend_from_slice(&buf[..n]);
-                }
-                got
-            })
-        };
-        let writer = {
-            let client = Arc::clone(&client);
-            thread::spawn(move || client.write_all(b"from client"))
-        };
-        server.write_all(b"from server").unwrap();
-        writer.join().unwrap().unwrap();
-        assert_eq!(reader.join().unwrap(), b"from server");
-        let mut buf = [0u8; 64];
-        let mut got = Vec::new();
-        while got.len() < 11 {
-            let n = server.read(&mut buf).unwrap();
-            assert_ne!(n, 0);
-            got.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(got, b"from client");
-
-        // Read timeout.
-        server.set_read_timeout(Some(SILENCE)).unwrap();
-        let started = Instant::now();
-        let e = server.read(&mut buf).unwrap_err();
-        assert!(matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{e}");
-        assert!(started.elapsed() < WAIT, "{:?}", started.elapsed());
-        server.set_read_timeout(None).unwrap();
-        server.set_write_timeout(Some(WAIT)).unwrap();
-
-        // StreamIo: Read + Write over the same connection.
-        {
-            let mut io = StreamIo(&*client);
-            io.write_all(b"via StreamIo").unwrap();
-            io.flush().unwrap();
-            let mut sio = StreamIo(&*server);
-            let mut got = vec![0u8; 12];
-            sio.read_exact(&mut got).unwrap();
-            assert_eq!(got, b"via StreamIo");
-            sio.write_all(b"back").unwrap();
-            let mut back = [0u8; 4];
-            io.read_exact(&mut back).unwrap();
-            assert_eq!(&back, b"back");
-        }
-
-        // EOF after the peer shuts down.
-        client.shutdown().unwrap();
-        server.set_read_timeout(Some(WAIT)).unwrap();
-        assert_eq!(server.read(&mut buf).unwrap(), 0, "EOF after peer shutdown");
-        // The normal teardown after reading EOF: shutting down our side succeeds
-        // even though the OS (macOS: ENOTCONN) considers the connection gone already;
-        // so does shutting down twice.
-        server.shutdown().unwrap_or_else(|e| panic!("shutdown after peer EOF: {e}"));
-        server.shutdown().unwrap_or_else(|e| panic!("second shutdown: {e}"));
-        client.shutdown().unwrap_or_else(|e| panic!("shutdown of the already shut-down side: {e}"));
-        // Writing to a shut-down stream fails (immediately or once the RST lands).
-        let mut write_failed = false;
-        for _ in 0..50 {
-            if client.write_all(b"after shutdown").is_err() {
-                write_failed = true;
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        assert!(write_failed, "write after shutdown eventually errors");
-
-        // Connecting to a closed port fails within the timeout.
-        let closed_port = {
-            let l = stack.listen_tcp(0).unwrap();
-            l.local_addr().port()
-        };
-        let started = Instant::now();
-        let e = stack.connect_tcp(SocketAddr::new(lo, closed_port), Duration::from_secs(2)).unwrap_err();
-        assert!(started.elapsed() < Duration::from_secs(3), "{e} after {:?}", started.elapsed());
-        assert_ne!(e.kind(), ErrorKind::Unsupported);
-        // A zero budget is a timeout (or the refusal), never InvalidInput about the timeout.
-        let e = stack.connect_tcp(SocketAddr::new(lo, closed_port), Duration::ZERO).unwrap_err();
-        assert_ne!(e.kind(), ErrorKind::InvalidInput, "{e}");
-        assert!(matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::ConnectionRefused | ErrorKind::WouldBlock), "{e}");
-    }
-
     /// `StreamIo::write` (and `TcpStreamLike::write`) keep the `io::Write` contract
     /// under a write timeout: an `Err` never consumed bytes. TLS relies on that to
     /// retry a record; the old `write_all`-based adapter delivered a partial record
     /// and then reported failure.
     #[test]
     fn write_under_a_write_timeout_never_loses_bytes() {
-        use io::Write;
-        let stack = StdNetStack::with_bind_addr(V4_LO);
-        let listener = stack.listen_tcp(0).unwrap();
-        let remote = listener.local_addr();
-        let connector = thread::spawn(move || StdNetStack::with_bind_addr(V4_LO).connect_tcp(remote, WAIT));
-        let (server, _) = listener.accept_timeout(WAIT).unwrap().expect("accepted");
-        let client = connector.join().unwrap().unwrap();
-        client.set_write_timeout(Some(Duration::from_millis(150))).unwrap();
-
-        // The peer does not read: fill the socket buffers until a write times out,
-        // accounting every byte the stream reported as accepted.
-        let chunk = vec![0x5au8; 256 * 1024];
-        let mut accepted = 0usize;
-        let mut io = StreamIo(&*client);
-        let started = Instant::now();
-        let e = loop {
-            match io.write(&chunk) {
-                Ok(0) => panic!("write returned Ok(0)"),
-                Ok(n) => accepted += n,
-                Err(e) => break e,
-            }
-            assert!(started.elapsed() < WAIT, "the write timeout never fired ({accepted} bytes accepted)");
-        };
-        assert!(matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{e}");
-        assert!(accepted > 0, "the socket buffers took nothing");
-
-        // Now read everything: exactly the accepted bytes arrive, then nothing more.
-        server.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let mut delivered = 0usize;
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match server.read(&mut buf) {
-                Ok(0) => panic!("unexpected EOF"),
-                Ok(n) => {
-                    assert!(buf[..n].iter().all(|&b| b == 0x5a));
-                    delivered += n;
-                }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
-                Err(e) => panic!("read: {e}"),
-            }
-        }
-        assert_eq!(delivered, accepted, "bytes delivered == bytes reported as written (none lost, none duplicated)");
-
-        // The stream is still usable and write_all works once the peer drains.
-        client.set_write_timeout(Some(WAIT)).unwrap();
-        let drainer = {
-            let server: Arc<dyn TcpStreamLike> = Arc::from(server);
-            thread::spawn(move || {
-                let mut buf = vec![0u8; 64 * 1024];
-                let mut total = 0usize;
-                server.set_read_timeout(Some(WAIT)).unwrap();
-                while total < 1 << 20 {
-                    total += server.read(&mut buf).unwrap();
-                }
-                total
-            })
-        };
-        client.write_all(&vec![0x5au8; 1 << 20]).unwrap();
-        assert_eq!(drainer.join().unwrap(), 1 << 20);
+        exercise_tcp_write_timeout(&StdNetStack::with_bind_addr(V4_LO), &StdNetStack::with_bind_addr(V4_LO));
     }
 
     #[test]
     fn tcp_exercise_on_ipv4_loopback() {
-        exercise_tcp(&StdNetStack::with_bind_addr(V4_LO), V4_LO);
+        exercise_tcp(&StdNetStack::with_bind_addr(V4_LO), &StdNetStack::with_bind_addr(V4_LO));
     }
 
     #[test]
@@ -772,7 +598,7 @@ mod tests {
             eprintln!("skipping: no IPv6 loopback");
             return;
         }
-        exercise_tcp(&StdNetStack::with_bind_addr(V6_LO), V6_LO);
+        exercise_tcp(&StdNetStack::with_bind_addr(V6_LO), &StdNetStack::with_bind_addr(V6_LO));
     }
 
     #[test]

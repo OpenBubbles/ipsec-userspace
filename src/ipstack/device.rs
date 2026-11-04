@@ -14,6 +14,9 @@
 //!   [`EspDevice::push_rx`] into a bounded queue (drop-oldest, drops counted);
 //!   `receive()` pops one packet per call. (IPv6 reassembly happens before the device,
 //!   in `InnerStack::push_rx`.)
+//! - **TCP MSS** (DESIGN.md §11.2): the MSS option of every TCP SYN crossing the device —
+//!   either way — is clamped to what fits the wire MTU ([`clamp_tcp_mss`]), so neither
+//!   side ever builds a TCP segment that has to be fragmented.
 //!
 //! No allocation happens per packet beyond the `Vec` the caller already hands in:
 //! received packets are moved through the queue and the TX scratch buffer is reused
@@ -26,7 +29,7 @@ use log::{debug, trace};
 use smoltcp::phy::{Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::time::Instant;
 
-use super::frag::fragment_for_wire;
+use super::frag::{clamp_tcp_mss, fragment_for_wire};
 use crate::Result;
 
 /// Where transmitted inner IP packets go: `Fn(ip_packet) -> Result<()>`. Every packet
@@ -55,6 +58,8 @@ pub struct DeviceStats {
     pub tx_fragmented: u64,
     /// IP packets longer than the wire MTU that could not be fragmented (dropped).
     pub tx_frag_drops: u64,
+    /// TCP SYNs (ours or the peer's) whose MSS option was lowered to fit the wire MTU.
+    pub tcp_mss_clamped: u64,
 }
 
 /// smoltcp `Medium::Ip` device over ESP. Not `Sync`: it lives inside the stack's mutex.
@@ -92,10 +97,15 @@ impl EspDevice {
 
     /// Queue one decapsulated inner IP packet for the stack. When the queue is full
     /// the oldest packet is dropped (and counted) so a stalled stack sheds load
-    /// instead of blocking the ESP receive thread.
-    pub fn push_rx(&mut self, packet: Vec<u8>) {
+    /// instead of blocking the ESP receive thread. A TCP SYN's MSS option is clamped to
+    /// the wire MTU on the way in (§11.2).
+    pub fn push_rx(&mut self, mut packet: Vec<u8>) {
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += packet.len() as u64;
+        if let Some(mss) = clamp_tcp_mss(&mut packet, self.wire_mtu) {
+            self.stats.tcp_mss_clamped += 1;
+            trace!("inner rx TCP SYN: MSS {mss} clamped for the wire MTU {}", self.wire_mtu);
+        }
         if self.rx.len() >= self.rx_capacity {
             self.rx.pop_front();
             self.stats.rx_queue_drops += 1;
@@ -129,13 +139,18 @@ impl EspDevice {
     }
 
     /// Hand exactly `len` bytes (filled in by `f`) to the sink, split into wire-sized
-    /// fragments first when they exceed the wire MTU.
+    /// fragments first when they exceed the wire MTU. A TCP SYN's MSS option is clamped
+    /// to the wire MTU first (§11.2).
     fn transmit_with<R, F: FnOnce(&mut [u8]) -> R>(&mut self, len: usize, f: F) -> R {
         if self.scratch.len() < len {
             self.scratch.resize(len, 0);
         }
         let buf = &mut self.scratch[..len];
         let r = f(buf);
+        if let Some(mss) = clamp_tcp_mss(buf, self.wire_mtu) {
+            self.stats.tcp_mss_clamped += 1;
+            trace!("inner tx TCP SYN: MSS {mss} clamped for the wire MTU {}", self.wire_mtu);
+        }
         match fragment_for_wire(buf, self.wire_mtu, self.next_ident) {
             Ok(None) => emit(&self.sink, &mut self.stats, buf),
             Ok(Some(frags)) => {
@@ -367,6 +382,51 @@ mod tests {
         let s = dev.stats();
         assert_eq!((s.tx_packets, s.tx_fragmented, s.tx_frag_drops), (6, 2, 1));
         assert_eq!(store.lock().unwrap().len(), 6);
+    }
+
+    /// IPv6 TCP SYN `2001:db8::1:40000 -> 2001:db8::2:5060` announcing `mss`.
+    fn tcp_syn(mss: u16) -> Vec<u8> {
+        use smoltcp::wire::{IpAddress, IpProtocol, Ipv6Packet, Ipv6Repr, TcpControl, TcpPacket, TcpRepr, TcpSeqNumber};
+        let (src, dst) = (std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2));
+        let tcp = TcpRepr {
+            src_port: 40000,
+            dst_port: 5060,
+            control: TcpControl::Syn,
+            seq_number: TcpSeqNumber(1),
+            ack_number: None,
+            window_len: 1000,
+            window_scale: None,
+            max_seg_size: Some(mss),
+            sack_permitted: false,
+            sack_ranges: [None, None, None],
+            timestamp: None,
+            payload: &[],
+        };
+        let ip = Ipv6Repr { src_addr: src, dst_addr: dst, next_header: IpProtocol::Tcp, payload_len: tcp.buffer_len(), hop_limit: 64 };
+        let mut buf = vec![0u8; 40 + tcp.buffer_len()];
+        ip.emit(&mut Ipv6Packet::new_unchecked(&mut buf));
+        tcp.emit(&mut TcpPacket::new_unchecked(&mut buf[40..]), &IpAddress::Ipv6(src), &IpAddress::Ipv6(dst), &ChecksumCapabilities::default());
+        buf
+    }
+
+    #[test]
+    fn tcp_syn_mss_is_clamped_to_the_wire_mtu_both_ways() {
+        let (sink, store) = capture();
+        let mut dev = EspDevice::new(sink, 1280, 16384, 4);
+        // TX: smoltcp announces 16384 - 60; the sink sees 1280 - 60.
+        let syn = tcp_syn(16324);
+        dev.transmit(Instant::from_millis(0)).unwrap().consume(syn.len(), |buf| buf.copy_from_slice(&syn));
+        let sent = store.lock().unwrap()[0].clone();
+        assert_eq!(u16::from_be_bytes([sent[62], sent[63]]), 1220, "MSS value right after kind/len at TCP offset 20");
+        // RX: the peer's 1440 is lowered before smoltcp sees it.
+        dev.push_rx(tcp_syn(1440));
+        let (rx, _) = dev.receive(Instant::from_millis(0)).unwrap();
+        assert_eq!(rx.consume(|p| u16::from_be_bytes([p[62], p[63]])), 1220);
+        // A SYN that already fits passes untouched.
+        dev.push_rx(tcp_syn(1000));
+        let (rx, _) = dev.receive(Instant::from_millis(0)).unwrap();
+        assert_eq!(rx.consume(|p| u16::from_be_bytes([p[62], p[63]])), 1000);
+        assert_eq!(dev.stats().tcp_mss_clamped, 2);
     }
 
     #[test]

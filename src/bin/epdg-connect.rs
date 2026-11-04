@@ -5,14 +5,18 @@
 //! every build, `target/debug/epdg-connect` does not.
 //!
 //! Usage: epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] [--hold SECS]
-//!                      [--rebind-after SECS] [--no-dns]
+//!                      [--rebind-after SECS] [--no-dns] [--tcp-probe]
 //! `--activation` (or env EPDG_ACTIVATION_CONFIG) loads the app-side activation config, which
 //! carries the bundle, the credentials and the DER client certificate/key in one plist.
 //! `--rebind-after SECS` forces one address update that far into the hold and then proves the
 //! moved tunnel still works (DESIGN §17.9); off by default.
+//! `--tcp-probe` opens one inner TCP connection (DESIGN §11.2) to the resolved P-CSCF on the
+//! port of the config's `pcscf-address` and prints a `TCP-PROBE` / `TCP-PROBE-FAILED` line;
+//! diagnostic only (whether the P-CSCF takes TCP is not known), it never changes the exit
+//! code. Off by default.
 //! Defaults point at tests/fixtures/. Set RUST_LOG=debug for hex dumps.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -20,6 +24,10 @@ use epdg::{Config, EpdgTunnel, Error, NetStack};
 
 const TARGET_HOST: &str = "ueb2bprod.pc.t-mobile.com";
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// Handshake budget of `--tcp-probe`.
+const TCP_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// SIP's default port (RFC 3261 §19.1.2), for a `pcscf-address` that names none.
+const SIP_DEFAULT_PORT: u16 = 5060;
 /// How long `--rebind-after` waits for the path thread to complete the forced address
 /// update. The announce runs the normal retransmit schedule (~15.5 s), and a schedule
 /// that times out once is retried by the path thread rather than being fatal (the
@@ -49,6 +57,7 @@ fn main() {
     let mut hold = Duration::from_secs(25);
     let mut rebind_after: Option<Duration> = None;
     let mut do_dns = true;
+    let mut tcp_probe = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| panic!("missing value for {a}"));
@@ -63,10 +72,11 @@ fn main() {
                 rebind_after = Some(Duration::from_secs(val().parse().expect("--rebind-after seconds")))
             }
             "--no-dns" => do_dns = false,
+            "--tcp-probe" => tcp_probe = true,
             "-h" | "--help" => {
                 println!(
                     "epdg-connect [--activation PLIST | --bundle P --creds P --cert PEM --key PEM] \
-                     [--hold SECS] [--rebind-after SECS] [--no-dns]"
+                     [--hold SECS] [--rebind-after SECS] [--no-dns] [--tcp-probe]"
                 );
                 println!("  --hold SECS          keep the tunnel open this long after the checks (default 25)");
                 println!(
@@ -78,6 +88,14 @@ fn main() {
                      POST-MOVE lines and exits non-zero if any of it fails. Off by default"
                 );
                 println!("  --no-dns             skip the pre-hold DNS check over the tunnel");
+                println!(
+                    "  --tcp-probe          after the DNS check, open one TCP connection over the tunnel to the \
+                     resolved P-CSCF on the port"
+                );
+                println!(
+                    "                       of the config's pcscf-address ({TCP_PROBE_TIMEOUT:?} budget); prints \
+                     TCP-PROBE ok / TCP-PROBE-FAILED, never fails the run. Off by default"
+                );
                 return;
             }
             other => panic!("unknown argument {other}"),
@@ -136,6 +154,12 @@ fn main() {
         } else {
             answers = lookup_pcscf(stack, TARGET_HOST, &format!("v6 {:?} v4 {:?}", a.dns_ipv6, a.dns_ipv4));
         }
+    }
+    if tcp_probe {
+        if answers.is_empty() {
+            answers = lookup_pcscf(stack, TARGET_HOST, "for the TCP probe");
+        }
+        probe_pcscf_tcp(stack, &answers, &cfg.ims.pcscf_address);
     }
 
     match tunnel.dpd() {
@@ -284,6 +308,51 @@ fn forced_address_update(tunnel: &EpdgTunnel) -> bool {
     true
 }
 
+/// `--tcp-probe`: one TCP handshake with the P-CSCF over the tunnel (DESIGN §11.2) — the
+/// first resolved address of a family the tunnel has an inner address for, on the port of
+/// the config's `pcscf-address` (35060 for T-Mobile; SIP's 5060 when it names none). One
+/// machine-checkable line either way:
+///
+/// - `TCP-PROBE ok local=<ip:port> peer=<ip:port> in=<ms>` — the handshake completed (then
+///   the connection is shut down gracefully);
+/// - `TCP-PROBE-FAILED <reason>` — no usable address, a refusal, a timeout, …
+///
+/// Whether the P-CSCF listens on TCP at all is not known, so the caller never turns a
+/// failed probe into a failed run. As with `ADDRESS-UPDATE-FAILED`, the failure marker does
+/// not start with the success marker followed by a space.
+fn probe_pcscf_tcp(stack: &dyn NetStack, answers: &[IpAddr], pcscf_address: &str) {
+    let port = pcscf_port(pcscf_address).unwrap_or(SIP_DEFAULT_PORT);
+    let inner = stack.local_addrs();
+    let Some(ip) = answers.iter().copied().find(|ip| inner.iter().any(|l| l.is_ipv6() == ip.is_ipv6())) else {
+        println!("TCP-PROBE-FAILED no resolved P-CSCF address of an inner address family (answers {answers:?}, inner {inner:?})");
+        return;
+    };
+    let peer = SocketAddr::new(ip, port);
+    println!("  tcp probe: connecting to {peer} over {} (port from pcscf-address {pcscf_address:?})", stack.name());
+    let started = Instant::now();
+    match stack.connect_tcp(peer, TCP_PROBE_TIMEOUT) {
+        Ok(stream) => {
+            println!("TCP-PROBE ok local={} peer={} in={}", stream.local_addr(), stream.peer_addr(), started.elapsed().as_millis());
+            if let Err(e) = stream.shutdown() {
+                println!("  tcp probe: shutdown: {e}");
+            }
+        }
+        Err(e) => {
+            println!("TCP-PROBE-FAILED connect to {peer}: {e} ({:?}) after {} ms", e.kind(), started.elapsed().as_millis())
+        }
+    }
+}
+
+/// The port of a `host:port` or `[v6]:port` P-CSCF address; `None` when it names none.
+fn pcscf_port(address: &str) -> Option<u16> {
+    let (host, port) = address.rsplit_once(':')?;
+    // A bare IPv6 literal is all colons and no port.
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return None;
+    }
+    port.parse().ok()
+}
+
 /// Resolve the P-CSCF host name with the stack's own resolver (two attempts): the
 /// DNS round trip proves ESP in both directions when `stack` is the tunnel.
 fn lookup_pcscf(stack: &dyn NetStack, host: &str, servers: &str) -> Vec<IpAddr> {
@@ -379,5 +448,21 @@ fn probe_main() {
         Ok(other) => println!("unexpected: {:?}", std::mem::discriminant(&other)),
         Err(Error::PeerNotify { notify_type, name, .. }) => println!("SERVER IKE NOTIFY: {notify_type} ({name}) -> ClientHello REJECTED"),
         Err(e) => println!("error: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pcscf_port;
+
+    #[test]
+    fn pcscf_port_is_the_port_of_the_configured_address() {
+        assert_eq!(pcscf_port("ueb2bprod.pc.t-mobile.com:35060"), Some(35060));
+        assert_eq!(pcscf_port("[2001:db8::1]:5061"), Some(5061));
+        assert_eq!(pcscf_port("192.0.2.1:5060"), Some(5060));
+        assert_eq!(pcscf_port("2001:db8::1"), None, "a bare IPv6 literal names no port");
+        assert_eq!(pcscf_port("pcscf.example.test"), None);
+        assert_eq!(pcscf_port("pcscf.example.test:sip"), None);
+        assert_eq!(pcscf_port(""), None);
     }
 }

@@ -11,7 +11,8 @@
 //!   `DELETE(IKE)` marks the tunnel dead.
 //! - **stack** (`epdg-stack`): the smoltcp poll loop of [`InnerStack`] (DESIGN §11).
 //!   Its TX sink is `EspOutbound::encapsulate` + `IkeTransport::send_esp`; it delivers
-//!   inner UDP to [`InnerUdpSocket`] channels and completes [`EpdgTunnel::resolve`].
+//!   inner UDP to [`InnerUdpSocket`] channels, completes [`EpdgTunnel::resolve`] and
+//!   drives the TCP sockets behind [`InnerTcpStream`] / [`InnerTcpListener`] (§11.2).
 //! - **keepalive**: one `0xFF` byte to `gateway:4500` every `keepalive_interval_secs`
 //!   on the same socket as IKE, regardless of traffic (AOSP behaviour, RFC 3948 §4).
 //! - **timer** (1 s tick): DPD after `dpd.interval_secs` without any rx, with
@@ -55,8 +56,9 @@
 //! `mark_dead(reason)` publishes the reason and closes the inner stack. That drops every
 //! inner UDP binding's sender, so a blocked `InnerUdpSocket::recv_timeout` returns
 //! `Error::Closed(reason)` **immediately** rather than at its own timeout, pending
-//! resolvers are completed with the same error, and every later `send_to` / `bind_udp` /
-//! `resolve` fails the same way. Through `netstack::to_io` that is
+//! resolvers are completed with the same error, a TCP read / write / accept / connect
+//! parked on the stack's TCP event counter wakes with it too, and every later `send_to` /
+//! `bind_udp` / `resolve` / TCP call fails the same way. Through `netstack::to_io` that is
 //! `io::ErrorKind::NotConnected` with the reason still in the error's `Display`, which is
 //! what a SIP transport above turns into a close event and a fresh connection. It is
 //! idempotent and the first reason wins, so a deliberate `close()` (reason
@@ -93,7 +95,7 @@ use crate::ike::transport::{IkeTransport, Incoming};
 use crate::ipstack::{InnerStack, StackStats, TxSink};
 use crate::{Error, Result};
 
-pub use crate::ipstack::{InnerUdpSocket, UdpDatagram};
+pub use crate::ipstack::{InnerTcpListener, InnerTcpStream, InnerUdpSocket, UdpDatagram};
 
 /// Rx thread socket wait per iteration (also bounds thread-stop latency).
 const RX_POLL: Duration = Duration::from_millis(500);
@@ -259,7 +261,7 @@ pub struct TunnelStats {
     pub rx_queue_drops: u64,
     /// Instant of the last IKE / ESP / keepalive datagram received from the gateway.
     pub last_rx: Option<Instant>,
-    /// Counters of the smoltcp inner stack (device queue, UDP delivery, DNS).
+    /// Counters of the smoltcp inner stack (device queue, UDP delivery, DNS, TCP).
     pub stack: StackStats,
 }
 
@@ -2818,6 +2820,25 @@ impl EpdgTunnel {
             return Err(self.shared.closed_error());
         }
         self.shared.stack.resolve(name, timeout)
+    }
+
+    /// Open an inner TCP connection to `remote` (DESIGN §11.2) from an ephemeral port,
+    /// waiting at most `timeout` for the handshake. `Error::Timeout` when nothing
+    /// answered, `Io(ConnectionRefused)` on a RST, `Error::Closed` once the tunnel is dead.
+    pub fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> Result<InnerTcpStream> {
+        if !self.shared.is_alive() {
+            return Err(self.shared.closed_error());
+        }
+        self.shared.stack.connect_tcp(remote, timeout)
+    }
+
+    /// Listen for inner TCP connections on `local_port` (0 = ephemeral) on every inner
+    /// address (DESIGN §11.2). A port that already has a listener is `Io(AddrInUse)`.
+    pub fn listen_tcp(&self, local_port: u16) -> Result<InnerTcpListener> {
+        if !self.shared.is_alive() {
+            return Err(self.shared.closed_error());
+        }
+        self.shared.stack.listen_tcp(local_port)
     }
 
     /// True while the IKE SA is up (no peer DELETE, no DPD failure, not closed).

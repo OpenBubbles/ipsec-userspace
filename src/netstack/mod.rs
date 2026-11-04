@@ -6,19 +6,21 @@
 //!
 //! - [`StdNetStack`] (`std_stack`): `std::net` sockets and the libc resolver
 //!   (`getaddrinfo`). UDP, TCP (client + listener) and DNS.
-//! - [`EpdgTunnel`]: inner UDP sockets and the smoltcp DNS socket over the
-//!   gateway-assigned servers (the libc resolver cannot reach tunnel-internal DNS).
-//!   TCP over the tunnel is **not implemented yet**: `connect_tcp` / `listen_tcp`
-//!   return `Err(ErrorKind::Unsupported)`. [`InnerStack`] implements the trait the
-//!   same way so the abstraction is testable offline over the two-stack loopback.
+//! - [`EpdgTunnel`]: inner UDP sockets, inner TCP connections and listeners (smoltcp TCP
+//!   sockets driven by the stack thread, DESIGN.md §11.2) and the smoltcp DNS socket over
+//!   the gateway-assigned servers (the libc resolver cannot reach tunnel-internal DNS).
+//!   [`InnerStack`] implements the trait the same way so the abstraction is testable
+//!   offline over the two-stack loopback.
 //!
 //! Everything is synchronous and object-safe. Errors are `io::Error`; the crate's
 //! [`Error`] is mapped by [`to_io`] (`Timeout` → `TimedOut`, `Closed` → `NotConnected`,
 //! `Config`/`Unsupported` → `InvalidInput`, the rest → `Other`; the crate error is
 //! kept as the payload, reachable through `io::Error::get_ref()` / `into_inner()`).
 //! Conditions a caller is expected to branch on have the same kind on both backends:
-//! a taken port in `bind_udp` is `AddrInUse`, a name that does not exist is
-//! `NotFound`, a resolver that did not answer is `TimedOut`.
+//! a taken port in `bind_udp` / `listen_tcp` is `AddrInUse`, a name that does not exist
+//! is `NotFound`, a resolver that did not answer is `TimedOut`, a connect nobody
+//! answered is `TimedOut` and one answered with RST `ConnectionRefused`, a read on a
+//! connection the peer reset is `ConnectionReset`, a write after `shutdown` fails.
 
 use std::fmt;
 use std::io::{self, ErrorKind};
@@ -27,15 +29,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::Error;
-use crate::ipstack::{InnerStack, InnerUdpSocket};
+use crate::ipstack::{InnerStack, InnerTcpListener, InnerTcpStream, InnerUdpSocket};
 use crate::tunnel::EpdgTunnel;
 
 pub mod std_stack;
 
 pub use std_stack::StdNetStack;
-
-/// Message of the `Unsupported` error returned by the tunnel backend's TCP methods.
-pub const TUNNEL_TCP_UNSUPPORTED: &str = "TCP over the ePDG tunnel is not implemented yet";
 
 /// A network stack: UDP sockets, TCP connections/listeners and a resolver, all
 /// sourced from the same place (the OS or the ePDG tunnel). Object-safe.
@@ -43,11 +42,13 @@ pub trait NetStack: Send + Sync {
     /// Bind a UDP socket on `local_port` (0 = ephemeral). A port that is already
     /// bound is `Err(AddrInUse)` on every backend.
     fn bind_udp(&self, local_port: u16) -> io::Result<Box<dyn UdpSocketLike>>;
-    /// Open a TCP connection to `remote` within `timeout`. Tunnel backend:
-    /// `Err(ErrorKind::Unsupported)` for now.
+    /// Open a TCP connection to `remote` within `timeout` (a v4-mapped `::ffff:a.b.c.d`
+    /// is IPv4 on every backend): `Err(TimedOut)` when nobody answered in time,
+    /// `Err(ConnectionRefused)` on a RST. Any `timeout` is accepted; a zero budget is a
+    /// (very short) timeout, never `InvalidInput`.
     fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> io::Result<Box<dyn TcpStreamLike>>;
-    /// Listen for TCP connections on `local_port` (0 = ephemeral). Tunnel backend:
-    /// `Err(ErrorKind::Unsupported)` for now.
+    /// Listen for TCP connections on `local_port` (0 = ephemeral). A port that already
+    /// has a listener is `Err(AddrInUse)` on every backend.
     fn listen_tcp(&self, local_port: u16) -> io::Result<Box<dyn TcpListenerLike>>;
     /// Resolve `host` to A/AAAA addresses with THIS stack's resolver, within
     /// `timeout`. IP literals (also bracketed, `[::1]`) return immediately without
@@ -206,11 +207,6 @@ pub fn to_io(e: Error) -> io::Error {
     io::Error::new(kind, e)
 }
 
-/// `Err(Unsupported)` for the tunnel backend's TCP methods.
-fn tunnel_tcp_unsupported<T>() -> io::Result<T> {
-    Err(io::Error::new(ErrorKind::Unsupported, TUNNEL_TCP_UNSUPPORTED))
-}
-
 /// The tunnel resolver's errors as `io::Error`: a negative answer (NXDOMAIN, no
 /// record of that type, server failure, no addresses) is `NotFound` — the kind the
 /// std backend uses for an empty `getaddrinfo` result — everything else is [`to_io`].
@@ -298,6 +294,52 @@ impl UdpSocketLike for InnerUdpSocket {
     }
 }
 
+/// Inner TCP connections (DESIGN.md §11.2). A read timeout expires as `TimedOut`.
+impl TcpStreamLike for InnerTcpStream {
+    fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        InnerTcpStream::read(self, buf).map_err(to_io)
+    }
+
+    fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        InnerTcpStream::write(self, buf).map_err(to_io)
+    }
+
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        InnerTcpStream::set_read_timeout(self, timeout).map_err(to_io)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        InnerTcpStream::set_write_timeout(self, timeout).map_err(to_io)
+    }
+
+    fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
+        InnerTcpStream::set_nodelay(self, nodelay).map_err(to_io)
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        InnerTcpStream::local_addr(self)
+    }
+
+    fn peer_addr(&self) -> SocketAddr {
+        InnerTcpStream::peer_addr(self)
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        InnerTcpStream::shutdown(self).map_err(to_io)
+    }
+}
+
+impl TcpListenerLike for InnerTcpListener {
+    fn accept_timeout(&self, timeout: Duration) -> io::Result<Option<(Box<dyn TcpStreamLike>, SocketAddr)>> {
+        let accepted = InnerTcpListener::accept_timeout(self, timeout).map_err(to_io)?;
+        Ok(accepted.map(|(stream, peer)| (Box::new(stream) as Box<dyn TcpStreamLike>, peer)))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        InnerTcpListener::local_addr(self)
+    }
+}
+
 /// The inner stack on its own (no IKE/ESP): the same delegation as [`EpdgTunnel`],
 /// so the trait can be exercised offline over the two-stack loopback harness.
 impl NetStack for InnerStack {
@@ -305,12 +347,13 @@ impl NetStack for InnerStack {
         Ok(Box::new(InnerStack::bind_udp(self, local_port).map_err(to_io)?))
     }
 
-    fn connect_tcp(&self, _remote: SocketAddr, _timeout: Duration) -> io::Result<Box<dyn TcpStreamLike>> {
-        tunnel_tcp_unsupported()
+    fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> io::Result<Box<dyn TcpStreamLike>> {
+        // smoltcp would route `::ffff:a.b.c.d` as plain IPv6 (to the gateway, lost).
+        Ok(Box::new(InnerStack::connect_tcp(self, normalise(remote), timeout).map_err(to_io)?))
     }
 
-    fn listen_tcp(&self, _local_port: u16) -> io::Result<Box<dyn TcpListenerLike>> {
-        tunnel_tcp_unsupported()
+    fn listen_tcp(&self, local_port: u16) -> io::Result<Box<dyn TcpListenerLike>> {
+        Ok(Box::new(InnerStack::listen_tcp(self, local_port).map_err(to_io)?))
     }
 
     fn resolve(&self, host: &str, timeout: Duration) -> io::Result<Vec<IpAddr>> {
@@ -329,19 +372,19 @@ impl NetStack for InnerStack {
     }
 }
 
-/// The ePDG tunnel as a network stack: inner UDP sockets and DNS over the assigned
-/// servers; TCP is not implemented yet (`Err(Unsupported)`).
+/// The ePDG tunnel as a network stack: inner UDP sockets, inner TCP connections and
+/// listeners, and DNS over the assigned servers.
 impl NetStack for EpdgTunnel {
     fn bind_udp(&self, local_port: u16) -> io::Result<Box<dyn UdpSocketLike>> {
         Ok(Box::new(EpdgTunnel::bind_udp(self, local_port).map_err(to_io)?))
     }
 
-    fn connect_tcp(&self, _remote: SocketAddr, _timeout: Duration) -> io::Result<Box<dyn TcpStreamLike>> {
-        tunnel_tcp_unsupported()
+    fn connect_tcp(&self, remote: SocketAddr, timeout: Duration) -> io::Result<Box<dyn TcpStreamLike>> {
+        Ok(Box::new(EpdgTunnel::connect_tcp(self, normalise(remote), timeout).map_err(to_io)?))
     }
 
-    fn listen_tcp(&self, _local_port: u16) -> io::Result<Box<dyn TcpListenerLike>> {
-        tunnel_tcp_unsupported()
+    fn listen_tcp(&self, local_port: u16) -> io::Result<Box<dyn TcpListenerLike>> {
+        Ok(Box::new(EpdgTunnel::listen_tcp(self, local_port).map_err(to_io)?))
     }
 
     fn resolve(&self, host: &str, timeout: Duration) -> io::Result<Vec<IpAddr>> {
@@ -488,6 +531,140 @@ pub(crate) mod tests {
         let big = vec![0xabu8; 1200];
         sa.send_to(to_b, &big).unwrap();
         assert_eq!(recv(&*sb, "b receives 1200 bytes").1, big);
+    }
+
+    /// Read from `stream` until `n` bytes arrived (EOF before that panics).
+    pub(crate) fn read_n(stream: &dyn TcpStreamLike, n: usize) -> Vec<u8> {
+        let mut got = Vec::with_capacity(n);
+        let mut buf = [0u8; 4096];
+        while got.len() < n {
+            let want = (n - got.len()).min(buf.len());
+            let r = stream.read(&mut buf[..want]).unwrap_or_else(|e| panic!("read after {} of {n} bytes: {e}", got.len()));
+            assert_ne!(r, 0, "unexpected EOF after {} of {n} bytes", got.len());
+            got.extend_from_slice(&buf[..r]);
+        }
+        got
+    }
+
+    /// The generic TCP exercise of DESIGN.md §16, run over both backends: `b` listens,
+    /// `a` connects to `b`'s first `local_addrs()` entry. `accept_timeout` → `None` on
+    /// silence, a connect while the acceptor waits, the addresses on both ends, a reader
+    /// and a writer thread sharing each stream through `Arc<dyn TcpStreamLike>`, both
+    /// directions, the read timeout, `StreamIo` as `Read + Write`, EOF after the peer's
+    /// shutdown, an idempotent shutdown, writes failing after it, a refused connect within
+    /// its timeout and a zero connect budget.
+    pub(crate) fn exercise_tcp<S: NetStack + ?Sized>(a: &S, b: &S) {
+        use io::{Read, Write};
+        use std::time::Instant;
+        assert!(!b.local_addrs().is_empty(), "{}: local_addrs of b", b.name());
+        let b_ip = b.local_addrs()[0];
+        let listener = b.listen_tcp(0).unwrap();
+        let port = listener.local_addr().port();
+        assert_ne!(port, 0, "listener reports its bound port");
+        assert_eq!(listener.local_addr().ip(), b_ip, "{}: the listener's address", b.name());
+        // A taken port is AddrInUse on every backend.
+        let e = b.listen_tcp(port).map(|_| ()).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::AddrInUse, "{}: listening twice on {port}: {e}", b.name());
+        assert!(listener.accept_timeout(SILENCE).unwrap().is_none(), "accept_timeout -> None on silence");
+        assert!(listener.accept_timeout(Duration::ZERO).unwrap().is_none());
+
+        let remote = SocketAddr::new(b_ip, port);
+        let (server, peer, client) = thread::scope(|sc| {
+            let connector = sc.spawn(|| a.connect_tcp(remote, WAIT));
+            let (server, peer) = listener.accept_timeout(WAIT).unwrap().expect("accepted within the wait");
+            (server, peer, connector.join().unwrap().unwrap())
+        });
+        assert_eq!(peer, client.local_addr());
+        assert_eq!(server.peer_addr(), client.local_addr());
+        assert_eq!(server.local_addr(), client.peer_addr());
+        assert_eq!(client.peer_addr(), remote);
+        assert!(
+            a.local_addrs().contains(&client.local_addr().ip()) || client.local_addr().ip().is_loopback(),
+            "{}: {} is not one of a's addresses",
+            a.name(),
+            client.local_addr()
+        );
+        client.set_nodelay(true).unwrap();
+        server.set_nodelay(true).unwrap();
+        // A zero timeout is an error on both backends (std refuses it).
+        assert_eq!(server.set_read_timeout(Some(Duration::ZERO)).unwrap_err().kind(), ErrorKind::InvalidInput);
+        assert_eq!(server.set_write_timeout(Some(Duration::ZERO)).unwrap_err().kind(), ErrorKind::InvalidInput);
+
+        // Shared by a reader thread and a writer thread through Arc<dyn TcpStreamLike>.
+        let client: Arc<dyn TcpStreamLike> = Arc::from(client);
+        let server: Arc<dyn TcpStreamLike> = Arc::from(server);
+        let reader = {
+            let client = Arc::clone(&client);
+            thread::spawn(move || read_n(&*client, 11))
+        };
+        let writer = {
+            let client = Arc::clone(&client);
+            thread::spawn(move || client.write_all(b"from client"))
+        };
+        server.write_all(b"from server").unwrap();
+        writer.join().unwrap().unwrap();
+        assert_eq!(reader.join().unwrap(), b"from server");
+        assert_eq!(read_n(&*server, 11), b"from client");
+
+        // Read timeout.
+        let mut buf = [0u8; 64];
+        server.set_read_timeout(Some(SILENCE)).unwrap();
+        let started = Instant::now();
+        let e = server.read(&mut buf).unwrap_err();
+        assert!(matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{e}");
+        assert!(started.elapsed() >= SILENCE / 2 && started.elapsed() < WAIT, "{:?}", started.elapsed());
+        server.set_read_timeout(None).unwrap();
+        server.set_write_timeout(Some(WAIT)).unwrap();
+
+        // StreamIo: Read + Write over the same connection.
+        {
+            let mut io = StreamIo(&*client);
+            io.write_all(b"via StreamIo").unwrap();
+            io.flush().unwrap();
+            let mut sio = StreamIo(&*server);
+            let mut got = vec![0u8; 12];
+            sio.read_exact(&mut got).unwrap();
+            assert_eq!(got, b"via StreamIo");
+            sio.write_all(b"back").unwrap();
+            let mut back = [0u8; 4];
+            io.read_exact(&mut back).unwrap();
+            assert_eq!(&back, b"back");
+        }
+
+        // EOF after the peer shuts down.
+        client.shutdown().unwrap();
+        server.set_read_timeout(Some(WAIT)).unwrap();
+        assert_eq!(server.read(&mut buf).unwrap(), 0, "EOF after peer shutdown");
+        // The normal teardown after reading EOF: shutting down our side succeeds even
+        // though the OS (macOS: ENOTCONN) considers the connection gone already; so does
+        // shutting down twice.
+        server.shutdown().unwrap_or_else(|e| panic!("shutdown after peer EOF: {e}"));
+        server.shutdown().unwrap_or_else(|e| panic!("second shutdown: {e}"));
+        client.shutdown().unwrap_or_else(|e| panic!("shutdown of the already shut-down side: {e}"));
+        // Writing to a shut-down stream fails (immediately or once the RST lands).
+        let mut write_failed = false;
+        for _ in 0..50 {
+            if client.write_all(b"after shutdown").is_err() {
+                write_failed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(write_failed, "write after shutdown eventually errors");
+
+        // Connecting to a closed port fails within the timeout.
+        let closed_port = {
+            let l = b.listen_tcp(0).unwrap();
+            l.local_addr().port()
+        };
+        let started = Instant::now();
+        let e = a.connect_tcp(SocketAddr::new(b_ip, closed_port), Duration::from_secs(2)).map(|_| ()).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(3), "{e} after {:?}", started.elapsed());
+        assert_ne!(e.kind(), ErrorKind::Unsupported);
+        // A zero budget is a timeout (or the refusal), never InvalidInput about the timeout.
+        let e = a.connect_tcp(SocketAddr::new(b_ip, closed_port), Duration::ZERO).map(|_| ()).unwrap_err();
+        assert_ne!(e.kind(), ErrorKind::InvalidInput, "{e}");
+        assert!(matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::ConnectionRefused | ErrorKind::WouldBlock), "{e}");
     }
 
     // ---- pure helpers -----------------------------------------------------
@@ -697,15 +874,103 @@ pub(crate) mod tests {
         assert_eq!(from.port(), sa.local_addr().port());
     }
 
+    /// `TcpStreamLike::write` (and so `StreamIo::write`) keeps the `io::Write` contract
+    /// under a write timeout on every backend: an `Err` never consumed bytes, so TLS may
+    /// retry the record. `a` writes to a peer on `b` that does not read until the
+    /// buffers are full and a write times out; then exactly the bytes reported as
+    /// accepted arrive, and a 1 MiB `write_all` against a draining peer completes.
+    pub(crate) fn exercise_tcp_write_timeout<S: NetStack + ?Sized>(a: &S, b: &S) {
+        use io::Write;
+        use std::time::Instant;
+        let listener = b.listen_tcp(0).unwrap();
+        let remote = SocketAddr::new(b.local_addrs()[0], listener.local_addr().port());
+        let client = a.connect_tcp(remote, WAIT).unwrap();
+        let (server, _) = listener.accept_timeout(WAIT).unwrap().expect("accepted");
+        client.set_write_timeout(Some(Duration::from_millis(150))).unwrap();
+
+        // The peer does not read: fill the buffers until a write times out, accounting
+        // every byte the stream reported as accepted.
+        let chunk = vec![0x5au8; 256 * 1024];
+        let mut accepted = 0usize;
+        let mut io = StreamIo(&*client);
+        let started = Instant::now();
+        let e = loop {
+            match io.write(&chunk) {
+                Ok(0) => panic!("write returned Ok(0)"),
+                Ok(n) => accepted += n,
+                Err(e) => break e,
+            }
+            assert!(started.elapsed() < WAIT, "the write timeout never fired ({accepted} bytes accepted)");
+        };
+        assert!(matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut), "{e}");
+        assert!(accepted > 0, "the buffers took nothing");
+
+        // Now read everything: exactly the accepted bytes arrive, then nothing more.
+        server.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let mut delivered = 0usize;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match server.read(&mut buf) {
+                Ok(0) => panic!("unexpected EOF"),
+                Ok(n) => {
+                    assert!(buf[..n].iter().all(|&b| b == 0x5a));
+                    delivered += n;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => break,
+                Err(e) => panic!("read: {e}"),
+            }
+        }
+        assert_eq!(delivered, accepted, "bytes delivered == bytes reported as written (none lost, none duplicated)");
+
+        // The stream is still usable and write_all works once the peer drains.
+        client.set_write_timeout(Some(WAIT)).unwrap();
+        let drainer = {
+            let server: Arc<dyn TcpStreamLike> = Arc::from(server);
+            thread::spawn(move || {
+                let mut buf = vec![0u8; 64 * 1024];
+                let mut total = 0usize;
+                server.set_read_timeout(Some(WAIT)).unwrap();
+                while total < 1 << 20 {
+                    total += server.read(&mut buf).unwrap();
+                }
+                total
+            })
+        };
+        client.write_all(&vec![0x5au8; 1 << 20]).unwrap();
+        assert_eq!(drainer.join().unwrap(), 1 << 20);
+    }
+
     #[test]
-    fn tunnel_tcp_is_unsupported_for_now() {
+    fn tunnel_tcp_write_under_a_write_timeout_never_loses_bytes() {
         let p = Pair::dual();
-        let stack: &dyn NetStack = &p.a;
-        let remote = SocketAddr::new(p.b.local_addrs()[0], 5060);
-        let e = stack.connect_tcp(remote, WAIT).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::Unsupported);
-        assert_eq!(e.to_string(), TUNNEL_TCP_UNSUPPORTED);
-        assert_eq!(stack.listen_tcp(0).unwrap_err().kind(), ErrorKind::Unsupported);
+        exercise_tcp_write_timeout(&p.a, &p.b);
+    }
+
+    #[test]
+    fn tunnel_tcp_exercise_over_the_loopback_pair() {
+        let p = Pair::dual();
+        exercise_tcp(&p.a, &p.b);
+        // The other direction, and through Arc<dyn NetStack> (itself a NetStack).
+        let a: Arc<dyn NetStack> = Arc::new(p.a.clone());
+        let b: Arc<dyn NetStack> = Arc::new(p.b.clone());
+        exercise_tcp(&*b, &*a);
+        exercise_tcp(&a, &b);
+    }
+
+    #[test]
+    fn tunnel_tcp_to_a_v4_mapped_destination_connects_over_ipv4() {
+        let p = Pair::dual();
+        let b_v4 = p.b.local_addrs().into_iter().find(IpAddr::is_ipv4).expect("b has an IPv4 inner address");
+        let IpAddr::V4(b_v4) = b_v4 else { unreachable!() };
+        let listener = NetStack::listen_tcp(&p.b, 0).unwrap();
+        let mapped = SocketAddr::new(IpAddr::V6(b_v4.to_ipv6_mapped()), listener.local_addr().port());
+        let client = NetStack::connect_tcp(&p.a, mapped, WAIT).unwrap();
+        let (server, peer) = listener.accept_timeout(WAIT).unwrap().expect("accepted");
+        assert!(peer.is_ipv4() && client.local_addr().is_ipv4(), "{peer} / {}", client.local_addr());
+        assert_eq!(client.peer_addr(), SocketAddr::new(IpAddr::V4(b_v4), listener.local_addr().port()));
+        assert_eq!(server.local_addr(), client.peer_addr());
+        client.write_all(b"over v4").unwrap();
+        assert_eq!(read_n(&*server, 7), b"over v4");
     }
 
     #[test]
@@ -713,6 +978,10 @@ pub(crate) mod tests {
         let p = Pair::dual();
         let stack: &dyn NetStack = &p.a;
         let s = stack.bind_udp(0).unwrap();
+        let listener = stack.listen_tcp(0).unwrap();
+        let b_listener = NetStack::listen_tcp(&p.b, 0).unwrap();
+        let b_addr = SocketAddr::new(p.b.local_addrs()[0], b_listener.local_addr().port());
+        let stream = stack.connect_tcp(b_addr, WAIT).unwrap();
         p.a.close("tunnel torn down");
         let e = s.recv_timeout(Duration::from_millis(10)).unwrap_err();
         assert_eq!(e.kind(), ErrorKind::NotConnected, "{e}");
@@ -721,5 +990,16 @@ pub(crate) mod tests {
         assert_eq!(e.kind(), ErrorKind::NotConnected, "{e}");
         assert_eq!(stack.bind_udp(0).unwrap_err().kind(), ErrorKind::NotConnected);
         assert_eq!(stack.resolve(HOST, WAIT).unwrap_err().kind(), ErrorKind::NotConnected);
+        // TCP: every call on a stream or listener, and every new one, is NotConnected
+        // with the reason; shutdown stays idempotent.
+        let e = stream.read(&mut [0u8; 8]).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotConnected, "{e}");
+        assert!(e.to_string().contains("tunnel torn down"), "{e}");
+        assert_eq!(stream.write(b"x").unwrap_err().kind(), ErrorKind::NotConnected);
+        assert_eq!(stream.set_nodelay(true).unwrap_err().kind(), ErrorKind::NotConnected);
+        stream.shutdown().expect("shutdown of a connection that is already down");
+        assert_eq!(listener.accept_timeout(Duration::from_millis(10)).map(|_| ()).unwrap_err().kind(), ErrorKind::NotConnected);
+        assert_eq!(stack.connect_tcp(b_addr, WAIT).map(|_| ()).unwrap_err().kind(), ErrorKind::NotConnected);
+        assert_eq!(stack.listen_tcp(0).map(|_| ()).unwrap_err().kind(), ErrorKind::NotConnected);
     }
 }
